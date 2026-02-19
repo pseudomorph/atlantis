@@ -829,6 +829,10 @@ func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out
 func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.ProjectContext, absPath string) ([]string, error) {
 	var outputs []string
 
+	// Acquire read lock for the repository to prevent git operations from modifying files w
+	repoReadLockUnlockFn := p.WorkingDir.GetCloneReadLock(ctx.Pull.BaseRepo, ctx.Pull, ctx.Workspace)
+	defer repoReadLockUnlockFn()
+
 	envs := make(map[string]string)
 	for _, step := range steps {
 		var out string

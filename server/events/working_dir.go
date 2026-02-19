@@ -58,6 +58,8 @@ type WorkingDir interface {
 	DeletePlan(logger logging.SimpleLogging, r models.Repo, p models.PullRequest, workspace string, path string, projectName string) error
 	// GetGitUntrackedFiles returns a list of Git untracked files in the working dir.
 	GetGitUntrackedFiles(logger logging.SimpleLogging, r models.Repo, p models.PullRequest, workspace string) ([]string, error)
+	// GetRepoReadLock acquires a read lock for the repository to prevent git operations from modifying files while terraform operations are running.
+	GetCloneReadLock(r models.Repo, p models.PullRequest, workspace string) func()
 }
 
 // FileWorkspace implements WorkingDir with the file system.
@@ -98,8 +100,8 @@ func (w *FileWorkspace) Clone(logger logging.SimpleLogging, headRepo models.Repo
 
 	// Unconditionally wait for the clone lock here, if anyone else is doing any clone
 	// operation in this directory, we wait for it to finish before we check anything.
-	value, _ := cloneLocks.LoadOrStore(cloneDir, new(sync.Mutex))
-	mutex := value.(*sync.Mutex)
+	value, _ := cloneLocks.LoadOrStore(cloneDir, new(sync.RWMutex))
+	mutex := value.(*sync.RWMutex)
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -168,8 +170,8 @@ func (w *FileWorkspace) MergeAgain(
 
 	// Unconditionally wait for the clone lock here, if anyone else is doing any clone
 	// operation in this directory, we wait for it to finish before we check anything.
-	value, _ := cloneLocks.LoadOrStore(cloneDir, new(sync.Mutex))
-	mutex := value.(*sync.Mutex)
+	value, _ := cloneLocks.LoadOrStore(cloneDir, new(sync.RWMutex))
+	mutex := value.(*sync.RWMutex)
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -551,4 +553,14 @@ func (w *FileWorkspace) GetGitUntrackedFiles(logger logging.SimpleLogging, r mod
 	untrackedFiles := strings.Split(string(output), "\n")[:]
 	logger.Debug("Untracked files: '%s'", strings.Join(untrackedFiles, ","))
 	return untrackedFiles, nil
+}
+
+func (w *FileWorkspace) GetCloneReadLock(r models.Repo, p models.PullRequest, workspace string) func() {
+	cloneDir := w.cloneDir(r, p, workspace)
+	value, _ := cloneLocks.LoadOrStore(cloneDir, new(sync.RWMutex))
+	mutex := value.(*sync.RWMutex)
+	mutex.RLock()
+	return func() {
+		mutex.RUnlock()
+	}
 }
