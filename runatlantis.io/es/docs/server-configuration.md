@@ -608,7 +608,9 @@ Habilitar Atlantis para formatear la salida de Terraform plan en un formato amig
 
 Útil para habilitar para usar con GitHub. Las líneas cambiadas dentro de diffs de heredoc y multiline-string de Terraform también se formatean para que renderizadores markdown conscientes de diff puedan colorearlas.
 
-### `--enable-drift-detection`
+### `--enable-drift-detection` <Badge text="Experimental" type="warning"/>
+
+Consulta el [experimento de detección de drift](../../docs/experiments.md#drift-detection) para conocer sus limitaciones y requisitos de graduación.
 
 ```bash
 atlantis server --enable-drift-detection
@@ -627,7 +629,9 @@ incluyendo resultados heartbeat de no-drift. La detección de drift no omite tea
 no pueden evaluarse fuera de un pull request. Las acciones destructivas de apply de remediación de drift también requieren
 `--enable-drift-remediation`. El valor predeterminado es `false`.
 
-### `--enable-drift-remediation`
+### `--enable-drift-remediation` <Badge text="Experimental" type="warning"/>
+
+Forma parte del [experimento de detección de drift](../../docs/experiments.md#drift-detection); sus limitaciones y requisitos de graduación también se aplican a la remediación.
 
 ```bash
 atlantis server --enable-drift-detection --enable-drift-remediation
@@ -708,6 +712,18 @@ Nombre ejecutable disparador del comando de comentario. El valor predeterminado 
 Esto es útil al ejecutar múltiples servidores Atlantis contra un solo repositorio.
 
 Nota: la advertencia de error ortográfico "did you mean" solo se aplica al nombre ejecutable predeterminado (`atlantis`). Si establece un `--executable-name` personalizado, Atlantis no advertirá sobre comentarios que estén cerca de él según Levenshtein — esto evita advertencias espurias cuando múltiples servidores con nombres similares (p. ej. `atlantis-dev` y `atlantis-prod`) reciben el mismo comentario.
+
+### `--experiments`
+
+Permisos para experimentos del servidor. La lista predeterminada está vacía. Los nombres deben coincidir exactamente; un nombre desconocido impide el inicio. Dar permiso no activa una función: sus propios ajustes controlan la activación.
+
+```sh
+atlantis server --experiments=drift-detection
+```
+
+Configura `ATLANTIS_EXPERIMENTS` como una lista separada por comas, o usa una lista YAML bajo `experiments` en el archivo de configuración del servidor. Repetir el flag añade nombres. Los flags prevalecen sobre el entorno, que prevalece sobre el archivo de configuración; las listas de distintas fuentes no se combinan. Usa `--experiments=` para vaciar la lista.
+
+Consulta [Experimentos](../../docs/experiments.md) para conocer los nombres admitidos y los detalles de compatibilidad.
 
 ### `--fail-on-pre-workflow-hook-error`
 

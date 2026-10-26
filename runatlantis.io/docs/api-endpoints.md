@@ -2,8 +2,8 @@
 
 Aside from interacting via pull request comments, Atlantis could respond to a limited number of API endpoints.
 
-:::warning ALPHA API - SUBJECT TO CHANGE
-The API endpoints documented on this page are currently in **alpha state** and are **not considered stable**. The request and response schemas may change at any time without prior notice or deprecation period.
+:::warning EXPERIMENTAL API - SUBJECT TO CHANGE
+The API endpoints documented on this page are **experimental** and are **not considered stable**. The request and response schemas may change at any time without prior notice or deprecation period.
 
 If you build integrations against these endpoints, when upgrading Atlantis you should review the release notes carefully and be prepared to update your code.
 :::
@@ -295,10 +295,12 @@ curl --request POST 'https://<ATLANTIS_HOST_NAME>/api/apply' \
 Error responses follow the same legacy format as the plan endpoint. See the [plan error response example](#sample-response-error) for details.
 :::
 
-## Drift Detection And Remediation (Alpha)
+## Drift Detection And Remediation (Experimental) {#drift-detection-and-remediation-alpha}
 
-:::warning ALPHA FEATURE - SUBJECT TO CHANGE
-The drift detection, drift status, remediation, remediation history, and drift webhook APIs are alpha features. Their request fields, response schemas, storage semantics, webhook payloads, and safety gates may change before the feature is promoted to stable.
+:::warning EXPERIMENTAL FEATURE - SUBJECT TO CHANGE
+The drift detection, drift status, remediation, remediation history, and drift webhook APIs are experimental features. Their request fields, response schemas, storage semantics, webhook payloads, and safety gates may change before the feature is promoted to stable.
+
+See the [drift detection experiment](experiments.md#drift-detection) for limitations and graduation requirements.
 
 Drift detection runs Terraform plan workflows and can execute configured hooks or custom plan steps. Destructive remediation apply requires both `--enable-drift-detection` and `--enable-drift-remediation`.
 :::

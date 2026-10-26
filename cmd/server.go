@@ -38,7 +38,7 @@ const (
 // To add a new flag you must:
 // 1. Add a const with the flag name (in alphabetic order).
 // 2. Add a new field to server.UserConfig and set the mapstructure tag equal to the flag name.
-// 3. Add your flag's description etc. to the stringFlags, intFlags, or boolFlags slices.
+// 3. Add your flag's description and default to stringFlags, stringSliceFlags, intFlags, or boolFlags.
 const (
 	// Flag names.
 	ADWebhookPasswordFlag            = "azuredevops-webhook-password" // nolint: gosec
@@ -84,6 +84,7 @@ const (
 	EnableRegExpCmdFlag              = "enable-regexp-cmd"
 	EnableProfilingAPI               = "enable-profiling-api"
 	ExecutableName                   = "executable-name"
+	ExperimentsFlag                  = "experiments"
 	FailOnPreWorkflowHookError       = "fail-on-pre-workflow-hook-error"
 	HideUnchangedPlanComments        = "hide-unchanged-plan-comments"
 	GHHostnameFlag                   = "gh-hostname"
@@ -207,6 +208,12 @@ const (
 	DefaultWebUsername                  = "atlantis"
 	DefaultWebPassword                  = "atlantis"
 )
+
+var stringSliceFlags = map[string]stringSliceFlag{
+	ExperimentsFlag: {
+		description: "Server experiment opt-ins, separated by commas. Does not enable features. See " + server.ExperimentsDocumentationURL + ".",
+	},
+}
 
 var stringFlags = map[string]stringFlag{
 	ADTokenFlag: {
@@ -765,6 +772,11 @@ type stringFlag struct {
 	defaultValue string
 	hidden       bool
 }
+type stringSliceFlag struct {
+	description  string
+	defaultValue []string
+	hidden       bool
+}
 type intFlag struct {
 	description  string
 	defaultValue int
@@ -836,7 +848,7 @@ func (s *ServerCmd) Init() *cobra.Command {
 	s.Viper.AutomaticEnv()
 	s.Viper.SetTypeByDefaultValue(true)
 
-	c.SetUsageTemplate(usageTmpl(stringFlags, intFlags, boolFlags))
+	c.SetUsageTemplate(usageTmpl(stringFlags, intFlags, boolFlags, stringSliceFlags))
 	// If a user passes in an invalid flag, tell them what the flag was.
 	c.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
 		s.printErr(err)
@@ -850,6 +862,14 @@ func (s *ServerCmd) Init() *cobra.Command {
 			usage = fmt.Sprintf("%s (default %q)", usage, f.defaultValue)
 		}
 		c.Flags().String(name, "", usage+"\n")
+		s.Viper.BindPFlag(name, c.Flags().Lookup(name)) // nolint: errcheck
+		if f.hidden {
+			c.Flags().MarkHidden(name) // nolint: errcheck
+		}
+	}
+
+	for name, f := range stringSliceFlags {
+		c.Flags().StringSlice(name, f.defaultValue, f.description+"\n")
 		s.Viper.BindPFlag(name, c.Flags().Lookup(name)) // nolint: errcheck
 		if f.hidden {
 			c.Flags().MarkHidden(name) // nolint: errcheck
@@ -1075,6 +1095,10 @@ func (s *ServerCmd) setDefaults(c *server.UserConfig, v *viper.Viper) {
 }
 
 func (s *ServerCmd) validate(userConfig server.UserConfig) error {
+	// Check before preparing directories; NewServer also validates direct callers.
+	if err := userConfig.ValidateExperiments(); err != nil {
+		return err
+	}
 	userConfig.LogLevel = strings.ToLower(userConfig.LogLevel)
 	if !isValidLogLevel(userConfig.LogLevel) {
 		return fmt.Errorf("invalid log level: must be one of %v", ValidLogLevels)

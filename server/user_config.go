@@ -149,6 +149,9 @@ type UserConfig struct {
 	WriteGitCreds              bool            `mapstructure:"write-git-creds"`
 	WebsocketCheckOrigin       bool            `mapstructure:"websocket-check-origin"`
 	UseTFPluginCache           bool            `mapstructure:"use-tf-plugin-cache"`
+
+	// Experiments grants server-only permissions without enabling features.
+	Experiments []string `mapstructure:"experiments"`
 }
 
 // ToAllowCommandNames parse AllowCommands into a slice of CommandName

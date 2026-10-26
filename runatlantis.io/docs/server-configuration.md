@@ -609,7 +609,9 @@ Enable Atlantis to format Terraform plan output into a markdown-diff friendly fo
 
 Useful to enable for use with GitHub. Changed lines inside Terraform heredoc and multiline-string diffs are also formatted so diff-aware markdown renderers can color them.
 
-### `--enable-drift-detection`
+### `--enable-drift-detection` <Badge text="Experimental" type="warning"/>
+
+See the [drift detection experiment](experiments.md#drift-detection) for limitations and graduation requirements.
 
 ```bash
 atlantis server --enable-drift-detection
@@ -628,7 +630,9 @@ including no-drift heartbeat results. Drift detection does not bypass team allow
 they cannot be evaluated outside a pull request. Destructive drift remediation apply actions also require
 `--enable-drift-remediation`. Defaults to `false`.
 
-### `--enable-drift-remediation`
+### `--enable-drift-remediation` <Badge text="Experimental" type="warning"/>
+
+Part of the [drift detection experiment](experiments.md#drift-detection); its limitations and graduation requirements also apply to remediation.
 
 ```bash
 atlantis server --enable-drift-detection --enable-drift-remediation
@@ -709,6 +713,18 @@ Comment command trigger executable name. Defaults to `atlantis`.
 This is useful when running multiple Atlantis servers against a single repository.
 
 Note: the "did you mean" misspelling warning only applies to the default executable name (`atlantis`). If you set a custom `--executable-name`, Atlantis won't warn about comments that are Levenshtein-close to it — this avoids spurious warnings when multiple servers with similar names (e.g. `atlantis-dev` and `atlantis-prod`) receive the same comment.
+
+### `--experiments`
+
+Server experiment opt-ins. The default list is empty. Names match exactly; unknown names prevent startup. Opting in does not enable a feature: its own settings control activation.
+
+```sh
+atlantis server --experiments=drift-detection
+```
+
+Set `ATLANTIS_EXPERIMENTS` to a comma-separated list, or use a YAML list under `experiments` in the server configuration file. Repeated flags append names. Flags override the environment, which overrides the configuration file; lists from different sources are not combined. Use `--experiments=` to clear the list.
+
+See [Experiments](experiments.md) for supported names and compatibility details.
 
 ### `--fail-on-pre-workflow-hook-error`
 
