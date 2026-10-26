@@ -44,10 +44,11 @@ jobs:
               - 'runatlantis.io/**'
               - 'docs/adr/**'
               - 'scripts/website/**'
-              - '.lycheeignore'
               - 'package-lock.json'
               - 'package.json'
+              - 'netlify.toml'
               - '.github/workflows/website.yml'
+              - '.lycheeignore'
               - '.vale.ini'
               - '_typos.toml'
               - '.github/styles/**'
@@ -126,12 +127,18 @@ jobs:
           # build site
           npm ci
           npm run website:test:adrs
-          npm run website:build
+          npm run website:test:versioned
+          npm run website:build -- --outDir /tmp/atlantis-normal-docs
+          npm run website:build:versioned -- --versions v0.4.0,v0.26.0,v0.48.0 --outDir /tmp/atlantis-versioned-docs
 
           # start http-server for integration testing
-          npx http-server runatlantis.io/.vitepress/dist &
+          python3 -m http.server 8080 --directory /tmp/atlantis-normal-docs &
+          python3 -m http.server 8081 --directory /tmp/atlantis-versioned-docs &
 
       - name: Run Playwright E2E tests
+        env:
+          ATLANTIS_VERSIONED_DOCS_URL: http://127.0.0.1:8081
+          ATLANTIS_NORMAL_DOCS_URL: http://127.0.0.1:8080
         run: |
           npx playwright install --with-deps
           npm run e2e
