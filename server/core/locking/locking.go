@@ -34,6 +34,7 @@ type Client struct {
 type Locker interface {
 	TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error)
 	Unlock(key string) (*models.ProjectLock, error)
+	UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error)
 	UnlockIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
 	List() (map[string]models.ProjectLock, error)
 	UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error)
@@ -75,6 +76,16 @@ func (c *Client) Unlock(key string) (*models.ProjectLock, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.database.Unlock(repo, project, workspace)
+}
+
+// UnlockOwned carries an internal claim owner without adding it to the public lock key.
+func (c *Client) UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error) {
+	repo, project, workspace, err := c.decodeKey(key)
+	if err != nil {
+		return nil, err
+	}
+	repo.Execution = pull.Execution
 	return c.database.Unlock(repo, project, workspace)
 }
 
@@ -121,10 +132,16 @@ func (c *Client) GetLock(key string) (*models.ProjectLock, error) {
 }
 
 func (c *Client) key(repo models.Repo, p models.Project, workspace string) string {
+	if codec, ok := c.database.(db.LockKeyCodec); ok {
+		return codec.LockKey(repo, p, workspace)
+	}
 	return models.GenerateLockKey(p, workspace)
 }
 
 func (c *Client) decodeKey(key string) (models.Repo, models.Project, string, error) {
+	if codec, ok := c.database.(db.LockKeyCodec); ok {
+		return codec.ParseLockKey(key)
+	}
 	p, workspace, err := c.lockKeyToProjectWorkspace(key)
 	return models.Repo{FullName: p.RepoFullName}, p, workspace, err
 }
@@ -192,4 +209,8 @@ func (c *NoOpLocker) GetLock(_ string) (*models.ProjectLock, error) {
 
 func (c *NoOpLocker) key(p models.Project, workspace string) string {
 	return models.GenerateLockKey(p, workspace)
+}
+
+func (c *NoOpLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
 }
