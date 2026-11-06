@@ -21,6 +21,8 @@ heartbeats, expiring leases, automatic retries, or operator reconciliation yet.
 Run storage tests with `go test -race ./server/core/sqlstore`. PostgreSQL,
 distributed leases, and recovery tooling are separate follow-up work.
 
-The schema is an unreleased draft. Databases created by earlier drafts must be
-recreated. Native database dumps are not a cross-backend migration format; a
-future transfer must copy typed rows into a schema initialized by Goose.
+The unreleased schema uses one initial migration; later changes add new versions.
+Recreate databases made with the earlier draft migration sequence.
+
+Native database dumps are not a cross-backend migration format; a future transfer
+must copy typed rows into a schema initialized by Goose.

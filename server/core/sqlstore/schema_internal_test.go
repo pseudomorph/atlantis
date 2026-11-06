@@ -5,8 +5,6 @@ package sqlstore
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
 	"testing"
 	"testing/fstest"
 
@@ -77,30 +75,26 @@ func TestRevisionAndTargetChangesReplaceProjects(t *testing.T) {
 	Equals(t, 2, len(got.Projects))
 }
 
-func TestUpgradeEarlierMigrationsPreservesRows(t *testing.T) {
-	dir := t.TempDir()
-	conn, err := sql.Open("sqlite", filepath.Join(dir, "atlantis.sqlite"))
-	Ok(t, err)
-	files := fstest.MapFS{}
-	for _, name := range []string{"00001_core.sql", "00002_jobs_artifacts.sql"} {
-		content, err := migrationFiles.ReadFile("migrations/" + name)
-		Ok(t, err)
-		files[name] = &fstest.MapFile{Data: content}
-	}
-	provider, err := goose.NewProvider(goose.DialectSQLite3, conn, files)
-	Ok(t, err)
-	_, err = provider.Up(context.Background())
-	Ok(t, err)
-	_, err = conn.Exec("INSERT INTO command_locks(command, unix_time) VALUES (?, ?)", int(command.Apply), 123)
-	Ok(t, err)
-	Ok(t, conn.Close())
-	store, err := OpenServer(dir)
+func TestVersionedMigrationPreservesRows(t *testing.T) {
+	store, err := OpenServer(t.TempDir())
 	Ok(t, err)
 	defer store.Close()
+	Ok(t, store.db.Exec("INSERT INTO command_locks(command, unix_time) VALUES (?, ?)", int(command.Apply), 123).Error)
+	initial, err := migrationFiles.ReadFile("migrations/00001_initial.sql")
+	Ok(t, err)
+	files := fstest.MapFS{
+		"00001_initial.sql": {Data: initial},
+		"00002_test.sql":    {Data: []byte("-- +goose Up\nALTER TABLE command_locks ADD COLUMN note TEXT NOT NULL DEFAULT '';\n")},
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, store.conn, files)
+	Ok(t, err)
+	applied, err := provider.Up(context.Background())
+	Ok(t, err)
+	Equals(t, 1, len(applied))
 	lock, err := store.CheckCommandLock(command.Apply)
 	Ok(t, err)
 	Equals(t, int64(123), lock.LockMetadata.UnixTime)
-	var count int64
-	Ok(t, store.db.Raw("SELECT COUNT(*) FROM pragma_table_info('project_statuses') WHERE name = 'plan_hash'").Scan(&count).Error)
-	Equals(t, int64(1), count)
+	var note string
+	Ok(t, store.db.Raw("SELECT note FROM command_locks WHERE command = ?", int(command.Apply)).Scan(&note).Error)
+	Equals(t, "", note)
 }
