@@ -237,15 +237,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
-	if globalCfg.ExternalStores.PlanStore.Type != "" {
-		logger.Warn("external_stores.plan_store is deprecated; use storage.artifacts with the durable-storage experiment")
-		if userConfig.Storage != nil {
-			return nil, fmt.Errorf("storage cannot be combined with external_stores.plan_store")
-		}
+	if globalCfg.ExternalStores.PlanStore.Type != "" && userConfig.Storage != nil {
+		return nil, fmt.Errorf("storage cannot be combined with external_stores.plan_store")
 	}
-	if userConfig.Storage == nil {
-		logger.Warn("BoltDB and Redis storage are deprecated in favor of the durable-storage experiment; legacy stores remain supported until graduation and the notice period in ADR 0004")
-	}
+
 	statsScope, statsReporter, closer, err := metrics.NewScope(globalCfg.Metrics, logger, userConfig.StatsNamespace)
 
 	if err != nil {

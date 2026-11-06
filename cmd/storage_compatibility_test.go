@@ -12,7 +12,7 @@ import (
 	. "github.com/runatlantis/atlantis/testing"
 )
 
-func TestStorageDeprecationWarningsAcrossConfigurationSources(t *testing.T) {
+func TestStorageSettingsDoNotWarnAboutDeprecation(t *testing.T) {
 	for _, source := range []string{"flag", "environment", "yaml"} {
 		t.Run(source, func(t *testing.T) {
 			t.Setenv("ATLANTIS_REDIS_PASSWORD", "")
@@ -42,17 +42,18 @@ func TestStorageDeprecationWarningsAcrossConfigurationSources(t *testing.T) {
 			Ok(t, readErr)
 			Ok(t, reader.Close())
 			Ok(t, err)
-			Assert(t, strings.Contains(string(output), "--redis-password has been deprecated"), "missing deprecation warning")
+			Assert(t, !strings.Contains(string(output), "deprecated"), "storage setting produced a premature deprecation warning")
 			Assert(t, !strings.Contains(string(output), "never-print-this"), "warning exposed a credential")
 		})
 	}
 }
 
-func TestLegacyStorageFlagsRemainDiscoverableAsDeprecated(t *testing.T) {
+func TestStorageFlagsRemainSupported(t *testing.T) {
 	command := setupWithDefaults(map[string]any{}, t)
-	for _, name := range legacyStorageFlags {
+	for _, name := range []string{LockingDBType, EnableExternalStoresFlag, SharePlanDirFlag, RedisDB, RedisHost, RedisPassword, RedisPort, RedisTLSEnabled, RedisInsecureSkipVerify, RedisUsername, RedisClusterAddresses} {
 		flag := command.Flags().Lookup(name)
 		Assert(t, flag != nil, "legacy flag removed before graduation")
-		Assert(t, strings.Contains(flag.Usage, "Deprecated"), "flag lacks deprecation guidance: %s", name)
+		Assert(t, !strings.Contains(flag.Usage, "Deprecated"), "storage flag prematurely marked deprecated: %s", name)
+		Equals(t, "", flag.Deprecated)
 	}
 }

@@ -22,5 +22,6 @@ Separate PostgreSQL and multi-instance work:
   competing commands, duplicate webhooks, cancellation, closure, and instance loss
   before advertising shared deployments.
 
-Graduation, the default switch, and removal of legacy storage require the
-ADR 0004 notice period and are separate reviewed changes.
+Deprecation notices start in a separately reviewed release once the replacement
+is ready for affected installations. Graduation, the default switch, and legacy
+storage removal are separate changes; removal requires the ADR 0004 notice period.

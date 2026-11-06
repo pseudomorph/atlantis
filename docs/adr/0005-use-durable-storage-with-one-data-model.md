@@ -60,7 +60,7 @@ Logs stay with their originating job and are saved during execution. They have a
 
 Durable storage ships behind the `durable-storage` experiment; existing installs keep their configured stores unless operators opt in. The experiment will include the documentation page and graduation checklist required by [ADR 0004](0004-govern-feature-lifecycles.md), with implementation details and open questions tracked in [#7031](https://github.com/runatlantis/atlantis/issues/7031). The existing S3 plan store becomes the artifact store's object storage backend, with new configuration replacing `--enable-external-stores`. This ADR also covers the durable job output proposed in [#6928](https://github.com/runatlantis/atlantis/pull/6928) and replaces that proposal.
 
-BoltDB, Redis, and `--enable-external-stores` are deprecated in the release that introduces the experiment. If the experiment is withdrawn, those deprecations are withdrawn too. After graduation and the required ADR 0004 notice period, reviewed PRs make durable storage the default and remove the old stores and configuration. Those changes may ship in the same release.
+Introducing the experiment does not deprecate existing storage. BoltDB, Redis, and `--enable-external-stores` are deprecated in a separately reviewed release once the replacement is ready for affected installations. The ADR 0004 notice period starts with that release. If the experiment is withdrawn, those deprecations are withdrawn too. After graduation and the required ADR 0004 notice period, reviewed PRs make durable storage the default and remove the old stores and configuration. Those changes may ship in the same release.
 
 Cutover requires draining active work, starting with an empty store, and replanning open PRs. No migration tooling is planned for the old locks, PR status, and plans; replanning is already the documented [recovery procedure](https://www.runatlantis.io/docs/faq.html). Experiment data, including logs and job history, may not survive disabling the experiment or resetting its storage before graduation. Operators who need that data must preserve it separately.
 
@@ -68,7 +68,7 @@ Cutover requires draining active work, starting with an empty store, and replann
 
 New features share records, identities, and storage rules. Plans survive restarts, logs and job records survive PR cleanup, and multi-instance behavior has explicit correctness requirements.
 
-Schema changes go through shared migrations. Saving an artifact writes to the artifact store and the database without one transaction covering both, so recovery and cleanup have to handle partial writes. Retained output needs protection and cleanup. Database claims can't stop Terraform processes on another host. Multi-instance installs using Redis will need PostgreSQL, and existing installs will receive deprecation warnings while the replacement is experimental.
+Schema changes go through shared migrations. Saving an artifact writes to the artifact store and the database without one transaction covering both, so recovery and cleanup have to handle partial writes. Retained output needs protection and cleanup. Database claims can't stop Terraform processes on another host. Multi-instance installs using Redis will need PostgreSQL before they can switch.
 
 ## Alternatives considered
 

@@ -89,10 +89,9 @@ Values are chosen in this order:
 
 ## Flags
 
-BoltDB, Redis, the legacy S3 plan-store configuration, and their storage flags are
-deprecated in the unreleased durable-storage experiment release. Existing settings
-remain supported during the experiment. See the [replacement settings and removal
-policy](experiments.md#legacy-storage-deprecations) before changing an installation.
+BoltDB, Redis, and the existing storage flags remain supported. Durable storage is
+an opt-in experiment. See the [storage configuration mapping](experiments.md#existing-storage-configuration)
+when testing it.
 
 ### `--allow-commands`
 
@@ -718,7 +717,7 @@ rejected while read-only drift detection remains available. This flag does not b
 repository `apply_requirements`; requirements that need pull request state fail closed for
 non-PR remediation requests. Defaults to `false`.
 
-### `--enable-external-stores` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--enable-external-stores`
 
 ```bash
 atlantis server --enable-external-stores
@@ -1245,7 +1244,7 @@ command_titles:
 For complete markdown wording customization, keep using
 `--markdown-template-overrides-dir`.
 
-### `--locking-db-type` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--locking-db-type`
 
 ```bash
 atlantis server --locking-db-type="<boltdb|redis>"
@@ -1378,7 +1377,7 @@ ATLANTIS_QUIET_POLICY_CHECKS=true
 
 Exclude policy check comments from pull requests unless there's an actual error from conftest. This also excludes warnings. Defaults to `false`.
 
-### `--redis-cluster-addresses` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-cluster-addresses`
 
 ```bash
 atlantis server --redis-cluster-addresses="redis-node-0:6379,redis-node-1:6379,redis-node-2:6379"
@@ -1388,7 +1387,7 @@ ATLANTIS_REDIS_CLUSTER_ADDRESSES="redis-node-0:6379,redis-node-1:6379,redis-node
 
 Comma-delimited list of Redis cluster node addresses in the format `host:port`. When set, Atlantis uses Redis Cluster mode instead of single-node mode. This is mutually exclusive with `--redis-host`/`--redis-port` (which are used for single-node mode).
 
-### `--redis-db` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-db`
 
 ```bash
 atlantis server --redis-db=0
@@ -1398,7 +1397,7 @@ ATLANTIS_REDIS_DB=0
 
 The Redis Database to use when using a Locking DB type of `redis`. Defaults to `0`.
 
-### `--redis-host` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-host`
 
 ```bash
 atlantis server --redis-host="localhost"
@@ -1408,7 +1407,7 @@ ATLANTIS_REDIS_HOST="localhost"
 
 The Redis Hostname for when using a Locking DB type of `redis`.
 
-### `--redis-insecure-skip-verify` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-insecure-skip-verify`
 
 ```bash
 atlantis server --redis-insecure-skip-verify=false
@@ -1422,7 +1421,7 @@ Controls whether the Redis client verifies the Redis server's certificate chain 
 If this is enabled, TLS is susceptible to machine-in-the-middle attacks unless custom verification is used.
 :::
 
-### `--redis-password` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-password`
 
 ```bash
 atlantis server --redis-password="password123"
@@ -1432,7 +1431,7 @@ ATLANTIS_REDIS_PASSWORD="password123"
 
 The Redis Password for when using a Locking DB type of `redis`.
 
-### `--redis-port` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-port`
 
 ```bash
 atlantis server --redis-port=6379
@@ -1442,7 +1441,7 @@ ATLANTIS_REDIS_PORT=6379
 
 The Redis Port for when using a Locking DB type of `redis`. Defaults to `6379`.
 
-### `--redis-tls-enabled` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-tls-enabled`
 
 ```bash
 atlantis server --redis-tls-enabled=false
@@ -1452,7 +1451,7 @@ ATLANTIS_REDIS_TLS_ENABLED=false
 
 Enables a TLS connection, with min version of 1.2, to Redis when using a Locking DB type of `redis`. Defaults to `false`.
 
-### `--redis-username` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--redis-username`
 
 ```bash
 atlantis server --redis-username="myuser"
@@ -1561,7 +1560,7 @@ ATLANTIS_RESTRICT_FILE_LIST=true
 When `--enable-regexp-cmd` is also enabled, regex project plans such as `atlantis plan -p .*` are scoped to matching projects with files modified in the pull request.
 Defaults to `false`.
 
-### `--share-plan-dir` <Badge text="Deprecated (unreleased)" type="warning"/>
+### `--share-plan-dir`
 
 ```bash
 atlantis server --share-plan-dir="path/to/local/plan/dir"

@@ -141,20 +141,20 @@ Experiment permission alone leaves the selected backend unchanged. Configuring
 `storage` without permission rejects startup. Database open or migration errors
 stop startup. Databases created by earlier local drafts must be recreated.
 
-### Legacy storage deprecations
+### Existing storage configuration
 
-These deprecations start in the release introducing the experiment:
+Existing stores and settings remain supported. Introducing the experiment does not
+start deprecation or its notice period. A later reviewed release will introduce
+notices once the replacement is ready for affected installations. Removal still
+requires graduation and the ADR 0004 notice period: at least two stable minor
+releases and 60 days, whichever is longer.
 
-| Existing setting or feature | Replacement |
+| Existing setting or feature | Durable storage setting |
 | --- | --- |
 | BoltDB, Redis, `locking-db-type`, and all `redis-*` settings | `storage.database` |
 | `enable-external-stores` and `external_stores.plan_store` (including its S3 settings) | `storage.artifacts` |
 | `share-plan-dir` | `storage.artifacts.type: filesystem` and `storage.artifacts.directory` |
 
-Startup warns about legacy backends and configured deprecated settings. Flag,
-environment, and YAML forms have the same deprecation status. The existing stores
-remain functional during the experiment. Removal requires graduation and the
-ADR 0004 notice period: at least two stable minor releases and 60 days, whichever is longer. The first warning release is unreleased; when it ships as N, removal is no earlier than N+2 and still requires graduation. Withdrawing the experiment withdraws these deprecations.
 `data-dir` and project-locking controls remain supported.
 
 ### Behavior and limits
