@@ -38,8 +38,46 @@ log-level: ...
 
 ::: warning
 The config file you pass to `--config` is different from the `--repo-config` file.
-The `--config` config file is only used as an alternate way of setting `atlantis server` flags.
+The `--config` config file sets server options, including the experimental structured `storage` section below.
 :::
+
+## Durable storage configuration
+
+The unreleased `durable-storage` experiment uses a structured YAML section with
+no corresponding storage flags. Other server configuration remains unchanged.
+
+```yaml
+experiments: [durable-storage]
+data-dir: /var/lib/atlantis-durable
+storage:
+  database:
+    type: sqlite
+  artifacts:
+    type: database
+  retention:
+    logs: 168h
+    plan_artifacts: 0s
+```
+
+`storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
+under `data-dir`. Run one Atlantis process on local or block-backed storage;
+network filesystems such as NFS/EFS are unsupported. PostgreSQL and shared
+operation are deferred.
+
+`storage.artifacts.type` accepts `database` (the default), `filesystem`, or `s3`.
+Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`. S3 settings
+are under `storage.artifacts.s3`: `bucket`, `region`, `prefix`, `endpoint`,
+`force_path_style`, and `profile`. Credentials use the AWS SDK credential chain.
+Protect artifact storage and the database with appropriate access controls,
+encryption at rest, and backups; plans and logs can contain secrets.
+
+`storage.retention.logs` is a positive Go duration, defaulting to `168h` after PR
+closure or non-PR job completion. `storage.retention.plan_artifacts` defaults to `0s`. It retains plans, showfiles, and declared workflow files after their plan is applied or invalidated; pending plans and running jobs remain protected.
+`storage.workflow_files` can list additional repository-relative files to preserve
+between workflow stages. Unknown storage keys and conflicting backend settings
+reject startup. Do not combine `storage` with `locking-db-type` or
+`enable-external-stores`. See [Durable storage](experiments.md#durable-storage)
+for cutover instructions and draft limitations.
 
 ## Precedence
 
@@ -50,6 +88,11 @@ Values are chosen in this order:
 1. Config File
 
 ## Flags
+
+BoltDB, Redis, the legacy S3 plan-store configuration, and their storage flags are
+deprecated in the unreleased durable-storage experiment release. Existing settings
+remain supported during the experiment. See the [replacement settings and removal
+policy](experiments.md#legacy-storage-deprecations) before changing an installation.
 
 ### `--allow-commands`
 
@@ -675,7 +718,7 @@ rejected while read-only drift detection remains available. This flag does not b
 repository `apply_requirements`; requirements that need pull request state fail closed for
 non-PR remediation requests. Defaults to `false`.
 
-### `--enable-external-stores`
+### `--enable-external-stores` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --enable-external-stores
@@ -1202,7 +1245,7 @@ command_titles:
 For complete markdown wording customization, keep using
 `--markdown-template-overrides-dir`.
 
-### `--locking-db-type`
+### `--locking-db-type` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --locking-db-type="<boltdb|redis>"
@@ -1216,6 +1259,8 @@ Notes:
 
 - If set to `boltdb`, only one process may have access to the boltdb instance.
 - If set to `redis`, use `--redis-host` and `--redis-port` for single-node mode, or `--redis-cluster-addresses` for Redis Cluster mode. Use `--redis-password` and (optionally) `--redis-username` only if your Redis deployment requires authentication.
+
+The durable-storage draft uses the structured `storage.database` setting instead. Do not combine `storage` with an explicit `locking-db-type`. See [Durable storage](experiments.md#durable-storage).
 
 ### `--log-level`
 
@@ -1333,7 +1378,7 @@ ATLANTIS_QUIET_POLICY_CHECKS=true
 
 Exclude policy check comments from pull requests unless there's an actual error from conftest. This also excludes warnings. Defaults to `false`.
 
-### `--redis-cluster-addresses`
+### `--redis-cluster-addresses` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-cluster-addresses="redis-node-0:6379,redis-node-1:6379,redis-node-2:6379"
@@ -1343,7 +1388,7 @@ ATLANTIS_REDIS_CLUSTER_ADDRESSES="redis-node-0:6379,redis-node-1:6379,redis-node
 
 Comma-delimited list of Redis cluster node addresses in the format `host:port`. When set, Atlantis uses Redis Cluster mode instead of single-node mode. This is mutually exclusive with `--redis-host`/`--redis-port` (which are used for single-node mode).
 
-### `--redis-db`
+### `--redis-db` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-db=0
@@ -1353,7 +1398,7 @@ ATLANTIS_REDIS_DB=0
 
 The Redis Database to use when using a Locking DB type of `redis`. Defaults to `0`.
 
-### `--redis-host`
+### `--redis-host` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-host="localhost"
@@ -1363,7 +1408,7 @@ ATLANTIS_REDIS_HOST="localhost"
 
 The Redis Hostname for when using a Locking DB type of `redis`.
 
-### `--redis-insecure-skip-verify`
+### `--redis-insecure-skip-verify` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-insecure-skip-verify=false
@@ -1377,7 +1422,7 @@ Controls whether the Redis client verifies the Redis server's certificate chain 
 If this is enabled, TLS is susceptible to machine-in-the-middle attacks unless custom verification is used.
 :::
 
-### `--redis-password`
+### `--redis-password` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-password="password123"
@@ -1387,7 +1432,7 @@ ATLANTIS_REDIS_PASSWORD="password123"
 
 The Redis Password for when using a Locking DB type of `redis`.
 
-### `--redis-port`
+### `--redis-port` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-port=6379
@@ -1397,7 +1442,7 @@ ATLANTIS_REDIS_PORT=6379
 
 The Redis Port for when using a Locking DB type of `redis`. Defaults to `6379`.
 
-### `--redis-tls-enabled`
+### `--redis-tls-enabled` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-tls-enabled=false
@@ -1407,7 +1452,7 @@ ATLANTIS_REDIS_TLS_ENABLED=false
 
 Enables a TLS connection, with min version of 1.2, to Redis when using a Locking DB type of `redis`. Defaults to `false`.
 
-### `--redis-username`
+### `--redis-username` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --redis-username="myuser"
@@ -1516,7 +1561,7 @@ ATLANTIS_RESTRICT_FILE_LIST=true
 When `--enable-regexp-cmd` is also enabled, regex project plans such as `atlantis plan -p .*` are scoped to matching projects with files modified in the pull request.
 Defaults to `false`.
 
-### `--share-plan-dir`
+### `--share-plan-dir` <Badge text="Deprecated (unreleased)" type="warning"/>
 
 ```bash
 atlantis server --share-plan-dir="path/to/local/plan/dir"

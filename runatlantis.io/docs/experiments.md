@@ -38,10 +38,11 @@ Names are lowercase and match exactly. Unknown names, wildcard values, `all`, an
 | --- | --- | --- | --- | --- | --- | --- |
 | [API](api-endpoints.md#main-endpoints) | `api` | Experimental | Plan/apply: v0.19.8+. Experiment gate: unreleased (Main only). | Requires `api`; authenticated commands also require `api-secret` | [ADR 0002](/contributing/adr/0002-api-enhancement-drift-detection.md) | [API development #6162](https://github.com/runatlantis/atlantis/issues/6162) |
 | [Drift detection](api-endpoints.md#drift-detection-and-remediation-alpha) | `drift-detection` | Experimental | Legacy API: v0.45.0+. Experiment gate: unreleased (Main only). | Requires `drift-detection`, `api-secret`, and drift enable flags | [ADR 0002](/contributing/adr/0002-api-enhancement-drift-detection.md) | [Development #7033](https://github.com/runatlantis/atlantis/issues/7033) |
+| [Durable storage](#durable-storage) | `durable-storage` | Experimental | Unreleased (Main draft only). | Requires `durable-storage` and structured `storage` configuration | [ADR 0005](/contributing/adr/0005-use-durable-storage-with-one-data-model.md) | [Development #7031](https://github.com/runatlantis/atlantis/issues/7031) |
 
-The supported names are `api` and `drift-detection`. Each permits its own route group and does not grant the other permission. No current release tag contains this setting.
+The supported names are `api`, `drift-detection`, and `durable-storage`. API and drift detection permit separate route groups. Durable storage permits the structured storage configuration; it grants no API or drift permission. No current release tag contains this setting.
 
-Both experiments share ADR 0002, but have separate tracking issues and graduation criteria. Graduating either one does not make the other stable.
+API and drift detection share ADR 0002, but have separate tracking issues and graduation criteria. Graduating either one does not make the other stable.
 
 ## Upgrading existing alpha features
 
@@ -101,3 +102,111 @@ Results currently use in-memory storage and are lost on restart. Drift detection
 - [ ] Record the graduation decision and first stable release in [development tracker #7033](https://github.com/runatlantis/atlantis/issues/7033).
 
 See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles.md) for the lifecycle policy and graduation requirements.
+
+## Durable storage
+
+::: warning Incomplete implementation
+This draft implements the SQLite portion of ADR 0005. PostgreSQL, operator
+recovery, PR reopening, webhook deduplication, and multi-instance acceptance
+tests remain incomplete.
+Use it only for development and testing.
+:::
+
+SQLite uses versioned Goose SQL migrations and works in CGO-disabled builds.
+The database owns application
+records, pending-plan relationships, execution claims, and cancellation requests.
+Artifacts can use the database, a filesystem directory, or S3-compatible storage.
+
+### Enable
+
+Drain the old installation, retain its data, and use a fresh data directory.
+Existing BoltDB or Redis data is not imported. Regenerate plans before applying.
+
+```yaml
+experiments: [durable-storage]
+data-dir: /var/lib/atlantis-durable
+storage:
+  database:
+    type: sqlite
+  artifacts:
+    type: database
+```
+
+Supply the usual VCS credentials and repository allowlist. See
+[storage configuration](server-configuration.md#durable-storage-configuration)
+for artifact backends and retention settings. Do not combine `storage`
+with `locking-db-type` or `enable-external-stores`.
+
+Experiment permission alone leaves the selected backend unchanged. Configuring
+`storage` without permission rejects startup. Database open or migration errors
+stop startup. Databases created by earlier local drafts must be recreated.
+
+### Legacy storage deprecations
+
+These deprecations start in the release introducing the experiment:
+
+| Existing setting or feature | Replacement |
+| --- | --- |
+| BoltDB, Redis, `locking-db-type`, and all `redis-*` settings | `storage.database` |
+| `enable-external-stores` and `external_stores.plan_store` (including its S3 settings) | `storage.artifacts` |
+| `share-plan-dir` | `storage.artifacts.type: filesystem` and `storage.artifacts.directory` |
+
+Startup warns about legacy backends and configured deprecated settings. Flag,
+environment, and YAML forms have the same deprecation status. The existing stores
+remain functional during the experiment. Removal requires graduation and the
+ADR 0004 notice period: at least two stable minor releases and 60 days, whichever is longer. The first warning release is unreleased; when it ships as N, removal is no earlier than N+2 and still requires graduation. Withdrawing the experiment withdraws these deprecations.
+`data-dir` and project-locking controls remain supported.
+
+### Behavior and limits
+
+- SQLite requires one Atlantis process on local or block-backed storage. NFS/EFS
+  and multiple instances are unsupported. Kubernetes deployments must stop the old
+  pod before starting its replacement, for example with `strategy: Recreate`.
+- VCS instances, repositories, PRs, projects, and jobs share foreign-key relationships.
+  Working directories include the VCS instance to prevent same-named repo collisions.
+- Apply and policy checks use the artifacts bound to their pending plan job.
+  Artifact inputs are checked for size and SHA-256 before restoration.
+- Logs flush in chunks during execution (every 200 ms or at 64 KiB) and before job completion. Job records survive artifact cleanup; retention
+  preserves artifacts referenced by pending plans or running jobs.
+- `atlantis cancel` prevents queued jobs from starting; running jobs continue to
+  completion while their execution claim remains held. Active-process interruption
+  is deferred. PR closure also invalidates plans and waits for active work before cleanup.
+  After a crash, prior claims become uncertain and block new commands on the affected
+  scope. They never permit automatic Terraform retries. There are no heartbeats or
+  expiring leases in this single-instance implementation.
+- Custom workflow files must be declared in `storage.workflow_files` to survive
+  loss of a working directory.
+- Project locks survive successful apply until closure, merge, or explicit unlock.
+  `disable-repo-locking` disables project locks, while execution claims remain active.
+
+### Unfinished execution after a crash
+
+This draft has no per-PR recovery command. `atlantis unlock` cannot clear an
+uncertain execution claim. To resume testing, stop Atlantis, independently verify
+that all Terraform and workflow processes have stopped, preserve the old data
+and artifact storage, and restart with a new empty `data-dir`. Replan every open
+PR and restore any required project locks before accepting commands. This starts
+new history; it does not recover the old database or artifacts. Per-PR recovery
+must be implemented before this draft is suitable for production.
+
+### Disable, upgrade, and roll back
+
+Stop Atlantis before backing up the database and artifact storage. For SQLite,
+include WAL sidecars or use a consistent SQLite backup. Preserve filesystem and
+object-storage artifacts with the matching database backup.
+
+To disable or roll back, drain commands, independently verify Terraform has stopped,
+and retain matching binary, configuration, database, and artifact backups. Remove
+`storage` and experiment permission when returning to a legacy configuration.
+Replan before applying against an empty or restored store. Changing configuration
+does not migrate state.
+
+### Durable storage graduation checklist
+
+- [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `schema_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
+- [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
+- [ ] Verify artifact retention, durable logs, and restoring pending plans across restarts and PR cleanup.
+- [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
+- [ ] Review stable configuration and document remaining operational limits.
+
+Graduation, changing defaults, and retiring BoltDB or Redis are separate changes. ADR 0005 remains Proposed. This draft implements only part of its contract. See the [implementation follow-ups](https://github.com/pseudomorph/atlantis/blob/feat/durable-storage-sqlite/docs/durable-storage-follow-ups.md) and track the overall proposal in [#7031](https://github.com/runatlantis/atlantis/issues/7031); this draft is not ready for production use.

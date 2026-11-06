@@ -223,3 +223,10 @@ func (d *DefaultWorkingDirLocker) pullKey(repo string, pull int) string {
 func (d *DefaultWorkingDirLocker) pullLockPrefix(repo string, pull int) string {
 	return fmt.Sprintf("%d:%s/%d/", len(repo), repo, pull)
 }
+
+func WorkingDirectoryRepoKey(repo models.Repo) string {
+	if repo.ExecutionOwner() != "" {
+		return repo.StorageIdentity().Directory() + "/" + repo.FullName
+	}
+	return repo.FullName
+}

@@ -18,6 +18,8 @@ import (
 
 	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+
+	"github.com/runatlantis/atlantis/server/core/planstore"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/logging"
@@ -1241,6 +1243,11 @@ func (p *DefaultProjectCommandBuilder) pathConfiguredOnlyOnAnotherBranch(ctx *co
 // pending plans in this ctx.
 func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *command.Context, commentCmd *CommentCommand) ([]command.ProjectContext, error) {
 	pullDir, err := p.WorkingDir.GetPullDir(ctx.Pull.BaseRepo, ctx.Pull)
+	inventory, hasInventory := p.PlanStore.(planstore.Inventory)
+	if hasInventory && (err == nil || os.IsNotExist(err)) {
+		err = os.ErrNotExist
+	}
+
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
@@ -1249,13 +1256,13 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		// recover via the plan store. We must clone each workspace that has
 		// stored plans BEFORE restoring, otherwise Clone falls through to
 		// forceClone (os.RemoveAll) and wipes the just-restored plans.
-		ctx.Log.Info("pull directory missing, attempting to restore plans")
+		ctx.Log.Info("restoring pending plans from storage")
 		// Probe capability first to avoid pointless I/O on stores that don't
 		// support restore (e.g. LocalPlanStore).
-		if errors.Is(p.PlanStore.RestorePlans("", "", "", 0), runtime.ErrRestoreNotSupported) {
+		if errors.Is(p.PlanStore.RestorePlans("", models.Repo{}, 0), runtime.ErrRestoreNotSupported) {
 			return nil, os.ErrNotExist
 		}
-		workspaces, listErr := p.PlanStore.ListWorkspaces(ctx.Pull.BaseRepo.Owner, ctx.Pull.BaseRepo.Name, ctx.Pull.Num)
+		workspaces, listErr := p.PlanStore.ListWorkspaces(ctx.Pull.BaseRepo, ctx.Pull.Num)
 		if listErr != nil {
 			return nil, fmt.Errorf("listing workspaces from external store: %w", listErr)
 		}
@@ -1280,14 +1287,34 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		if err != nil {
 			return nil, err
 		}
-		if restoreErr := p.PlanStore.RestorePlans(restoreDir, ctx.Pull.BaseRepo.Owner, ctx.Pull.BaseRepo.Name, ctx.Pull.Num); restoreErr != nil {
+		if restoreErr := p.PlanStore.RestorePlans(restoreDir, ctx.Pull.BaseRepo, ctx.Pull.Num); restoreErr != nil {
 			return nil, fmt.Errorf("restoring plans from external store: %w", restoreErr)
 		}
 	}
 
-	plans, err := p.PendingPlanFinder.Find(pullDir)
-	if err != nil {
-		return nil, err
+	var plans []PendingPlan
+	if hasInventory {
+		pending, err := inventory.PendingPlans(ctx.Pull.BaseRepo, ctx.Pull.Num)
+		if err != nil {
+			return nil, fmt.Errorf("listing pending plans: %w", err)
+		}
+		for _, job := range pending {
+			repoDir, err := workspaceRepoDir(pullDir, job.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			plans = append(plans, PendingPlan{
+				RepoDir:     repoDir,
+				RepoRelDir:  job.Project.Path,
+				ProjectName: job.Project.ProjectName,
+				Workspace:   job.Workspace,
+			})
+		}
+	} else {
+		plans, err = p.PendingPlanFinder.Find(pullDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// use the default repository workspace because it is the only one guaranteed to have an atlantis.yaml,
@@ -1602,7 +1629,7 @@ func (p *DefaultProjectCommandBuilder) buildProjectCommand(ctx *command.Context,
 		// LocalPlanStore signals this via ErrRestoreNotSupported; external
 		// stores (S3) return nil and Load restores the plan in doApply before
 		// plan validation (this path does not call RestorePlans).
-		if errors.Is(p.PlanStore.RestorePlans("", "", "", 0), runtime.ErrRestoreNotSupported) {
+		if errors.Is(p.PlanStore.RestorePlans("", models.Repo{}, 0), runtime.ErrRestoreNotSupported) {
 			return projCtx, errors.New("no working directory found–did you run plan?")
 		}
 		ctx.Log.Info("working directory missing, re-cloning repo for apply")

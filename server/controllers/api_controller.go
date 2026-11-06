@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,9 +23,11 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/drift"
+
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -42,6 +45,7 @@ var nonPRPullCounter atomic.Int64
 var apiErrorURLCredentialRE = regexp.MustCompile(`(?i)(https?://)([^\s/@]+:)?[^\s/@]+@`)
 
 type APIController struct {
+	Execution                       *events.ExecutionCoordinator
 	APISecret                       []byte
 	Locker                          locking.Locker `validate:"required"`
 	DriftStorage                    drift.Storage
@@ -108,7 +112,12 @@ func (a *APIController) getAPIMiddleware() *APIMiddleware {
 }
 
 func nextNonPRPullNum() int {
-	return -int((time.Now().UnixNano() & 0x3fffffff) + nonPRPullCounter.Add(1))
+	id := uuid.New()
+	n := binary.BigEndian.Uint64(id[:8]) & 0x7fffffffffffffff
+	if n == 0 {
+		n = 1
+	}
+	return -int(n)
 }
 
 func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBranch string) func() {
@@ -125,6 +134,13 @@ func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBra
 }
 
 func (a *APIController) cleanupNonPRWorkingDir(ctx *command.Context) {
+	if ctx.Pull.Execution != nil {
+		defer ctx.Pull.Execution.Close()
+		if a.Execution.Store.CheckClaim(ctx.Pull) != nil {
+			return
+		}
+	}
+
 	if ctx.Pull.Num >= 0 {
 		return
 	}
@@ -306,7 +322,7 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ctx.CommandSkipped {
-		defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+		defer a.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 	}
 
 	statusCode := http.StatusOK
@@ -343,7 +359,7 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		responder.writeJSON(w, http.StatusOK, result)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 
 	// The API apply endpoint runs plan first. Refresh PR status afterward so
 	// apply requirements evaluate the VCS state the plan phase just produced.
@@ -523,6 +539,18 @@ func (a *APIController) DriftStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (err error) {
+	if a.Execution != nil && ctx.Pull.Execution == nil {
+		_, claimErr := a.Execution.Acquire(ctx)
+		if claimErr != nil {
+			return claimErr
+		}
+		defer func() {
+			if err != nil {
+				a.cleanupNonPRWorkingDir(ctx)
+			}
+		}()
+	}
+
 	if ctx.Pull.Num < 0 {
 		defer func() {
 			if err != nil {
@@ -535,7 +563,7 @@ func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (er
 	baseRepo := ctx.Pull.BaseRepo
 	headRepo := ctx.HeadRepo
 
-	unlockFn, err := a.WorkingDirLocker.TryLock(baseRepo.FullName, pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
+	unlockFn, err := a.WorkingDirLocker.TryLock(events.WorkingDirectoryRepoKey(baseRepo), pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
 	if err != nil {
 		return err
 	}
@@ -716,7 +744,7 @@ func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (_ *c
 	// some plans ran would leave their project locks behind.
 	defer func() {
 		if err != nil && !ctx.CommandSkipped {
-			a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+			a.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 		}
 	}()
 
@@ -1401,7 +1429,7 @@ func (e *apiRemediationExecutor) ExecutePlan(repository, ref, vcsType, projectNa
 	if err != nil {
 		return "", nil, err
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 
 	output, driftSummary := planRemediationOutput(result)
 
@@ -1481,7 +1509,7 @@ func (e *apiRemediationExecutor) ExecuteApplyProjects(repository, ref, vcsType s
 	if err != nil {
 		return nil, fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 
 	remediationResults := projectRemediationResultsFromPlan(projects, planResult)
 	if planResult.HasErrors() {
@@ -1576,7 +1604,7 @@ func (e *apiRemediationExecutor) ExecuteApply(repository, ref, vcsType, projectN
 	if err != nil {
 		return "", fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 	if planResult.HasErrors() {
 		output, _ := planRemediationOutput(planResult)
 		return output.String(), fmt.Errorf("plan had errors")
@@ -2315,7 +2343,7 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		responder.InternalError(w, r, err)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num) // nolint: errcheck
 
 	// Process results and store drift data
 	detectionResult := models.NewDriftDetectionResult(request.Repository)
