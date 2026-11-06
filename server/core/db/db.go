@@ -17,12 +17,12 @@ import (
 // Database is an implementation of the database API we require.
 type Database interface {
 	TryLock(lock models.ProjectLock) (bool, models.ProjectLock, error)
-	Unlock(project models.Project, workspace string) (*models.ProjectLock, error)
-	UnlockIfOwnedByPull(project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
+	Unlock(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error)
+	UnlockIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
 	List() ([]models.ProjectLock, error)
-	GetLock(project models.Project, workspace string) (*models.ProjectLock, error)
-	UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error)
-	UpdateProjectStatus(pull models.PullRequest, workspace string, repoRelDir string, newStatus models.ProjectPlanStatus) error
+	GetLock(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error)
+	UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error)
+	UpdateProjectStatus(pull models.PullRequest, workspace string, repoRelDir string, projectName string, newStatus models.ProjectPlanStatus) error
 	GetPullStatus(pull models.PullRequest) (*models.PullStatus, error)
 	DeletePullStatus(pull models.PullRequest) error
 	UpdatePullWithResults(pull models.PullRequest, newResults []command.ProjectResult) (models.PullStatus, error)
@@ -34,4 +34,11 @@ type Database interface {
 	// Ping checks the database connection health.
 	Ping() error
 	Close() error
+}
+
+// LockKeyCodec provides opaque keys for stores with instance-scoped identities.
+// Legacy stores keep their existing externally visible lock keys.
+type LockKeyCodec interface {
+	LockKey(models.Repo, models.Project, string) string
+	ParseLockKey(string) (models.Repo, models.Project, string, error)
 }

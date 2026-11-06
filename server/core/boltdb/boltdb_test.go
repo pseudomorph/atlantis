@@ -164,7 +164,7 @@ func TestMigrationOldLockKeysToNewFormat(t *testing.T) {
 	// Verify the lock can be retrieved using the GetLock method
 	// which uses the new key format internally
 	projectWithName := models.NewProject("owner/repo", "path", "myproject")
-	retrievedLock, err := b.GetLock(projectWithName, "default")
+	retrievedLock, err := b.GetLock(models.Repo{}, projectWithName, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist with new key format")
 	Equals(t, "owner/repo", retrievedLock.Project.RepoFullName)
@@ -198,7 +198,7 @@ func TestNoMigrationNeededForNewFormatKeys(t *testing.T) {
 	Assert(t, acquired, "should acquire lock")
 
 	// Verify the lock can be retrieved immediately after creation
-	retrievedLock, err := db.GetLock(projectWithName, "default")
+	retrievedLock, err := db.GetLock(models.Repo{}, projectWithName, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist")
 	Equals(t, "projectName", retrievedLock.Project.ProjectName)
@@ -211,7 +211,7 @@ func TestNoMigrationNeededForNewFormatKeys(t *testing.T) {
 	defer db.Close()
 
 	// Verify lock still exists after reopening (no migration should have changed it)
-	retrievedLock, err = db.GetLock(projectWithName, "default")
+	retrievedLock, err = db.GetLock(models.Repo{}, projectWithName, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist after migration")
 	Equals(t, "projectName", retrievedLock.Project.ProjectName)
@@ -299,7 +299,7 @@ func TestListAddRemove(t *testing.T) {
 	defer cleanupDB(db)
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
-	_, err = b.Unlock(project, workspace)
+	_, err = b.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	ls, err := b.List()
@@ -381,7 +381,7 @@ func TestUnlockingNoLocks(t *testing.T) {
 	t.Log("unlocking with no locks should succeed")
 	db, b := newTestDB()
 	defer cleanupDB(db)
-	_, err := b.Unlock(project, workspace)
+	_, err := b.Unlock(models.Repo{}, project, workspace)
 
 	Ok(t, err)
 }
@@ -393,7 +393,7 @@ func TestUnlocking(t *testing.T) {
 
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
-	_, err = b.Unlock(project, workspace)
+	_, err = b.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	// should be no locks listed
@@ -434,13 +434,13 @@ func TestUnlockingMultiple(t *testing.T) {
 	Ok(t, err)
 
 	// now try and unlock them
-	_, err = b.Unlock(new3.Project, new3.Workspace)
+	_, err = b.Unlock(models.Repo{}, new3.Project, new3.Workspace)
 	Ok(t, err)
-	_, err = b.Unlock(new2.Project, workspace)
+	_, err = b.Unlock(models.Repo{}, new2.Project, workspace)
 	Ok(t, err)
-	_, err = b.Unlock(new1.Project, workspace)
+	_, err = b.Unlock(models.Repo{}, new1.Project, workspace)
 	Ok(t, err)
-	_, err = b.Unlock(project, workspace)
+	_, err = b.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	// should be none left
@@ -454,7 +454,7 @@ func TestUnlockIfOwnedByPullMissingLock(t *testing.T) {
 	db, b := newTestDB()
 	defer cleanupDB(db)
 
-	deleted, err := b.UnlockIfOwnedByPull(project, workspace, pullNum)
+	deleted, err := b.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), deleted)
 }
@@ -467,11 +467,11 @@ func TestUnlockIfOwnedByPullOtherPull(t *testing.T) {
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
 
-	deleted, err := b.UnlockIfOwnedByPull(project, workspace, pullNum+1)
+	deleted, err := b.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum+1)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), deleted)
 
-	existing, err := b.GetLock(project, workspace)
+	existing, err := b.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Assert(t, existing != nil, "expected lock to remain")
 	Equals(t, pullNum, existing.Pull.Num)
@@ -485,7 +485,7 @@ func TestUnlockIfOwnedByPullCurrentPull(t *testing.T) {
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
 
-	deleted, err := b.UnlockIfOwnedByPull(project, workspace, pullNum)
+	deleted, err := b.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum)
 	Ok(t, err)
 	Assert(t, deleted != nil, "expected deleted lock")
 	Equals(t, lock.Project, deleted.Project)
@@ -493,7 +493,7 @@ func TestUnlockIfOwnedByPullCurrentPull(t *testing.T) {
 	Equals(t, lock.Pull, deleted.Pull)
 	Equals(t, lock.User, deleted.User)
 
-	existing, err := b.GetLock(project, workspace)
+	existing, err := b.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), existing)
 }
@@ -503,7 +503,7 @@ func TestUnlockByPullNone(t *testing.T) {
 	db, b := newTestDB()
 	defer cleanupDB(db)
 
-	_, err := b.UnlockByPull("any/repo", 1)
+	_, err := b.UnlockByPull(models.Repo{FullName: "any/repo"}, 1)
 	Ok(t, err)
 }
 
@@ -516,7 +516,7 @@ func TestUnlockByPullOne(t *testing.T) {
 
 	t.Log("...delete nothing when its the same repo but a different pull")
 	{
-		_, err := b.UnlockByPull(project.RepoFullName, pullNum+1)
+		_, err := b.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum+1)
 		Ok(t, err)
 		ls, err := b.List()
 		Ok(t, err)
@@ -524,7 +524,7 @@ func TestUnlockByPullOne(t *testing.T) {
 	}
 	t.Log("...delete nothing when its the same pull but a different repo")
 	{
-		_, err := b.UnlockByPull("different/repo", pullNum)
+		_, err := b.UnlockByPull(models.Repo{FullName: "different/repo"}, pullNum)
 		Ok(t, err)
 		ls, err := b.List()
 		Ok(t, err)
@@ -532,7 +532,7 @@ func TestUnlockByPullOne(t *testing.T) {
 	}
 	t.Log("...delete the lock when its the same repo and pull")
 	{
-		_, err := b.UnlockByPull(project.RepoFullName, pullNum)
+		_, err := b.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 		Ok(t, err)
 		ls, err := b.List()
 		Ok(t, err)
@@ -546,10 +546,10 @@ func TestUnlockByPullAfterUnlock(t *testing.T) {
 	defer cleanupDB(db)
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
-	_, err = b.Unlock(project, workspace)
+	_, err = b.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
-	_, err = b.UnlockByPull(project.RepoFullName, pullNum)
+	_, err = b.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 	Ok(t, err)
 	ls, err := b.List()
 	Ok(t, err)
@@ -579,7 +579,7 @@ func TestUnlockByPullMatching(t *testing.T) {
 	Equals(t, 3, len(ls))
 
 	// should all be unlocked
-	_, err = b.UnlockByPull(project.RepoFullName, pullNum)
+	_, err = b.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 	Ok(t, err)
 	ls, err = b.List()
 	Ok(t, err)
@@ -590,7 +590,7 @@ func TestGetLockNotThere(t *testing.T) {
 	t.Log("getting a lock that doesn't exist should return a nil pointer")
 	db, b := newTestDB()
 	defer cleanupDB(db)
-	l, err := b.GetLock(project, workspace)
+	l, err := b.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), l)
 }
@@ -602,7 +602,7 @@ func TestGetLock(t *testing.T) {
 	_, _, err := b.TryLock(lock)
 	Ok(t, err)
 
-	l, err := b.GetLock(project, workspace)
+	l, err := b.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	// can't compare against time so doing each field
 	Equals(t, lock.Project, l.Project)
@@ -756,7 +756,7 @@ func TestPullStatus_UpdateProject(t *testing.T) {
 		})
 	Ok(t, err)
 
-	err = b.UpdateProjectStatus(pull, "default", ".", models.DiscardedPlanStatus)
+	err = b.UpdateProjectStatus(pull, "default", ".", "", models.DiscardedPlanStatus)
 	Ok(t, err)
 
 	status, err := b.GetPullStatus(pull)

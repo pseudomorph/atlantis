@@ -58,6 +58,7 @@ type PullReqStatus struct {
 
 // Repo is a VCS repository.
 type Repo struct {
+	Execution *Execution `json:"-"`
 	// FullName is the owner and repo name separated
 	// by a "/", ex. "runatlantis/atlantis", "gitlab/subgroup/atlantis",
 	// "Bitbucket Server/atlantis", "azuredevops/project/atlantis".
@@ -221,6 +222,7 @@ type MergeableStatus struct {
 // PullRequest is a VCS pull request.
 // GitLab calls these Merge Requests.
 type PullRequest struct {
+	Execution *Execution `json:"-"`
 	// Num is the pull request number or ID.
 	Num int
 	// HeadCommit is a sha256 that points to the head of the branch that is being

@@ -71,6 +71,18 @@ docker/test: ## Run tests in docker
 test-all: test-nested-modules ## Run tests including integration
 	@go test -timeout=300s $(PKG)
 
+.PHONY: test-postgres
+test-postgres: ## Run SQL storage tests with SQLite and PostgreSQL (requires ATLANTIS_TEST_POSTGRES_DSN)
+	@if [ -z "$$ATLANTIS_TEST_POSTGRES_DSN" ]; then \
+		echo "Set ATLANTIS_TEST_POSTGRES_DSN to a test database; see server/core/sqlstore/README.md" >&2; \
+		exit 1; \
+	fi
+	@go test -race -count=1 -timeout=300s ./server/core/sqlstore
+
+.PHONY: test-postgres-local
+test-postgres-local: ## Start disposable PostgreSQL, run SQL storage tests, and clean up (requires Docker)
+	@bash scripts/test-postgres.sh
+
 .PHONY: docker/test-all
 docker/test-all: ## Run all tests in docker
 	docker run -it -v $(PWD):/atlantis ghcr.io/runatlantis/testing-env:latest sh -c "cd /atlantis && make test-all"

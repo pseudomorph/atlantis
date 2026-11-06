@@ -50,6 +50,7 @@ jobs:
           filters: |
             go:
               - '**/*.go'
+              - '**/*.sql'
               - '**/*.txt' # golden file test output
               - 'go.*'
               - '**/go.mod'
@@ -65,6 +66,17 @@ jobs:
     # Use latest testing environment for automatic updates
     # Previous: ghcr.io/runatlantis/testing-env:latest@sha256:725981e9090c977f8055f5ec5ba7a63430a8f0337ab955978e6b8cc2cd0236c3
     container: ghcr.io/runatlantis/testing-env:latest@sha256:dc683c36e7fb8f26fcc8628fdcf328f42d3b1903e130aebb8484223fbdedfd98
+    services:
+      postgres:
+        image: postgres:17@sha256:3b0cda93be7c8dba2ed484d19393d93845dc3dafb88973e248ba8e6d99d784e1
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: atlantis_test
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres -d atlantis_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -79,6 +91,10 @@ jobs:
           go-version-file: go.mod
 
       - run: make test-all
+      - name: Test SQL storage with PostgreSQL
+        run: make test-postgres
+        env:
+          ATLANTIS_TEST_POSTGRES_DSN: postgresql://postgres:postgres@postgres:5432/atlantis_test?sslmode=disable
       - run: make check-fmt
       - run: make check-go-toolchain
 
