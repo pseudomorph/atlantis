@@ -130,3 +130,18 @@ func (mr *MockLockerMockRecorder) UnlockIfOwnedByPull(repo, project, workspace, 
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnlockIfOwnedByPull", reflect.TypeOf((*MockLocker)(nil).UnlockIfOwnedByPull), repo, project, workspace, pullNum)
 }
+
+// UnlockOwned mocks base method.
+func (m *MockLocker) UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UnlockOwned", key, pull)
+	ret0, _ := ret[0].(*models.ProjectLock)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// UnlockOwned indicates an expected call of UnlockOwned.
+func (mr *MockLockerMockRecorder) UnlockOwned(key, pull any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UnlockOwned", reflect.TypeOf((*MockLocker)(nil).UnlockOwned), key, pull)
+}

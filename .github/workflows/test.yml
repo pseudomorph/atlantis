@@ -50,6 +50,7 @@ jobs:
           filters: |
             go:
               - '**/*.go'
+              - '**/*.sql'
               - '**/*.txt' # golden file test output
               - 'go.*'
               - '**/go.mod'
