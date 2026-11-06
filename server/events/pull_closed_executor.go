@@ -16,6 +16,7 @@ import (
 	"github.com/runatlantis/atlantis/server/logging"
 
 	"github.com/runatlantis/atlantis/server/core/db"
+
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -41,6 +42,7 @@ type PullCleaner interface {
 // PullClosedExecutor executes the tasks required to clean up a closed pull
 // request.
 type PullClosedExecutor struct {
+	Executions               db.ExecutionStore
 	Locker                   locking.Locker
 	VCSClient                vcs.Client
 	WorkingDir               WorkingDir
@@ -73,6 +75,19 @@ func (t *PullClosedEventTemplate) Execute(wr io.Writer, data any) error {
 
 // CleanUpPull cleans up after a closed pull request.
 func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) error {
+	if p.Executions != nil {
+		if err := p.Executions.ClosePull(pull); err != nil {
+			return err
+		}
+		idle, err := p.Executions.PullIdle(pull)
+		if err != nil {
+			return err
+		}
+		if !idle {
+			return fmt.Errorf("cleanup deferred until execution is stopped or reconciled")
+		}
+	}
+
 	pullStatus, err := p.Database.GetPullStatus(pull)
 	if err != nil {
 		// Log and continue to clean up other resources.

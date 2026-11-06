@@ -25,6 +25,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/drift"
+
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -42,6 +43,7 @@ var nonPRPullCounter atomic.Int64
 var apiErrorURLCredentialRE = regexp.MustCompile(`(?i)(https?://)([^\s/@]+:)?[^\s/@]+@`)
 
 type APIController struct {
+	Execution                       *events.ExecutionCoordinator
 	APISecret                       []byte
 	Locker                          locking.Locker `validate:"required"`
 	DriftStorage                    drift.Storage
@@ -125,6 +127,13 @@ func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBra
 }
 
 func (a *APIController) cleanupNonPRWorkingDir(ctx *command.Context) {
+	if ctx.Pull.Execution != nil {
+		defer ctx.Pull.Execution.Close()
+		if a.Execution.Store.CheckClaim(ctx.Pull) != nil {
+			return
+		}
+	}
+
 	if ctx.Pull.Num >= 0 {
 		return
 	}
@@ -523,6 +532,18 @@ func (a *APIController) DriftStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (err error) {
+	if a.Execution != nil && ctx.Pull.Execution == nil {
+		_, claimErr := a.Execution.Acquire(ctx)
+		if claimErr != nil {
+			return claimErr
+		}
+		defer func() {
+			if err != nil {
+				a.cleanupNonPRWorkingDir(ctx)
+			}
+		}()
+	}
+
 	if ctx.Pull.Num < 0 {
 		defer func() {
 			if err != nil {
@@ -535,7 +556,7 @@ func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (er
 	baseRepo := ctx.Pull.BaseRepo
 	headRepo := ctx.HeadRepo
 
-	unlockFn, err := a.WorkingDirLocker.TryLock(baseRepo.FullName, pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
+	unlockFn, err := a.WorkingDirLocker.TryLock(events.WorkingDirectoryRepoKey(baseRepo), pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
 	if err != nil {
 		return err
 	}
