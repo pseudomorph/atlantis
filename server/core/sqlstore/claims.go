@@ -75,6 +75,13 @@ func checkExecutionClaim(claim executionClaim, owner, scope string, err error) e
 	return nil
 }
 
+// Jobs retain their immutable scope and owner, avoiding identity reconstruction on each write.
+func (s *Store) guardJob(tx *gorm.DB, row job) error {
+	var claim executionClaim
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("pull_id = ? AND scope_id = ?", row.PullID, row.Scope).Take(&claim).Error
+	return checkExecutionClaim(claim, row.Owner, row.Scope, err)
+}
+
 func (s *Store) CheckClaim(p models.PullRequest) error {
 	return s.db.Transaction(func(tx *gorm.DB) error { return s.guard(tx, p) })
 }
