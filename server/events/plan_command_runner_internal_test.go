@@ -330,7 +330,7 @@ func (r *recordingPlanCleanupLocker) Unlock(key string) (*models.ProjectLock, er
 	return nil, nil
 }
 
-func (r *recordingPlanCleanupLocker) UnlockIfOwnedByPull(project models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
+func (r *recordingPlanCleanupLocker) UnlockIfOwnedByPull(_ models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
 	key := models.GenerateLockKey(project, workspace)
 	r.unlockIfOwnedByPullCalls = append(r.unlockIfOwnedByPullCalls, unlockIfOwnedByPullCall{key: key, project: project, workspace: workspace, pullNum: pullNum})
 	lock, ok := r.locksByKey[key]
@@ -342,8 +342,8 @@ func (r *recordingPlanCleanupLocker) UnlockIfOwnedByPull(project models.Project,
 	return &lock, nil
 }
 
-func (r *recordingPlanCleanupLocker) UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error) {
-	r.unlockByPullCalls = append(r.unlockByPullCalls, unlockByPullCall{repoFullName: repoFullName, pullNum: pullNum})
+func (r *recordingPlanCleanupLocker) UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error) {
+	r.unlockByPullCalls = append(r.unlockByPullCalls, unlockByPullCall{repoFullName: repo.FullName, pullNum: pullNum})
 	return nil, nil
 }
 

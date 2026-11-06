@@ -293,7 +293,7 @@ func TestRestorePlans_Success(t *testing.T) {
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 	pullDir := t.TempDir()
 
-	err := store.RestorePlans(pullDir, "acme", "infra", 42)
+	err := store.RestorePlans(pullDir, models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 
 	// Verify files were written to the correct paths.
@@ -322,7 +322,7 @@ func TestRestorePlans_DestinationDoesNotExist(t *testing.T) {
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 	pullDir := filepath.Join(t.TempDir(), "planstore", "repos", "acme", "infra", "42")
 
-	err := store.RestorePlans(pullDir, "acme", "infra", 42)
+	err := store.RestorePlans(pullDir, models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 
 	got, err := os.ReadFile(filepath.Join(pullDir, "default", "modules", "vpc", "plan.tfplan"))
@@ -338,7 +338,7 @@ func TestRestorePlans_NoPlansFound(t *testing.T) {
 	}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
-	err := store.RestorePlans(t.TempDir(), "acme", "infra", 42)
+	err := store.RestorePlans(t.TempDir(), models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 }
 
@@ -346,7 +346,7 @@ func TestRestorePlans_ListError(t *testing.T) {
 	mock := &mockS3Client{listErr: errors.New("access denied")}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
-	err := store.RestorePlans(t.TempDir(), "acme", "infra", 42)
+	err := store.RestorePlans(t.TempDir(), models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	assert.ErrorContains(t, err, "access denied")
 }
 
@@ -364,7 +364,7 @@ func TestRestorePlans_WithoutPrefix(t *testing.T) {
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "", logging.NewNoopLogger(t))
 	pullDir := t.TempDir()
 
-	err := store.RestorePlans(pullDir, "acme", "infra", 42)
+	err := store.RestorePlans(pullDir, models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 
 	got, err := os.ReadFile(filepath.Join(pullDir, "default", "plan.tfplan"))
@@ -383,7 +383,7 @@ func TestDeleteForPull_Success(t *testing.T) {
 	}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
-	err := store.DeleteForPull("acme", "infra", 42)
+	err := store.DeleteForPull(models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{
@@ -400,7 +400,7 @@ func TestDeleteForPull_NoObjects(t *testing.T) {
 	}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
-	err := store.DeleteForPull("acme", "infra", 42)
+	err := store.DeleteForPull(models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	require.NoError(t, err)
 	assert.Empty(t, mock.deletedKeys)
 }
@@ -409,7 +409,7 @@ func TestDeleteForPull_ListError(t *testing.T) {
 	mock := &mockS3Client{listErr: errors.New("access denied")}
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
-	err := store.DeleteForPull("acme", "infra", 42)
+	err := store.DeleteForPull(models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	assert.ErrorContains(t, err, "access denied")
 }
 
@@ -425,6 +425,6 @@ func TestDeleteForPull_DeleteError(t *testing.T) {
 	store := planstore.NewS3PlanStoreWithClient(mock, "bucket", "pfx", logging.NewNoopLogger(t))
 
 	// S3 delete errors during cleanup are logged but not returned (soft-fail).
-	err := store.DeleteForPull("acme", "infra", 42)
+	err := store.DeleteForPull(models.Repo{Owner: "acme", Name: "infra", FullName: "acme/infra"}, 42)
 	assert.NoError(t, err)
 }

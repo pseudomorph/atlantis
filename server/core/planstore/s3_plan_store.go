@@ -20,6 +20,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/utils"
 )
@@ -230,12 +231,12 @@ func (s *S3PlanStore) Remove(ctx command.ProjectContext, planPath string) error 
 // workspace names (first path segment after owner/repo/pullNum/) that have at
 // least one .tfplan stored. Callers use this to clone each workspace before
 // invoking RestorePlans, so plan files don't get wiped by a subsequent Clone.
-func (s *S3PlanStore) ListWorkspaces(owner, repo string, pullNum int) ([]string, error) {
+func (s *S3PlanStore) ListWorkspaces(repository models.Repo, pullNum int) ([]string, error) {
 	prefixParts := []string{}
 	if s.prefix != "" {
 		prefixParts = append(prefixParts, s.prefix)
 	}
-	prefixParts = append(prefixParts, owner, repo, strconv.Itoa(pullNum))
+	prefixParts = append(prefixParts, repository.FullName, strconv.Itoa(pullNum))
 	listPrefix := strings.Join(prefixParts, "/") + "/"
 
 	seen := map[string]struct{}{}
@@ -277,7 +278,7 @@ func (s *S3PlanStore) ListWorkspaces(owner, repo string, pullNum int) ([]string,
 	return workspaces, nil
 }
 
-func (s *S3PlanStore) RestorePlans(pullDir, owner, repo string, pullNum int) error {
+func (s *S3PlanStore) RestorePlans(pullDir string, repository models.Repo, pullNum int) error {
 	if pullDir == "" {
 		return nil // capability probe: external store supports restore
 	}
@@ -286,7 +287,7 @@ func (s *S3PlanStore) RestorePlans(pullDir, owner, repo string, pullNum int) err
 	if s.prefix != "" {
 		prefixParts = append(prefixParts, s.prefix)
 	}
-	prefixParts = append(prefixParts, owner, repo, strconv.Itoa(pullNum))
+	prefixParts = append(prefixParts, repository.FullName, strconv.Itoa(pullNum))
 	listPrefix := strings.Join(prefixParts, "/") + "/"
 
 	var restored int
@@ -337,7 +338,7 @@ func (s *S3PlanStore) RestorePlans(pullDir, owner, repo string, pullNum int) err
 		continuationToken = resp.NextContinuationToken
 	}
 
-	s.logger.Info("restored %d plan(s) from S3 for %s/%s#%d", restored, owner, repo, pullNum)
+	s.logger.Info("restored %d plan(s) from S3 for %s#%d", restored, repository.FullName, pullNum)
 	return nil
 }
 
@@ -369,12 +370,12 @@ func (s *S3PlanStore) downloadObjectTo(key, localPath string) error {
 }
 
 // DeleteForPull removes all plan objects stored under the pull request prefix in S3.
-func (s *S3PlanStore) DeleteForPull(owner, repo string, pullNum int) error {
+func (s *S3PlanStore) DeleteForPull(repository models.Repo, pullNum int) error {
 	prefixParts := []string{}
 	if s.prefix != "" {
 		prefixParts = append(prefixParts, s.prefix)
 	}
-	prefixParts = append(prefixParts, owner, repo, strconv.Itoa(pullNum))
+	prefixParts = append(prefixParts, repository.FullName, strconv.Itoa(pullNum))
 	listPrefix := strings.Join(prefixParts, "/") + "/"
 
 	var deleted int
@@ -413,7 +414,7 @@ func (s *S3PlanStore) DeleteForPull(owner, repo string, pullNum int) error {
 	}
 
 	if deleted > 0 {
-		s.logger.Info("deleted %d plan(s) from S3 for %s/%s#%d", deleted, owner, repo, pullNum)
+		s.logger.Info("deleted %d plan(s) from S3 for %s#%d", deleted, repository.FullName, pullNum)
 	}
 	return nil
 }
@@ -441,7 +442,7 @@ func (s *S3PlanStore) TestS3Key(ctx command.ProjectContext, planPath string) str
 	return s.s3Key(ctx, planPath)
 }
 
-func (s *S3PlanStore) DeletePlanForProject(owner, repo string, pullNum int, workspace, repoRelDir, projectName string) error {
+func (s *S3PlanStore) DeletePlanForProject(repository models.Repo, pullNum int, workspace, repoRelDir, projectName string) error {
 	var planFilename string
 	if projectName == "" {
 		planFilename = workspace + ".tfplan"
@@ -452,7 +453,7 @@ func (s *S3PlanStore) DeletePlanForProject(owner, repo string, pullNum int, work
 	if s.prefix != "" {
 		parts = append(parts, s.prefix)
 	}
-	parts = append(parts, owner, repo, strconv.Itoa(pullNum), workspace, repoRelDir, planFilename)
+	parts = append(parts, repository.FullName, strconv.Itoa(pullNum), workspace, repoRelDir, planFilename)
 	key := strings.Join(parts, "/")
 
 	opCtx, opCancel := s3Ctx()
