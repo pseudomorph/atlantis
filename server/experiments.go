@@ -13,11 +13,12 @@ import (
 const ExperimentsDocumentationURL = "https://www.runatlantis.io/versions/main/docs/experiments.html"
 
 const (
-	apiExperiment   = "api"
-	driftExperiment = "drift-detection"
+	apiExperiment     = "api"
+	driftExperiment   = "drift-detection"
+	durableExperiment = "durable-storage"
 )
 
-var knownExperiments = []string{apiExperiment, driftExperiment}
+var knownExperiments = []string{apiExperiment, driftExperiment, durableExperiment}
 
 // ValidateExperiments checks permissions and prerequisites before startup.
 func (c UserConfig) ValidateExperiments() error {
@@ -48,6 +49,26 @@ func (c UserConfig) ValidateExperiments() error {
 	}
 	if c.EnableDriftDetection && c.APISecret == "" {
 		return fmt.Errorf("enable-drift-detection requires api-secret for authentication; configure api-secret or disable enable-drift-detection; see %s", ExperimentsDocumentationURL)
+	}
+
+	if c.Storage != nil {
+		if !slices.Contains(c.Experiments, durableExperiment) {
+			return fmt.Errorf("storage requires --experiments=durable-storage; see %s", ExperimentsDocumentationURL)
+		}
+		if c.SharePlanDir != "" && c.SharePlanDir != c.DataDir {
+			return fmt.Errorf("storage cannot be combined with share-plan-dir; use storage.artifacts.directory")
+		}
+		if c.EnableExternalStores || (c.LockingDBType != "" && c.LockingDBType != "boltdb") {
+			return fmt.Errorf("storage cannot be combined with legacy storage selection; see %s", ExperimentsDocumentationURL)
+		}
+		if err := c.Storage.Validate(); err != nil {
+			return fmt.Errorf("%w; see %s", err, ExperimentsDocumentationURL)
+		}
+	}
+	switch c.LockingDBType {
+	case "", "boltdb", "redis":
+	default:
+		return fmt.Errorf("invalid --locking-db-type %q; use boltdb or redis; configure durable storage through storage; see %s", c.LockingDBType, ExperimentsDocumentationURL)
 	}
 	return nil
 }

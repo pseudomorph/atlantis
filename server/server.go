@@ -34,12 +34,15 @@ import (
 	prometheus "github.com/uber-go/tally/v4/prometheus"
 	"github.com/urfave/negroni/v3"
 
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/boltdb"
 	cfg "github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
+
 	"github.com/runatlantis/atlantis/server/core/redis"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/metrics"
@@ -129,6 +132,11 @@ type Server struct {
 	EnableProfilingAPI             bool
 	Experiments                    []string
 	database                       db.Database
+	artifactStore                  artifacts.Store
+	jobService                     *jobs.Service
+	storageMaintenance             func()
+	storageCancel                  context.CancelFunc
+	storageDone                    chan struct{}
 }
 
 // Config holds config for server that isn't passed in by the user.
@@ -173,6 +181,13 @@ var staticAssets embed.FS
 func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if err := userConfig.ValidateExperiments(); err != nil {
 		return nil, err
+	}
+	if userConfig.Storage != nil {
+		userConfig.SharePlanDir = ""
+	} else if _, err := os.Stat(filepath.Join(userConfig.DataDir, "atlantis.sqlite")); err == nil {
+		return nil, fmt.Errorf("data directory contains durable storage; configure storage with --experiments=durable-storage or restore matching legacy data")
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("checking durable storage: %w", err)
 	}
 	logging.SuppressDefaultLogging()
 	logger, err := logging.NewStructuredLoggerFromLevel(userConfig.ToLogLevel())
@@ -222,6 +237,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
+	if globalCfg.ExternalStores.PlanStore.Type != "" {
+		logger.Warn("external_stores.plan_store is deprecated; use storage.artifacts with the durable-storage experiment")
+		if userConfig.Storage != nil {
+			return nil, fmt.Errorf("storage cannot be combined with external_stores.plan_store")
+		}
+	}
+	if userConfig.Storage == nil {
+		logger.Warn("BoltDB and Redis storage are deprecated in favor of the durable-storage experiment; legacy stores remain supported until graduation and the notice period in ADR 0004")
+	}
 	statsScope, statsReporter, closer, err := metrics.NewScope(globalCfg.Metrics, logger, userConfig.StatsNamespace)
 
 	if err != nil {
@@ -441,7 +465,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
 
-	if userConfig.TFEToken != "" && !userConfig.TFELocalExecutionMode {
+	if userConfig.Storage != nil {
+		projectCmdOutputHandler = &jobs.DurableOutputHandler{}
+	} else if userConfig.TFEToken != "" && !userConfig.TFELocalExecutionMode {
 		// When TFE is enabled and using remote execution mode log streaming is not necessary.
 		projectCmdOutputHandler = &jobs.NoopProjectOutputHandler{}
 	} else {
@@ -494,7 +520,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var applyLockingClient locking.ApplyLocker
 	var database db.Database
 
-	switch dbtype := userConfig.LockingDBType; dbtype {
+	dbtype := userConfig.LockingDBType
+	if userConfig.Storage != nil {
+		dbtype = "durable"
+	}
+	switch dbtype {
 	case "redis":
 		var clusterAddrs []string
 		if userConfig.RedisClusterAddresses != "" {
@@ -525,7 +555,13 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-	case "boltdb":
+	case "durable":
+		logger.Warn("using experimental durable storage")
+		database, err = sqlstore.OpenServer(userConfig.DataDir)
+		if err != nil {
+			return nil, err
+		}
+	case "", "boltdb":
 		logger.Info("Utilizing BoltDB")
 		database, err = boltdb.New(userConfig.DataDir)
 		if err != nil {
@@ -533,6 +569,18 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
+	storage := &storageRuntime{}
+	var artifactStore artifacts.Store
+	if sql, ok := database.(*sqlstore.Store); ok {
+		storage, err = newStorageRuntime(sql, userConfig, logger)
+		if err != nil {
+			_ = database.Close()
+			return nil, err
+		}
+		artifactStore = storage.Artifacts.Blobs
+		projectCmdOutputHandler.(*jobs.DurableOutputHandler).Service = storage.Jobs
+		commitStatusUpdater.ClaimCheck = sql.CheckClaim
+	}
 	noOpLocker := locking.NewNoOpLocker()
 	if userConfig.DisableRepoLocking {
 		logger.Info("Repo Locking is disabled")
@@ -546,6 +594,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	workingDirLocker := events.NewDefaultWorkingDirLocker()
 
 	var workingDir events.WorkingDir = &events.FileWorkspace{
+		InstanceScoped:    storage.Store != nil,
 		DataDir:           userConfig.DataDir,
 		LocalSharePlanDir: userConfig.SharePlanDir,
 		CheckoutMerge:     userConfig.CheckoutStrategy == "merge",
@@ -593,6 +642,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ExecutableName: userConfig.ExecutableName,
 	}
 	deleteLockCommand := &events.DefaultDeleteLockCommand{
+		Execution:        storage.Execution,
 		Locker:           lockingClient,
 		WorkingDir:       workingDir,
 		WorkingDirLocker: workingDirLocker,
@@ -665,6 +715,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectCmdOutputHandler: projectCmdOutputHandler,
 	}
 	drainer := &events.Drainer{}
+	if storage.Execution != nil {
+		storage.Execution.Drainer = drainer
+	}
 	statusController := &controllers.StatusController{
 		Logger:          logger,
 		Drainer:         drainer,
@@ -675,7 +728,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GlobalCfg:        globalCfg,
 		WorkingDirLocker: workingDirLocker,
 		WorkingDir:       workingDir,
-		PreWorkflowHookRunner: runtime.DefaultPreWorkflowHookRunner{
+		PreWorkflowHookRunner: runtime.DefaultPreWorkflowHookRunner{Jobs: storage.Jobs,
 			OutputHandler: projectCmdOutputHandler,
 		},
 		CommitStatusUpdater: commitStatusUpdater,
@@ -686,14 +739,16 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GlobalCfg:        globalCfg,
 		WorkingDirLocker: workingDirLocker,
 		WorkingDir:       workingDir,
-		PostWorkflowHookRunner: runtime.DefaultPostWorkflowHookRunner{
+		PostWorkflowHookRunner: runtime.DefaultPostWorkflowHookRunner{Jobs: storage.Jobs,
 			OutputHandler: projectCmdOutputHandler,
 		},
 		CommitStatusUpdater: commitStatusUpdater,
 		Router:              router,
 	}
 	var planStore runtime.PlanStore
-	if userConfig.EnableExternalStores {
+	if storage.Store != nil {
+		planStore = storage.Artifacts
+	} else if userConfig.EnableExternalStores {
 		psCfg := globalCfg.ExternalStores.PlanStore
 		if psCfg.Type == "" {
 			return nil, fmt.Errorf("--enable-external-stores is set but no external_stores.plan_store.type is configured in the server-side repo config")
@@ -728,19 +783,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	deleteLockCommand.PlanStore = planStore
 
-	pullClosedExecutor := events.NewInstrumentedPullClosedExecutor(
-		statsScope,
-		logger,
-		&events.PullClosedExecutor{
-			Locker:                   lockingClient,
-			WorkingDir:               workingDir,
-			Database:                 database,
-			PullClosedTemplate:       &events.PullClosedEventTemplate{},
-			LogStreamResourceCleaner: projectCmdOutputHandler,
-			VCSClient:                vcsClient,
-			PlanStore:                planStore,
-		},
-	)
+	pullClosedWorker := &events.PullClosedExecutor{
+		Executions: storage.Claims, Locker: lockingClient, WorkingDir: workingDir, Database: database,
+		PullClosedTemplate: &events.PullClosedEventTemplate{}, LogStreamResourceCleaner: projectCmdOutputHandler, VCSClient: vcsClient, PlanStore: planStore,
+	}
+	pullClosedExecutor := events.NewInstrumentedPullClosedExecutor(statsScope, logger, pullClosedWorker)
+	var storageMaintenance func()
+	if storage.Store != nil {
+		storageMaintenance = storage.Maintain(pullClosedWorker, logger)
+	}
 
 	projectFinder := &events.DefaultProjectFinder{}
 	projectCommandBuilder := events.NewInstrumentedProjectCommandBuilder(
@@ -801,7 +852,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		),
 	}
 
-	cancellationTracker := events.NewCancellationTracker()
+	var cancellationTracker events.CancellationTracker = events.NewCancellationTracker()
+	if storage.Store != nil {
+		cancellationTracker = &events.DurableCancellationTracker{Store: storage.Store}
+	}
 
 	varFileAllowlistChecker, err := events.NewVarFileAllowlistChecker(userConfig.VarFileAllowlist)
 	if err != nil {
@@ -809,6 +863,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
+		Jobs: storage.Jobs, Artifacts: storage.Artifacts,
+		Execution:               storage.Execution,
 		VcsClient:               vcsClient,
 		VarFileAllowlistChecker: varFileAllowlistChecker,
 		Locker:                  projectLocker,
@@ -859,6 +915,12 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	pullUpdater := &events.PullUpdater{
+		ClaimCheck: func(p models.PullRequest) error {
+			if storage.Store != nil && p.ExecutionOwner() != "" {
+				return storage.Store.CheckClaim(p)
+			}
+			return nil
+		},
 		HidePrevPlanComments: userConfig.HidePrevPlanComments,
 		VCSClient:            vcsClient,
 		MarkdownRenderer:     markdownRenderer,
@@ -1018,6 +1080,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	commandRunner := &events.DefaultCommandRunner{
+		Execution:                      storage.Execution,
 		VCSClient:                      vcsClient,
 		GithubPullGetter:               githubClient,
 		GitlabMergeRequestGetter:       gitlabClient,
@@ -1049,6 +1112,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		return nil, err
 	}
 	locksController := &controllers.LocksController{
+		Durable:            storage.Store != nil,
 		AtlantisVersion:    config.AtlantisVersion,
 		AtlantisURL:        parsedURL,
 		Locker:             lockingClient,
@@ -1082,6 +1146,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	apiController := &controllers.APIController{
+		Execution:                       storage.Execution,
 		APISecret:                       []byte(userConfig.APISecret),
 		Locker:                          lockingClient,
 		Logger:                          logger,
@@ -1189,6 +1254,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
 		Experiments:                    slices.Clone(userConfig.Experiments),
 		database:                       database,
+		artifactStore:                  artifactStore,
+		jobService:                     storage.Jobs,
+		storageMaintenance:             storageMaintenance,
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())
@@ -1256,6 +1324,25 @@ func (s *Server) SetupRoutes() {
 
 // Start creates the routes and starts serving traffic.
 func (s *Server) Start() error {
+	if s.storageMaintenance != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.storageCancel = cancel
+		s.storageDone = make(chan struct{})
+		go func() {
+			defer close(s.storageDone)
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.storageMaintenance()
+				}
+			}
+		}()
+		defer cancel()
+	}
 	s.SetupRoutes()
 
 	n := negroni.New(&negroni.Recovery{
@@ -1340,15 +1427,33 @@ func (s *Server) waitForDrain() {
 
 // closeDatabase attempts to close the database, waiting up to the given timeout.
 func (s *Server) closeDatabase(timeout time.Duration) error {
+	if s.storageCancel != nil {
+		s.storageCancel()
+		select {
+		case <-s.storageDone:
+		case <-time.After(timeout):
+			return fmt.Errorf("storage maintenance did not stop before timeout")
+		}
+	}
+
 	if s.database == nil {
 		return nil
 	}
 	s.Logger.Info("Shutting down database")
 
 	done := make(chan error, 1)
-	go func() { done <- s.database.Close() }()
+	go func() {
+		var outputErr error
+		if s.jobService != nil {
+			outputErr = s.jobService.Close()
+		}
+		done <- errors.Join(outputErr, s.database.Close())
+	}()
 	select {
 	case err := <-done:
+		if s.artifactStore != nil {
+			err = errors.Join(err, s.artifactStore.Close())
+		}
 		return err
 	case <-time.After(timeout):
 		return fmt.Errorf("database close timed out after %s", timeout)

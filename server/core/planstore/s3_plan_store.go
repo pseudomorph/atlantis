@@ -17,7 +17,6 @@ import (
 	securejoin "github.com/cyphar/filepath-securejoin"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -39,41 +38,9 @@ type S3PlanStore struct {
 
 // NewS3PlanStore creates an S3PlanStore using the AWS SDK default credential chain.
 func NewS3PlanStore(cfg S3PlanStoreConfig, logger logging.SimpleLogging) (*S3PlanStore, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-	opts = append(opts, awsconfig.WithRegion(cfg.Region))
-
-	if cfg.Profile != "" {
-		opts = append(opts, awsconfig.WithSharedConfigProfile(cfg.Profile))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	client, err := artifacts.NewS3Client(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("loading AWS config: %w", err)
-	}
-
-	var s3Opts []func(*s3.Options)
-	if cfg.Endpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
-			if cfg.ForcePathStyle {
-				o.UsePathStyle = true
-			}
-		})
-	} else if cfg.ForcePathStyle {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.UsePathStyle = true
-		})
-	}
-
-	client := s3.NewFromConfig(awsCfg, s3Opts...)
-
-	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(cfg.Bucket),
-	}); err != nil {
-		return nil, fmt.Errorf("validating S3 plan store bucket %q: %w", cfg.Bucket, err)
+		return nil, err
 	}
 
 	return NewS3PlanStoreWithClient(client, cfg.Bucket, cfg.Prefix, logger), nil
