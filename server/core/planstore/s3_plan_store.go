@@ -19,30 +19,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/utils"
 )
 
-// S3Client is the subset of the S3 API used by S3PlanStore, extracted for testability.
-type S3Client interface {
-	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
-	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
-	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
-	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
-	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-}
-
-// S3PlanStoreConfig holds configuration for connecting to S3.
-type S3PlanStoreConfig struct {
-	Bucket         string
-	Region         string
-	Prefix         string
-	Endpoint       string
-	ForcePathStyle bool
-	Profile        string
-}
+type S3Client = artifacts.S3Client
+type S3PlanStoreConfig = artifacts.S3Config
 
 // S3PlanStore implements PlanStore by persisting plan files to S3.
 type S3PlanStore struct {
