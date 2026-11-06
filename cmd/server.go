@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/runatlantis/atlantis/server"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
@@ -425,7 +426,7 @@ var stringFlags = map[string]stringFlag{
 		description: "Secret used to validate requests made to the /api/* endpoints. Requires the api or drift-detection experiment for the corresponding routes.",
 	},
 	LockingDBType: {
-		description:  "The locking database type to use for storing plan and apply locks.",
+		description:  "[Deprecated: use storage.database.] " + "The locking database type to use for storing plan and apply locks.",
 		defaultValue: DefaultLockingDBType,
 	},
 	LogLevelFlag: {
@@ -441,20 +442,20 @@ var stringFlags = map[string]stringFlag{
 		defaultValue: DefaultStatsNamespace,
 	},
 	SharePlanDirFlag: {
-		description:  "Path to directory to store local Terraform plan files. If unset, defaults to --" + DataDirFlag + ".",
+		description:  "[Deprecated: use storage.artifacts.directory.] " + "Path to directory to store local Terraform plan files. If unset, defaults to --" + DataDirFlag + ".",
 		defaultValue: "",
 	},
 	RedisHost: {
-		description: "The Redis Hostname for when using a Locking DB type of 'redis'.",
+		description: "[Deprecated: use storage.database.] " + "The Redis Hostname for when using a Locking DB type of 'redis'.",
 	},
 	RedisPassword: {
-		description: "The Redis Password for when using a Locking DB type of 'redis'.",
+		description: "[Deprecated: use storage.database.] " + "The Redis Password for when using a Locking DB type of 'redis'.",
 	},
 	RedisUsername: {
-		description: "The Redis Username for when using a Locking DB type of 'redis'.",
+		description: "[Deprecated: use storage.database.] " + "The Redis Username for when using a Locking DB type of 'redis'.",
 	},
 	RedisClusterAddresses: {
-		description: "Comma-delimited list of Redis cluster node addresses in the format 'host:port'. " +
+		description: "[Deprecated: use storage.database.] " + "Comma-delimited list of Redis cluster node addresses in the format 'host:port'. " +
 			"When set, Atlantis uses Redis Cluster mode instead of single-node mode.",
 	},
 	RepoConfigFlag: {
@@ -627,7 +628,7 @@ var boolFlags = map[string]boolFlag{
 		defaultValue: false,
 	},
 	EnableExternalStoresFlag: {
-		description:  "Enable external storage backends configured in the server-side repo config (external_stores block).",
+		description:  "[Deprecated: use storage.artifacts.] " + "Enable external storage backends configured in the server-side repo config (external_stores block).",
 		defaultValue: false,
 	},
 	QuietPolicyChecks: {
@@ -635,11 +636,11 @@ var boolFlags = map[string]boolFlag{
 		defaultValue: false,
 	},
 	RedisTLSEnabled: {
-		description:  "Enable TLS on the connection to Redis with a min TLS version of 1.2",
+		description:  "[Deprecated: use storage.database.] " + "Enable TLS on the connection to Redis with a min TLS version of 1.2",
 		defaultValue: DefaultRedisTLSEnabled,
 	},
 	RedisInsecureSkipVerify: {
-		description:  "Controls whether the Redis client verifies the Redis server's certificate chain and host name. If true, accepts any certificate presented by the server and any host name in that certificate.",
+		description:  "[Deprecated: use storage.database.] " + "Controls whether the Redis client verifies the Redis server's certificate chain and host name. If true, accepts any certificate presented by the server and any host name in that certificate.",
 		defaultValue: DefaultRedisInsecureSkipVerify,
 	},
 	SilenceNoProjectsFlag: {
@@ -736,11 +737,11 @@ var intFlags = map[string]intFlag{
 		defaultValue: DefaultPort,
 	},
 	RedisDB: {
-		description:  "The Redis Database to use when using a Locking DB type of 'redis'.",
+		description:  "[Deprecated: use storage.database.] " + "The Redis Database to use when using a Locking DB type of 'redis'.",
 		defaultValue: DefaultRedisDB,
 	},
 	RedisPort: {
-		description:  "The Redis Port for when using a Locking DB type of 'redis'.",
+		description:  "[Deprecated: use storage.database.] " + "The Redis Port for when using a Locking DB type of 'redis'.",
 		defaultValue: DefaultRedisPort,
 	},
 }
@@ -946,6 +947,15 @@ func (s *ServerCmd) run() error {
 	if err := s.Viper.Unmarshal(&userConfig); err != nil {
 		return err
 	}
+	if userConfig.Storage != nil {
+		if err := s.Viper.UnmarshalKey("storage", userConfig.Storage, func(c *mapstructure.DecoderConfig) { c.ErrorUnused = true }); err != nil {
+			return fmt.Errorf("invalid storage configuration: %w", err)
+		}
+		if s.Viper.IsSet(LockingDBType) || s.Viper.IsSet(SharePlanDirFlag) || userConfig.EnableExternalStores {
+			return fmt.Errorf("storage cannot be combined with legacy locking-db-type, share-plan-dir, or enable-external-stores settings")
+		}
+	}
+
 	s.setDefaults(&userConfig, s.Viper)
 
 	// Now that we've parsed the config we can set our local logger to the
@@ -1357,22 +1367,25 @@ func (s *ServerCmd) securityWarnings(userConfig *server.UserConfig) {
 	}
 }
 
+var legacyStorageFlags = []string{LockingDBType, EnableExternalStoresFlag, SharePlanDirFlag, RedisDB, RedisHost, RedisPassword, RedisPort, RedisTLSEnabled, RedisInsecureSkipVerify, RedisUsername, RedisClusterAddresses}
+
 // deprecationWarnings prints a warning if flags that are deprecated are
 // being used.
 func (s *ServerCmd) deprecationWarnings(userConfig *server.UserConfig) error {
 	var deprecatedFlags []string
 
-	// Currently there are no deprecated flags; if flags become deprecated, add them here like so
-	//       if userConfig.SomeDeprecatedFlag {
-	//               deprecatedFlags = append(deprecatedFlags, SomeDeprecatedFlag)
-	//       }
-	//
+	for _, name := range legacyStorageFlags {
+		if s.Viper.IsSet(name) {
+			deprecatedFlags = append(deprecatedFlags, name)
+		}
+	}
 
 	if userConfig.TFDistribution != "" {
 		deprecatedFlags = append(deprecatedFlags, TFDistributionFlag)
 	}
 
 	if len(deprecatedFlags) > 0 {
+		slices.Sort(deprecatedFlags)
 		warning := "WARNING: "
 		if len(deprecatedFlags) == 1 {
 			warning += fmt.Sprintf("Flag --%s has been deprecated.", deprecatedFlags[0])

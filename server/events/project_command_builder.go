@@ -1256,7 +1256,7 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		// recover via the plan store. We must clone each workspace that has
 		// stored plans BEFORE restoring, otherwise Clone falls through to
 		// forceClone (os.RemoveAll) and wipes the just-restored plans.
-		ctx.Log.Info("pull directory missing, attempting to restore plans")
+		ctx.Log.Info("restoring pending plans from storage")
 		// Probe capability first to avoid pointless I/O on stores that don't
 		// support restore (e.g. LocalPlanStore).
 		if errors.Is(p.PlanStore.RestorePlans("", models.Repo{}, 0), runtime.ErrRestoreNotSupported) {
