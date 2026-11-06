@@ -573,7 +573,7 @@ func (p *PlanCommandRunner) deletePlanLocksForPendingPlans(ctx *command.Context,
 }
 
 func (p *PlanCommandRunner) unlockPlanLockIfOwnedByPull(ctx *command.Context, project models.Project, workspace string, lockKey string) error {
-	if _, err := p.lockingLocker.UnlockIfOwnedByPull(project, workspace, ctx.Pull.Num); err != nil {
+	if _, err := p.lockingLocker.UnlockIfOwnedByPull(ctx.Pull.BaseRepo, project, workspace, ctx.Pull.Num); err != nil {
 		return fmt.Errorf("deleting lock %q for pull %d: %w", lockKey, ctx.Pull.Num, err)
 	}
 	return nil

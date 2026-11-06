@@ -306,7 +306,7 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ctx.CommandSkipped {
-		defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+		defer a.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 	}
 
 	statusCode := http.StatusOK
@@ -343,7 +343,7 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		responder.writeJSON(w, http.StatusOK, result)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 
 	// The API apply endpoint runs plan first. Refresh PR status afterward so
 	// apply requirements evaluate the VCS state the plan phase just produced.
@@ -716,7 +716,7 @@ func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (_ *c
 	// some plans ran would leave their project locks behind.
 	defer func() {
 		if err != nil && !ctx.CommandSkipped {
-			a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+			a.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 		}
 	}()
 
@@ -1401,7 +1401,7 @@ func (e *apiRemediationExecutor) ExecutePlan(repository, ref, vcsType, projectNa
 	if err != nil {
 		return "", nil, err
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 
 	output, driftSummary := planRemediationOutput(result)
 
@@ -1481,7 +1481,7 @@ func (e *apiRemediationExecutor) ExecuteApplyProjects(repository, ref, vcsType s
 	if err != nil {
 		return nil, fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 
 	remediationResults := projectRemediationResultsFromPlan(projects, planResult)
 	if planResult.HasErrors() {
@@ -1576,7 +1576,7 @@ func (e *apiRemediationExecutor) ExecuteApply(repository, ref, vcsType, projectN
 	if err != nil {
 		return "", fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 	if planResult.HasErrors() {
 		output, _ := planRemediationOutput(planResult)
 		return output.String(), fmt.Errorf("plan had errors")
@@ -2315,7 +2315,7 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		responder.InternalError(w, r, err)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.Locker.UnlockByPull(ctx.HeadRepo, ctx.Pull.Num) // nolint: errcheck
 
 	// Process results and store drift data
 	detectionResult := models.NewDriftDetectionResult(request.Repository)
