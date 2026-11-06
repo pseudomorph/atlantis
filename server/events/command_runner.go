@@ -14,6 +14,7 @@ import (
 	"github.com/drmaxgit/go-azuredevops/azuredevops"
 	"github.com/google/go-github/v88/github"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -100,6 +101,7 @@ func preWorkflowHooksConfigured(runner PreWorkflowHooksCommandRunner, ctx *comma
 
 // DefaultCommandRunner is the first step when processing a comment command.
 type DefaultCommandRunner struct {
+	Execution                *ExecutionCoordinator
 	VCSClient                vcs.Client `validate:"required"`
 	GithubPullGetter         GithubPullGetter
 	AzureDevopsPullGetter    AzureDevopsPullGetter
@@ -208,6 +210,14 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 		}
 	}
 
+	if c.Execution != nil {
+		release, err := c.Execution.Acquire(ctx)
+		if err != nil {
+			ctx.Log.Err("acquiring durable execution: %v", err)
+			return
+		}
+		defer release()
+	}
 	ctx.Log.Info("Running autoplan...")
 	cmd := &CommentCommand{
 		Name: command.Autoplan,
@@ -523,6 +533,18 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if c.Execution != nil && cmd.Name != command.Cancel {
+		release, err := c.Execution.Acquire(ctx)
+		if err != nil {
+			ctx.Log.Err("acquiring durable execution: %v", err)
+			return
+		}
+		defer release()
+	}
+	if c.Execution != nil && cmd.Name == command.Cancel {
+		cmdRunner.Run(ctx, cmd)
+		return
+	}
 	preWorkflowHooksMayUpdateRepo := preWorkflowHooksConfigured(c.PreWorkflowHooksCommandRunner, ctx)
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 	if targetInitiallyIgnored {
