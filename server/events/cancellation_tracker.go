@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/events/models"
 )
 
@@ -55,3 +56,15 @@ func (p *DefaultCancellationTracker) Clear(pull models.PullRequest) {
 func pullKey(pull models.PullRequest) string {
 	return fmt.Sprintf("%s#%d", pull.BaseRepo.FullName, pull.Num)
 }
+
+// DurableCancellationTracker keeps cancellation authoritative in the database.
+type DurableCancellationTracker struct{ Store db.ExecutionStore }
+
+func (t *DurableCancellationTracker) Cancel(p models.PullRequest) {
+	_ = t.Store.CancelPull(p)
+}
+func (t *DurableCancellationTracker) IsCancelled(p models.PullRequest) bool {
+	cancelled, err := t.Store.IsCancelled(p)
+	return err != nil || cancelled
+}
+func (t *DurableCancellationTracker) Clear(models.PullRequest) {} // A new claimed operation clears a prior cancellation.

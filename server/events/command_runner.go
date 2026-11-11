@@ -14,6 +14,7 @@ import (
 	"github.com/drmaxgit/go-azuredevops/azuredevops"
 	"github.com/google/go-github/v88/github"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -100,6 +101,8 @@ func preWorkflowHooksConfigured(runner PreWorkflowHooksCommandRunner, ctx *comma
 
 // DefaultCommandRunner is the first step when processing a comment command.
 type DefaultCommandRunner struct {
+	LivePullHeadFetcher      LivePullHeadFetcher
+	Execution                *ExecutionCoordinator
 	VCSClient                vcs.Client `validate:"required"`
 	GithubPullGetter         GithubPullGetter
 	AzureDevopsPullGetter    AzureDevopsPullGetter
@@ -208,6 +211,14 @@ func (c *DefaultCommandRunner) RunAutoplanCommand(baseRepo models.Repo, headRepo
 		}
 	}
 
+	if c.Execution != nil {
+		release, err := c.Execution.Acquire(ctx)
+		if err != nil {
+			ctx.Log.Err("acquiring durable execution: %v", err)
+			return
+		}
+		defer release()
+	}
 	ctx.Log.Info("Running autoplan...")
 	cmd := &CommentCommand{
 		Name: command.Autoplan,
@@ -490,6 +501,14 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if c.Execution != nil && c.LivePullHeadFetcher != nil && (baseRepo.VCSHost.Type == models.BitbucketCloud || baseRepo.VCSHost.Type == models.BitbucketServer) {
+		current, refreshErr := c.LivePullHeadFetcher.GetLivePullIdentity(command.ProjectContext{Pull: pull, Log: log})
+		if refreshErr != nil {
+			log.Err("verifying current pull request: %v", refreshErr)
+			return
+		}
+		pull = current
+	}
 	status, err := c.PullStatusFetcher.GetPullStatus(pull)
 
 	if err != nil {
@@ -523,6 +542,27 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		return
 	}
 
+	if c.Execution != nil && ctx.Pull.State == models.OpenPullState && cmd.Name != command.Cancel && cmd.Name != command.Unlock {
+		if err := c.Execution.Store.RequestReopen(ctx.Pull); err != nil {
+			ctx.Log.Err("recording live PR reopening: %v", err)
+			return
+		}
+	}
+	if c.Execution != nil && cmd.Name != command.Cancel {
+		release, err := c.Execution.Acquire(ctx)
+		if err != nil {
+			ctx.Log.Err("acquiring durable execution: %v", err)
+			if commentErr := c.VCSClient.CreateComment(ctx.Log, baseRepo, pullNum, fmt.Sprintf("Atlantis could not start this command: %s", err), cmd.Name.String()); commentErr != nil {
+				ctx.Log.Err("reporting execution rejection: %v", commentErr)
+			}
+			return
+		}
+		defer release()
+	}
+	if c.Execution != nil && cmd.Name == command.Cancel {
+		cmdRunner.Run(ctx, cmd)
+		return
+	}
 	preWorkflowHooksMayUpdateRepo := preWorkflowHooksConfigured(c.PreWorkflowHooksCommandRunner, ctx)
 	preWorkflowHooksErr := c.PreWorkflowHooksCommandRunner.RunPreHooks(ctx, cmd)
 	if targetInitiallyIgnored {

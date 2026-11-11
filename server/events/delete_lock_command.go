@@ -6,6 +6,8 @@ package events
 import (
 	"strings"
 
+	"github.com/runatlantis/atlantis/server/events/command"
+
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/planstore"
@@ -23,6 +25,7 @@ type DeleteLockCommand interface {
 
 // DefaultDeleteLockCommand deletes a specific lock after a request from the LocksController.
 type DefaultDeleteLockCommand struct {
+	Execution        *ExecutionCoordinator
 	Locker           locking.Locker
 	WorkingDir       WorkingDir
 	WorkingDirLocker WorkingDirLocker
@@ -32,7 +35,23 @@ type DefaultDeleteLockCommand struct {
 
 // DeleteLock handles deleting the lock at id
 func (l *DefaultDeleteLockCommand) DeleteLock(logger logging.SimpleLogging, id string) (*models.ProjectLock, error) {
-	lock, err := l.Locker.Unlock(id)
+	var lock *models.ProjectLock
+	var err error
+	if l.Execution != nil {
+		existing, e := l.Locker.GetLock(id)
+		if e != nil || existing == nil {
+			return existing, e
+		}
+		ctx := &command.Context{Pull: existing.Pull, Log: logger}
+		release, e := l.Execution.Acquire(ctx)
+		if e != nil {
+			return nil, e
+		}
+		defer release()
+		lock, err = l.Locker.UnlockOwned(id, ctx.Pull)
+	} else {
+		lock, err = l.Locker.Unlock(id)
+	}
 	if err != nil {
 		return nil, err
 	}
