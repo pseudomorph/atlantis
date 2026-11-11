@@ -5820,3 +5820,24 @@ func TestAPIController_RejectsWorkspaceUnsafeForPaths(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIFailedPlanUnlocksBaseRepositoryForFork(t *testing.T) {
+	ac, _, _ := setup(t, func(config *apiControllerTestConfig) { config.allowUnlockByPull = false })
+	ac.FailOnPreWorkflowHookError = true
+	When(ac.PreWorkflowHooksCommandRunner.(*MockPreWorkflowHooksCommandRunner).RunPreHooks(Any[*command.Context](), Any[*events.CommentCommand]())).
+		Then(func(args []Param) ReturnValues {
+			args[0].(*command.Context).HeadRepo = models.Repo{FullName: "contributor/fork"}
+			return ReturnValues{errors.New("setup failed")}
+		})
+	ac.Locker.(*MockLocker).EXPECT().UnlockByPull(gomock.Any(), gomock.Any()).DoAndReturn(func(repo models.Repo, _ int) ([]models.ProjectLock, error) {
+		Equals(t, "Repo", repo.FullName)
+		return nil, nil
+	}).Times(1)
+	body, err := json.Marshal(controllers.APIRequest{Repository: "Repo", Ref: "main", Type: "Gitlab", Projects: []string{"project"}})
+	Ok(t, err)
+	request := httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewReader(body))
+	request.Header.Set(atlantisTokenHeader, atlantisToken)
+	response := httptest.NewRecorder()
+	ac.Plan(response, request)
+	Equals(t, http.StatusInternalServerError, response.Code)
+}

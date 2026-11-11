@@ -178,7 +178,7 @@ func (b *BoltDB) TryLock(newLock models.ProjectLock) (bool, models.ProjectLock, 
 // If there is no lock, then it will return a nil pointer.
 // If there is a lock, then it will delete it, and then return a pointer
 // to the deleted lock.
-func (b *BoltDB) Unlock(p models.Project, workspace string) (*models.ProjectLock, error) {
+func (b *BoltDB) Unlock(repo models.Repo, p models.Project, workspace string) (*models.ProjectLock, error) {
 	var lock models.ProjectLock
 	foundLock := false
 	key := b.lockKey(p, workspace)
@@ -203,7 +203,7 @@ func (b *BoltDB) Unlock(p models.Project, workspace string) (*models.ProjectLock
 }
 
 // UnlockIfOwnedByPull deletes a lock only if it is still owned by pullNum.
-func (b *BoltDB) UnlockIfOwnedByPull(p models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
+func (b *BoltDB) UnlockIfOwnedByPull(repo models.Repo, p models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
 	var lock models.ProjectLock
 	foundLock := false
 	key := b.lockKey(p, workspace)
@@ -344,7 +344,8 @@ func (b *BoltDB) CheckCommandLock(cmdName command.Name) (*command.Lock, error) {
 }
 
 // UnlockByPull deletes all locks associated with that pull request and returns them.
-func (b *BoltDB) UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error) {
+func (b *BoltDB) UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error) {
+	repoFullName := repo.FullName
 	var locks []models.ProjectLock
 	err := b.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(b.locksBucketName).Cursor()
@@ -367,7 +368,7 @@ func (b *BoltDB) UnlockByPull(repoFullName string, pullNum int) ([]models.Projec
 
 	// delete the locks
 	for _, lock := range locks {
-		if _, err = b.Unlock(lock.Project, lock.Workspace); err != nil {
+		if _, err = b.Unlock(lock.Pull.BaseRepo, lock.Project, lock.Workspace); err != nil {
 			return locks, fmt.Errorf("unlocking repo %s, path %s, workspace %s: %w", lock.Project.RepoFullName, lock.Project.Path, lock.Workspace, err)
 		}
 	}
@@ -376,7 +377,7 @@ func (b *BoltDB) UnlockByPull(repoFullName string, pullNum int) ([]models.Projec
 
 // GetLock returns a pointer to the lock for that project and workspace.
 // If there is no lock, it returns a nil pointer.
-func (b *BoltDB) GetLock(p models.Project, workspace string) (*models.ProjectLock, error) {
+func (b *BoltDB) GetLock(repo models.Repo, p models.Project, workspace string) (*models.ProjectLock, error) {
 	key := b.lockKey(p, workspace)
 	var lockBytes []byte
 	err := b.db.View(func(tx *bolt.Tx) error {
@@ -553,7 +554,7 @@ func (b *BoltDB) DeletePullStatus(pull models.PullRequest) error {
 }
 
 // UpdateProjectStatus updates project status.
-func (b *BoltDB) UpdateProjectStatus(pull models.PullRequest, workspace string, repoRelDir string, newStatus models.ProjectPlanStatus) error {
+func (b *BoltDB) UpdateProjectStatus(pull models.PullRequest, workspace string, repoRelDir string, projectName string, newStatus models.ProjectPlanStatus) error {
 	key, err := b.pullKey(pull)
 	if err != nil {
 		return err

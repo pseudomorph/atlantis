@@ -225,7 +225,7 @@ func TestMigrationOldLockKeysToNewFormat(t *testing.T) {
 	Assert(t, err != nil, "old key should be deleted after migration")
 
 	// Verify the new key exists with correct format
-	retrievedLock, err := r.GetLock(oldProject, "default")
+	retrievedLock, err := r.GetLock(models.Repo{}, oldProject, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist with new key format")
 	Equals(t, "owner/repo", retrievedLock.Project.RepoFullName)
@@ -257,7 +257,7 @@ func TestNoMigrationNeededForNewFormatKeys(t *testing.T) {
 	Assert(t, acquired, "should acquire lock")
 
 	// Verify the lock was created and can be retrieved with the correct key format
-	retrievedLock, err := r.GetLock(projectWithName, "default")
+	retrievedLock, err := r.GetLock(models.Repo{}, projectWithName, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist")
 	Equals(t, "projectName", retrievedLock.Project.ProjectName)
@@ -269,7 +269,7 @@ func TestNoMigrationNeededForNewFormatKeys(t *testing.T) {
 	r = newTestRedis(s)
 	defer r.Close()
 	// Verify lock still exists after "migration"
-	retrievedLock, err = r.GetLock(projectWithName, "default")
+	retrievedLock, err = r.GetLock(models.Repo{}, projectWithName, "default")
 	Ok(t, err)
 	Assert(t, retrievedLock != nil, "lock should exist")
 	Equals(t, "projectName", retrievedLock.Project.ProjectName)
@@ -351,7 +351,7 @@ func TestListAddRemove(t *testing.T) {
 	rdb := newTestRedis(s)
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
-	_, err = rdb.Unlock(project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	ls, err := rdb.List()
@@ -434,7 +434,7 @@ func TestUnlockingNoLocks(t *testing.T) {
 	t.Log("unlocking with no locks should succeed")
 	s := miniredis.RunT(t)
 	rdb := newTestRedis(s)
-	_, err := rdb.Unlock(project, workspace)
+	_, err := rdb.Unlock(models.Repo{}, project, workspace)
 
 	Ok(t, err)
 }
@@ -446,7 +446,7 @@ func TestUnlocking(t *testing.T) {
 
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
-	_, err = rdb.Unlock(project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	// should be no locks listed
@@ -487,13 +487,13 @@ func TestUnlockingMultiple(t *testing.T) {
 	Ok(t, err)
 
 	// now try and unlock them
-	_, err = rdb.Unlock(new3.Project, new3.Workspace)
+	_, err = rdb.Unlock(models.Repo{}, new3.Project, new3.Workspace)
 	Ok(t, err)
-	_, err = rdb.Unlock(new2.Project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, new2.Project, workspace)
 	Ok(t, err)
-	_, err = rdb.Unlock(new1.Project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, new1.Project, workspace)
 	Ok(t, err)
-	_, err = rdb.Unlock(project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
 	// should be none left
@@ -507,7 +507,7 @@ func TestUnlockIfOwnedByPullMissingLock(t *testing.T) {
 	s := miniredis.RunT(t)
 	rdb := newTestRedis(s)
 
-	deleted, err := rdb.UnlockIfOwnedByPull(project, workspace, pullNum)
+	deleted, err := rdb.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), deleted)
 }
@@ -520,11 +520,11 @@ func TestUnlockIfOwnedByPullOtherPull(t *testing.T) {
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
 
-	deleted, err := rdb.UnlockIfOwnedByPull(project, workspace, pullNum+1)
+	deleted, err := rdb.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum+1)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), deleted)
 
-	existing, err := rdb.GetLock(project, workspace)
+	existing, err := rdb.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Assert(t, existing != nil, "expected lock to remain")
 	Equals(t, pullNum, existing.Pull.Num)
@@ -538,7 +538,7 @@ func TestUnlockIfOwnedByPullCurrentPull(t *testing.T) {
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
 
-	deleted, err := rdb.UnlockIfOwnedByPull(project, workspace, pullNum)
+	deleted, err := rdb.UnlockIfOwnedByPull(models.Repo{}, project, workspace, pullNum)
 	Ok(t, err)
 	Assert(t, deleted != nil, "expected deleted lock")
 	Equals(t, lock.Project, deleted.Project)
@@ -546,7 +546,7 @@ func TestUnlockIfOwnedByPullCurrentPull(t *testing.T) {
 	Equals(t, lock.Pull, deleted.Pull)
 	Equals(t, lock.User, deleted.User)
 
-	existing, err := rdb.GetLock(project, workspace)
+	existing, err := rdb.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), existing)
 }
@@ -556,7 +556,7 @@ func TestUnlockByPullNone(t *testing.T) {
 	s := miniredis.RunT(t)
 	rdb := newTestRedis(s)
 
-	_, err := rdb.UnlockByPull("any/repo", 1)
+	_, err := rdb.UnlockByPull(models.Repo{FullName: "any/repo"}, 1)
 	Ok(t, err)
 }
 
@@ -569,7 +569,7 @@ func TestUnlockByPullOne(t *testing.T) {
 
 	t.Log("...delete nothing when its the same repo but a different pull")
 	{
-		_, err := rdb.UnlockByPull(project.RepoFullName, pullNum+1)
+		_, err := rdb.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum+1)
 		Ok(t, err)
 		ls, err := rdb.List()
 		Ok(t, err)
@@ -577,7 +577,7 @@ func TestUnlockByPullOne(t *testing.T) {
 	}
 	t.Log("...delete nothing when its the same pull but a different repo")
 	{
-		_, err := rdb.UnlockByPull("different/repo", pullNum)
+		_, err := rdb.UnlockByPull(models.Repo{FullName: "different/repo"}, pullNum)
 		Ok(t, err)
 		ls, err := rdb.List()
 		Ok(t, err)
@@ -585,7 +585,7 @@ func TestUnlockByPullOne(t *testing.T) {
 	}
 	t.Log("...delete the lock when its the same repo and pull")
 	{
-		_, err := rdb.UnlockByPull(project.RepoFullName, pullNum)
+		_, err := rdb.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 		Ok(t, err)
 		ls, err := rdb.List()
 		Ok(t, err)
@@ -599,10 +599,10 @@ func TestUnlockByPullAfterUnlock(t *testing.T) {
 	rdb := newTestRedis(s)
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
-	_, err = rdb.Unlock(project, workspace)
+	_, err = rdb.Unlock(models.Repo{}, project, workspace)
 	Ok(t, err)
 
-	_, err = rdb.UnlockByPull(project.RepoFullName, pullNum)
+	_, err = rdb.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 	Ok(t, err)
 	ls, err := rdb.List()
 	Ok(t, err)
@@ -632,7 +632,7 @@ func TestUnlockByPullMatching(t *testing.T) {
 	Equals(t, 3, len(ls))
 
 	// should all be unlocked
-	_, err = rdb.UnlockByPull(project.RepoFullName, pullNum)
+	_, err = rdb.UnlockByPull(models.Repo{FullName: project.RepoFullName}, pullNum)
 	Ok(t, err)
 	ls, err = rdb.List()
 	Ok(t, err)
@@ -643,7 +643,7 @@ func TestGetLockNotThere(t *testing.T) {
 	t.Log("getting a lock that doesn't exist should return a nil pointer")
 	s := miniredis.RunT(t)
 	rdb := newTestRedis(s)
-	l, err := rdb.GetLock(project, workspace)
+	l, err := rdb.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	Equals(t, (*models.ProjectLock)(nil), l)
 }
@@ -655,7 +655,7 @@ func TestGetLock(t *testing.T) {
 	_, _, err := rdb.TryLock(lock)
 	Ok(t, err)
 
-	l, err := rdb.GetLock(project, workspace)
+	l, err := rdb.GetLock(models.Repo{}, project, workspace)
 	Ok(t, err)
 	// can't compare against time so doing each field
 	Equals(t, lock.Project, l.Project)
@@ -810,7 +810,7 @@ func TestPullStatus_UpdateProject(t *testing.T) {
 		})
 	Ok(t, err)
 
-	err = rdb.UpdateProjectStatus(pull, "default", ".", models.DiscardedPlanStatus)
+	err = rdb.UpdateProjectStatus(pull, "default", ".", "", models.DiscardedPlanStatus)
 	Ok(t, err)
 
 	status, err := rdb.GetPullStatus(pull)
