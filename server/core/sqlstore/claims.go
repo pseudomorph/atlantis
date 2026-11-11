@@ -74,6 +74,13 @@ func checkExecutionClaim(claim executionClaim, owner string, err error) error {
 	return nil
 }
 
+// Jobs retain the pull and owner that admitted them, fencing writes after recovery.
+func (s *Store) guardJob(tx *gorm.DB, row job) error {
+	var claim executionClaim
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("pull_id = ?", row.PullID).Take(&claim).Error
+	return checkExecutionClaim(claim, row.Owner, err)
+}
+
 func (s *Store) CheckClaim(p models.PullRequest) error {
 	return s.db.Transaction(func(tx *gorm.DB) error { return s.guard(tx, p) })
 }
