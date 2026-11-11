@@ -1887,6 +1887,10 @@ func (l failUnlockByPullLocker) Unlock(string) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
+func (l failUnlockByPullLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
+}
+
 func (l failUnlockByPullLocker) List() (map[string]models.ProjectLock, error) {
 	return nil, nil
 }

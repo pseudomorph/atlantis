@@ -35,3 +35,10 @@ type Database interface {
 	Ping() error
 	Close() error
 }
+
+// LockKeyCodec provides opaque keys for stores with instance-scoped identities.
+// Legacy stores keep their existing externally visible lock keys.
+type LockKeyCodec interface {
+	LockKey(models.Repo, models.Project, string) string
+	ParseLockKey(string) (models.Repo, models.Project, string, error)
+}
