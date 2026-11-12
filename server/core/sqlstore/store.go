@@ -19,6 +19,7 @@ import (
 
 	"github.com/glebarez/sqlite"
 	"github.com/gofrs/flock"
+	"github.com/google/uuid"
 	"github.com/pressly/goose/v3"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"gorm.io/gorm"
@@ -36,6 +37,10 @@ type Store struct {
 	db    *gorm.DB
 	conn  *sql.DB
 	owner *flock.Flock
+	// instance identifies this server process in the claims and jobs it writes.
+	instance string
+	// claimExpiry is how long a claim may go without a heartbeat before it is uncertain.
+	claimExpiry time.Duration
 }
 
 var _ db.Database = (*Store)(nil)
@@ -91,7 +96,7 @@ func openSQLite(dataDir string) (*Store, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("migrating sqlite: %w", err)
 	}
-	return &Store{db: orm, conn: conn}, nil
+	return &Store{db: orm, conn: conn, instance: uuid.NewString(), claimExpiry: ClaimExpiry}, nil
 }
 
 func migrate(conn *sql.DB) error {

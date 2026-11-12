@@ -219,8 +219,16 @@ of this experiment.
   completion while their execution claim remains held. Active-process interruption
   is deferred. PR closure invalidates pending plans. After a crash, prior claims become uncertain and block new commands
   on the affected PR or API invocation. They never permit automatic Terraform
-  retries. There are no heartbeats or expiring leases in this single-instance
-  implementation.
+  retries.
+- Each server process gets a new instance ID, logged at startup. Claims record
+  the instance that holds them and jobs record the instance that ran them. The
+  server refreshes a heartbeat on its claims every 15 seconds, including while it
+  drains for shutdown. A sweep marks an active claim whose heartbeat is older than
+  2 minutes uncertain and seals its open logs as interrupted. An expired claim is
+  never transferred to another command; it needs the stopped-work recovery below.
+  With SQLite the process lock already makes every earlier claim uncertain at
+  startup, so the sweep only finds claims whose own refresh stopped. These
+  intervals are fixed and not configurable.
 - Closing a PR cancels queued work and defers cleanup until active work stops.
   Reopening it accepts commands again once that cleanup finishes.
 - Commands report claim rejection on the PR. A rejected autoplan also fails the
@@ -250,8 +258,9 @@ started by custom steps, then have an authorized operator comment:
 atlantis unlock --confirm-stopped
 ```
 
-This is an operator attestation, not automatic process detection. Recovery records
-its actor, previous owner, and timestamp; marks unfinished jobs interrupted;
+This is an operator attestation, not automatic process detection. Recovery also
+works on a claim whose heartbeat expired. It records its actor, the previous
+owner and server instance, the recovering instance, and a timestamp; marks unfinished jobs interrupted;
 invalidates pending plans; and acquires recovery ownership in one transaction.
 Unlock then releases the PR's reservations. Job history and logs remain available. A failed
 recovery write rolls back; uncertain work never permits automatic retry. If apply

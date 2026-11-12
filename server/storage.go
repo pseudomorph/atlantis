@@ -74,6 +74,25 @@ func newStorageRuntime(store *sqlstore.Store, config UserConfig) (*storageRuntim
 	}, nil
 }
 
+// Heartbeat refreshes the claims this server instance holds, then marks claims
+// whose heartbeat has expired uncertain. With SQLite the process lock already
+// made earlier claims uncertain at startup, so the sweep only finds claims whose
+// own refresh stopped.
+func (s *storageRuntime) Heartbeat(logger logging.SimpleLogging) func() {
+	return func() {
+		if _, err := s.Store.RefreshClaimHeartbeats(); err != nil {
+			logger.Err("refreshing execution claim heartbeats: %v", err)
+		}
+		expired, err := s.Store.ExpireClaims()
+		if err != nil {
+			logger.Err("sweeping expired execution claims: %v", err)
+		}
+		if expired > 0 {
+			logger.Warn("marked %d expired execution claims uncertain, verify stopped work and recover with unlock --confirm-stopped", expired)
+		}
+	}
+}
+
 func (s *storageRuntime) Maintain(worker *events.PullClosedExecutor, logger logging.SimpleLogging) func() {
 	return func() {
 		pending, err := s.Store.PendingLifecycleChecks()
