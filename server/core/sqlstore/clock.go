@@ -10,6 +10,9 @@ import (
 	"gorm.io/gorm"
 )
 
+// Now supplies database time to maintenance that runs outside a storage transaction.
+func (s *Store) Now() (time.Time, error) { return databaseNow(s.db) }
+
 // databaseNow reads wall-clock time on the current connection, including after a lock wait.
 // Call explicitly; a query from GORM's NowFunc would re-enter SQLite's single connection.
 func databaseNow(tx *gorm.DB) (time.Time, error) {

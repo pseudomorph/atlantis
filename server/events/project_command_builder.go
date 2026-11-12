@@ -1242,6 +1242,11 @@ func (p *DefaultProjectCommandBuilder) pathConfiguredOnlyOnAnotherBranch(ctx *co
 // pending plans in this ctx.
 func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *command.Context, commentCmd *CommentCommand) ([]command.ProjectContext, error) {
 	pullDir, err := p.WorkingDir.GetPullDir(ctx.Pull.BaseRepo, ctx.Pull)
+	inventory, hasInventory := p.PlanStore.(planstore.Inventory)
+	if hasInventory && (err == nil || os.IsNotExist(err)) {
+		err = os.ErrNotExist
+	}
+
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
@@ -1286,9 +1291,29 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		}
 	}
 
-	plans, err := p.PendingPlanFinder.Find(pullDir)
-	if err != nil {
-		return nil, err
+	var plans []PendingPlan
+	if hasInventory {
+		pending, err := inventory.PendingPlans(ctx.Pull.BaseRepo, ctx.Pull.Num)
+		if err != nil {
+			return nil, fmt.Errorf("listing pending plans: %w", err)
+		}
+		for _, job := range pending {
+			repoDir, err := workspaceRepoDir(pullDir, job.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			plans = append(plans, PendingPlan{
+				RepoDir:     repoDir,
+				RepoRelDir:  job.Project.Path,
+				ProjectName: job.Project.ProjectName,
+				Workspace:   job.Workspace,
+			})
+		}
+	} else {
+		plans, err = p.PendingPlanFinder.Find(pullDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// use the default repository workspace because it is the only one guaranteed to have an atlantis.yaml,
@@ -1643,7 +1668,11 @@ func (p *DefaultProjectCommandBuilder) buildProjectCommand(ctx *command.Context,
 	if err != nil {
 		return projCtx, err
 	}
-	if recloned {
+	// Durable plans can be restored into any checkout, so a targeted apply
+	// recovers each missing workspace even when something else, such as a
+	// pre-workflow hook, already recreated the default checkout.
+	_, durablePlans := p.PlanStore.(planstore.Inventory)
+	if recloned || (durablePlans && cmd.Name == command.Apply) {
 		if err := p.cloneMissingWorkspaces(ctx, projCtx); err != nil {
 			return nil, err
 		}
@@ -1662,14 +1691,22 @@ func (p *DefaultProjectCommandBuilder) buildProjectCommand(ctx *command.Context,
 // that file is only readable once the default checkout exists. A targeted
 // command addressing a project by name (`-p`) supplies no workspace at all, so
 // a project pinned to a non-default workspace would otherwise never be cloned.
+// Existing checkouts are left alone.
 func (p *DefaultProjectCommandBuilder) cloneMissingWorkspaces(ctx *command.Context, projCtxs []command.ProjectContext) error {
-	cloned := map[string]bool{DefaultWorkspace: true}
+	checked := map[string]bool{DefaultWorkspace: true}
 	for _, projCtx := range projCtxs {
 		workspace := projCtx.Workspace
-		if workspace == "" || cloned[workspace] {
+		if workspace == "" || checked[workspace] {
 			continue
 		}
-		cloned[workspace] = true
+		checked[workspace] = true
+		_, err := p.WorkingDir.GetWorkingDir(ctx.Pull.BaseRepo, ctx.Pull, workspace)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("checking working directory for workspace %q: %w", workspace, err)
+		}
 		if _, err := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, workspace); err != nil {
 			return fmt.Errorf("re-cloning workspace %q for apply: %w", workspace, err)
 		}

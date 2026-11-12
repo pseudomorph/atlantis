@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	. "github.com/petergtz/pegomock/v4"
 	"github.com/runatlantis/atlantis/server"
 	events_controllers "github.com/runatlantis/atlantis/server/controllers/events"
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -27,10 +29,11 @@ import (
 )
 
 // durableE2E holds one server's durable-storage runtime. Reusing DataDir in a
-// second setup restarts the server against the same database.
+// second setup restarts the server against the same database and artifacts.
 type durableE2E struct {
 	DataDir   string
 	Store     *sqlstore.Store
+	Artifacts *artifacts.Service
 	Jobs      *jobs.Service
 	Execution *events.ExecutionCoordinator
 	Cleaner   *events.PullClosedExecutor
@@ -43,7 +46,9 @@ func (d *durableE2E) open(t *testing.T) {
 	Ok(t, err)
 	// Startup marks work left by a previous process uncertain, as the server does.
 	Ok(t, store.MarkPreviousExecutionsUncertain())
+	blobs := sqlstore.BlobStore{Store: store}
 	d.Store = store
+	d.Artifacts = &artifacts.Service{Records: store, Blobs: blobs}
 	d.Jobs = &jobs.Service{Store: store}
 	d.Execution = &events.ExecutionCoordinator{Store: store}
 	t.Cleanup(func() { d.stop(t) })
@@ -138,8 +143,8 @@ func skipUnlessDurableE2E(t *testing.T) {
 	userConfig = server.UserConfig{}
 }
 
-// Locks and pull status live in SQLite, so a restarted server applies the plan
-// that the first server recorded.
+// Locks, pull status and the plan snapshot live in durable storage, so a
+// restarted server applies the plan that the first server recorded.
 func TestDurableStoragePlanSurvivesRestart(t *testing.T) {
 	skipUnlessDurableE2E(t)
 	repoDir, headSHA := initializeRepo(t, "simple")
@@ -161,6 +166,79 @@ func TestDurableStoragePlanSurvivesRestart(t *testing.T) {
 	locks, err = restarted.storage.Store.List()
 	Ok(t, err)
 	Equals(t, 1, len(locks))
+}
+
+func TestDurableStorageRestoresPlanIntoLostWorkingDirectory(t *testing.T) {
+	skipUnlessDurableE2E(t)
+	repoDir, headSHA := initializeRepo(t, "simple")
+
+	s := startDurableServer(t, repoDir, headSHA, &durableE2E{})
+	s.open(t, headSHA)
+	lastReplyContains(t, s, "Plan: 3 to add")
+	Ok(t, os.RemoveAll(pullWorkingDir(s)))
+	s.comment(t, "atlantis apply")
+	lastReplyContains(t, s, "Apply complete!")
+}
+
+func TestDurableStorageRestoresBackendDataAndWorkspace(t *testing.T) {
+	for _, workspace := range []string{"default", "staging"} {
+		t.Run(workspace, func(t *testing.T) {
+			skipUnlessDurableE2E(t)
+			repoDir, headSHA := initializeRepo(t, "simple")
+			stateDir := filepath.ToSlash(t.TempDir())
+			backend := fmt.Sprintf("terraform {\n backend \"local\" {\n path = %q\n workspace_dir = %q\n }\n}\n", stateDir+"/state.tfstate", stateDir+"/workspaces")
+			Ok(t, os.WriteFile(filepath.Join(repoDir, "backend.tf"), []byte(backend), 0600))
+			workflow := fmt.Sprintf(`version: 3
+projects:
+- dir: .
+  workspace: %s
+  workflow: restore
+workflows:
+  restore:
+    plan:
+      steps:
+      - env:
+          name: TF_DATA_DIR
+          value: .tfdata
+      - init
+      - plan
+    apply:
+      steps:
+      - env:
+          name: TF_DATA_DIR
+          value: .tfdata
+      - apply
+`, workspace)
+			Ok(t, os.WriteFile(filepath.Join(repoDir, "atlantis.yaml"), []byte(workflow), 0600))
+			runCmd(t, repoDir, "git", "add", "backend.tf", "atlantis.yaml")
+			runCmd(t, repoDir, "git", "commit", "-m", "explicit backend and data directory")
+			headSHA = strings.TrimSpace(runCmd(t, repoDir, "git", "rev-parse", "HEAD"))
+			s := startDurableServer(t, repoDir, headSHA, &durableE2E{})
+			s.open(t, headSHA)
+			lastReplyContains(t, s, "Plan: 3 to add")
+			all, err := s.storage.Store.Jobs()
+			Ok(t, err)
+			var plans []models.Job
+			for _, job := range all {
+				if job.Command == "plan" {
+					plans = append(plans, job)
+				}
+			}
+
+			Equals(t, 1, len(plans))
+			records, err := s.storage.Store.Snapshot(plans[0].ID)
+			Ok(t, err)
+			backendSaved, workspaceSaved := false, false
+			for _, a := range records.Manifest.Files {
+				backendSaved = backendSaved || a.Kind == "backend"
+				workspaceSaved = workspaceSaved || a.Kind == "workspace"
+			}
+			Assert(t, backendSaved && workspaceSaved, "initialization metadata was not captured")
+			Ok(t, os.RemoveAll(pullWorkingDir(s)))
+			s.comment(t, "atlantis apply")
+			lastReplyContains(t, s, "Apply complete!")
+		})
+	}
 }
 
 func TestDurableStorageReopenedPullAcceptsCommands(t *testing.T) {
@@ -299,4 +377,91 @@ func pullDirs(t *testing.T, s durableServer) []string {
 	dirs, err := filepath.Glob(filepath.Join(pullWorkingDir(s), "*", "runatlantis", "atlantis-tests", "2"))
 	Ok(t, err)
 	return dirs
+}
+
+func TestDurableStorageRestoresProviderFreeBackend(t *testing.T) {
+	skipUnlessDurableE2E(t)
+	repoDir, _ := initializeRepo(t, "simple")
+	statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "state.tfstate"))
+	configuration := fmt.Sprintf("terraform {\n backend \"local\" {\n path = %q\n }\n}\noutput \"restored\" {\n value = \"provider-free\"\n}\n", statePath)
+	Ok(t, os.WriteFile(filepath.Join(repoDir, "main.tf"), []byte(configuration), 0600))
+	Ok(t, os.Remove(filepath.Join(repoDir, "versions.tf")))
+	runCmd(t, repoDir, "git", "add", "main.tf", "versions.tf")
+	runCmd(t, repoDir, "git", "commit", "-m", "provider-free backend")
+	headSHA := strings.TrimSpace(runCmd(t, repoDir, "git", "rev-parse", "HEAD"))
+	s := startDurableServer(t, repoDir, headSHA, &durableE2E{})
+	s.open(t, headSHA)
+	lastReplyContains(t, s, "Changes to Outputs")
+	all, err := s.storage.Store.Jobs()
+	Ok(t, err)
+	found := false
+	for _, job := range all {
+		if job.Command != "plan" {
+			continue
+		}
+		snapshot, err := s.storage.Store.Snapshot(job.ID)
+		Ok(t, err)
+		Assert(t, snapshot != nil, "provider-free plan snapshot missing")
+		_, hasLock := snapshot.Manifest.File("lockfile")
+		_, hasBackend := snapshot.Manifest.File("backend")
+		Assert(t, !hasLock && hasBackend && snapshot.Manifest.DataDirectory == ".terraform", "provider-free initialization metadata missing")
+		found = true
+	}
+	Assert(t, found, "no plan job recorded")
+	Ok(t, os.RemoveAll(pullWorkingDir(s)))
+	s.comment(t, "atlantis apply")
+	lastReplyContains(t, s, "Apply complete!")
+}
+
+func TestDurableStorageRestoresPlanOnlyBackendArguments(t *testing.T) {
+	for _, changed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cached configuration", true: "changed override rejected"}[changed], func(t *testing.T) {
+			skipUnlessDurableE2E(t)
+			repoDir, _ := initializeRepo(t, "simple")
+			statePath := filepath.ToSlash(filepath.Join(t.TempDir(), "planned.tfstate"))
+			configuration := "terraform {\n backend \"local\" {}\n}\noutput \"restored\" { value = \"partial-backend\" }\n"
+			Ok(t, os.WriteFile(filepath.Join(repoDir, "main.tf"), []byte(configuration), 0600))
+			Ok(t, os.Remove(filepath.Join(repoDir, "versions.tf")))
+			applySteps := "      - apply"
+			changedPath := filepath.ToSlash(filepath.Join(t.TempDir(), "changed.tfstate"))
+			if changed {
+				applySteps = fmt.Sprintf("      - env:\n          name: TF_CLI_ARGS_init\n          value: '-backend-config=path=%s'\n      - apply", changedPath)
+			}
+			workflow := fmt.Sprintf(`version: 3
+projects:
+- dir: .
+  workflow: restore
+workflows:
+  restore:
+    plan:
+      steps:
+      - env:
+          name: TF_CLI_ARGS_init
+          value: '-backend-config=path=%s'
+      - init
+      - plan
+    apply:
+      steps:
+%s
+`, statePath, applySteps)
+			Ok(t, os.WriteFile(filepath.Join(repoDir, "atlantis.yaml"), []byte(workflow), 0600))
+			runCmd(t, repoDir, "git", "add", "main.tf", "versions.tf", "atlantis.yaml")
+			runCmd(t, repoDir, "git", "commit", "-m", "partial backend configuration")
+			headSHA := strings.TrimSpace(runCmd(t, repoDir, "git", "rev-parse", "HEAD"))
+			s := startDurableServer(t, repoDir, headSHA, &durableE2E{})
+			s.open(t, headSHA)
+			lastReplyContains(t, s, "Changes to Outputs")
+			Ok(t, os.RemoveAll(pullWorkingDir(s)))
+			s.comment(t, "atlantis apply")
+			if changed {
+				lastReplyContains(t, s, "Backend configuration changed")
+				_, err := os.Stat(changedPath)
+				Assert(t, os.IsNotExist(err), "changed backend received state")
+			} else {
+				lastReplyContains(t, s, "Apply complete!")
+				_, err := os.Stat(statePath)
+				Ok(t, err)
+			}
+		})
+	}
 }

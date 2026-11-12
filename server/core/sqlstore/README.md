@@ -8,21 +8,22 @@ Keep schema definitions portable for a future PostgreSQL backend: UUIDs use
 `TEXT`, counters use `BIGINT`, binary payloads use `BYTEA`, and booleans use
 `TRUE`/`FALSE`. SQLite accepts these declarations without `STRICT` tables.
 Store timestamps in UTC, normalized to microseconds. Storage-generated timestamps
-use `databaseNow`; explicitly supplied event timestamps retain their instant.
-SQLite's clock has millisecond resolution.
+and production retention cutoffs use `databaseNow`; explicitly supplied event
+timestamps retain their instant. SQLite's clock has millisecond resolution.
 
 `OpenServer` holds a process lock before opening or migrating SQLite. Run one
 server on local or block-backed storage; network filesystems are unsupported.
-The store holds project locks, global command locks, pull request status, jobs
-and execution claims.
+The store holds project locks, global command locks, pull request status, jobs,
+execution claims, pending plans and plan snapshot metadata.
 
 Commands own persisted execution claims until completion, and lock, status and
 job writes require the live claim. Startup marks leftover claims uncertain,
 preventing new commands and destructive cleanup for those PRs or API
 invocations: a dead parent does not prove Terraform children stopped. There are
 no heartbeats, expiring leases, or automatic retries. Authorized unlock recovery
-requires an explicit stopped-work attestation; it records the actor and
-interrupts unfinished jobs before releasing reservations. Closing a pull request
+requires an explicit stopped-work attestation; it records the actor,
+interrupts unfinished jobs and invalidates pending plans before releasing
+reservations. Closing a pull request
 records a closure generation; deferred cleanup holds its own claim and must
 match that generation, and a reopened pull request accepts work only after the
 cleanup completes. Unverified close events persist in `pending_pull_lifecycles`
@@ -63,3 +64,21 @@ Store one credential-free clone URL and populate both repository model URL field
 when loading it. Repository owner/name/hostname derive on load. Status rows
 reference their pull; project status constraints separately enforce repository
 matching and deletion with the parent status.
+
+A plan job records its pending plan in `pending_plans`, one row per project and
+pull. `StartPlan` takes the slot when the runner holds its locks, and a plan
+becomes ready only if it finishes successfully with a published snapshot while
+its pull is open. A later plan for the same project replaces the slot; the older
+job then fails at completion. Apply, policy check, import and state commands
+bind the ready producer at admission with an insert-only `plan_bindings` row,
+whose foreign keys require the producer's project and pull.
+Closure, unlock, recovery, pull status deletion and the release of a non-PR
+invocation delete pending rows. A successful apply, import or state command
+consumes its plan, and so does one that fails after it started mutating.
+
+Each snapshot and database blob is keyed by its producing job; filesystem keys
+derive from the same ID under `snapshots/v1/`. The manifest records member
+roles, paths and checksums, and publication requires the live claim. Retention
+protects the bundle while any consumer is running, even after pending-plan
+invalidation, then purges it once `storage.retention.plan_artifacts` has passed.
+Orphan collection deletes unreferenced bundles only while no claim or job is active.

@@ -15,8 +15,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -376,6 +378,7 @@ type DefaultProjectCommandRunner struct {
 	VarFileAllowlistChecker *VarFileAllowlistChecker
 	Execution               *ExecutionCoordinator
 	Jobs                    *jobs.Service
+	Artifacts               *artifacts.Service
 }
 
 // checkVarFilesResolved rejects comment var-file arguments that resolve, with
@@ -620,6 +623,9 @@ func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) 
 		}
 		return nil, "", err
 	}
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
+	}
 	absPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err := checkProjectDir(ctx, repoDir, absPath); err != nil {
 
@@ -631,6 +637,11 @@ func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) 
 		return nil, "", err
 	}
 
+	if p.Jobs != nil {
+		if err := p.ensurePlanLoaded(ctx, absPath); err != nil {
+			return nil, "", err
+		}
+	}
 	var failure string
 	outputs, err := p.runSteps(ctx.Steps, ctx, absPath)
 	var errs error
@@ -865,6 +876,9 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
 		return nil, "", err
 	}
 
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
+	}
 	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err := checkProjectDir(ctx, repoDir, projAbsPath); err != nil {
 		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
@@ -957,6 +971,9 @@ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (apply
 			return "", "", "", errors.New("project has not been cloned–did you run plan?")
 		}
 		return "", "", "", err
+	}
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
 	}
 	absPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err := checkProjectDir(ctx, repoDir, absPath); err != nil {
@@ -1089,6 +1106,9 @@ func (p *DefaultProjectCommandRunner) doVersion(ctx command.ProjectContext) (ver
 		}
 		return "", "", err
 	}
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
+	}
 	absPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err := checkProjectDir(ctx, repoDir, absPath); err != nil {
 		return "", "", err
@@ -1114,6 +1134,9 @@ func (p *DefaultProjectCommandRunner) doImport(ctx command.ProjectContext) (out 
 	repoDir, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
 	if cloneErr != nil {
 		return nil, "", cloneErr
+	}
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
 	}
 	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err = checkProjectDir(ctx, repoDir, projAbsPath); err != nil {
@@ -1163,6 +1186,9 @@ func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out
 	repoDir, cloneErr := p.WorkingDir.Clone(ctx.Log, ctx.HeadRepo, ctx.Pull, ctx.Workspace)
 	if cloneErr != nil {
 		return nil, "", cloneErr
+	}
+	if p.Jobs != nil {
+		ctx.ArtifactRoot = repoDir
 	}
 	projAbsPath := filepath.Join(repoDir, ctx.RepoRelDir)
 	if err = checkProjectDir(ctx, repoDir, projAbsPath); err != nil {
@@ -1233,6 +1259,16 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 			return nil, err
 		}
 	}
+	if p.Jobs != nil && ctx.CommandName == command.Plan {
+		if err := p.Jobs.Store.StartPlan(ctx.JobID); err != nil {
+			return nil, fmt.Errorf("starting plan generation: %w", err)
+		}
+		for _, filename := range []string{runtime.GetPlanFilePath(ctx, absPath), filepath.Join(absPath, ctx.GetShowResultFileName())} {
+			if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("removing previous plan input: %w", err)
+			}
+		}
+	}
 
 	var outputs []string
 
@@ -1241,11 +1277,22 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	defer unlock()
 
 	envs := make(map[string]string)
+	ctx, restoredInitArgs, initializeRestored, err := p.prepareDurableRestore(ctx)
+	if err != nil {
+		return outputs, err
+	}
 	for _, step := range steps {
 		if p.Jobs != nil {
 			if err := p.Execution.Store.CheckClaim(ctx.Pull); err != nil {
 				return outputs, err
 			}
+		}
+		if initializeRestored && step.StepName != "env" && step.StepName != "multienv" {
+			out, err := p.InitStepRunner.Run(ctx, restoredInitArgs, absPath, envs)
+			if err != nil {
+				return append(outputs, out), fmt.Errorf("initializing restored plan: %w", err)
+			}
+			initializeRestored = false
 		}
 		var out string
 		var err error
@@ -1267,14 +1314,28 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 					return outputs, err
 				}
 			}
+			if err = p.markMutating(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ApplyStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "version":
 			out, err = p.VersionStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "import":
+			if err = p.markMutating(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.ImportStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "state_rm":
+			if err = p.markMutating(ctx); err != nil {
+				return outputs, err
+			}
 			out, err = p.StateRmStepRunner.Run(ctx, step.ExtraArgs, absPath, envs)
 		case "run":
+			if ctx.CommandName == command.Apply || ctx.CommandName == command.Import || ctx.CommandName == command.State {
+				if err = p.markMutating(ctx); err != nil {
+					return outputs, err
+				}
+			}
 			out, err = p.RunStepRunner.Run(ctx, step.RunShell, step.RunCommand, absPath, envs, !ctx.SuppressJobOutput, step.Output, step.FilterRegexes)
 		case "env":
 			out, err = p.EnvStepRunner.Run(ctx, step.RunShell, step.RunCommand, step.EnvVarValue, absPath, envs)
@@ -1295,6 +1356,12 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 			return outputs, err
 		}
 	}
+	if p.Artifacts != nil && ctx.CommandName == command.Plan {
+		if err := p.Artifacts.SnapshotPlanWithEnvironment(ctx, absPath, runtime.GetPlanFilePath(ctx, absPath), envs); err != nil {
+			return outputs, err
+		}
+	}
+
 	return outputs, nil
 }
 
@@ -1373,6 +1440,18 @@ func (p *DefaultProjectCommandRunner) withDurableJob(ctx command.ProjectContext,
 		return command.ProjectCommandOutput{Error: err}
 	}
 	ctx.CommandName = name
+	if init, ok := p.InitStepRunner.(*runtime.InitStepRunner); ok {
+		if ctx.TerraformVersion == nil {
+			ctx.TerraformVersion = init.DefaultTFVersion
+		}
+		if ctx.TerraformDistribution == nil && init.DefaultTFDistribution != nil {
+			distribution := "terraform"
+			if init.DefaultTFDistribution.BinName() == terraform.NewDistributionOpenTofu().BinName() {
+				distribution = "opentofu"
+			}
+			ctx.TerraformDistribution = &distribution
+		}
+	}
 	if ctx.JobID == "" {
 		ctx.JobID = uuid.NewString()
 	}
@@ -1393,4 +1472,11 @@ func (p *DefaultProjectCommandRunner) withDurableJob(ctx command.ProjectContext,
 		}
 	}()
 	return execute(ctx)
+}
+
+func (p *DefaultProjectCommandRunner) markMutating(ctx command.ProjectContext) error {
+	if p.Jobs == nil {
+		return nil
+	}
+	return p.Jobs.Store.MarkJobMutating(ctx.JobID)
 }

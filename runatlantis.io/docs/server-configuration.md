@@ -52,13 +52,37 @@ data-dir: /var/lib/atlantis-durable
 storage:
   database:
     type: sqlite
+  artifacts:
+    type: database
+  retention:
+    plan_artifacts: 0s
 ```
 
 `storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
 under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks,
-PR status, job history, and execution claims. Run one Atlantis 64-bit process on local or block-backed storage;
-network filesystems such as NFS/EFS are unsupported. PostgreSQL and shared
-operation are deferred.
+PR status, job history, execution claims, pending plans, and the metadata that
+locates artifacts in any backend. Run one Atlantis 64-bit process on local or
+block-backed storage; network filesystems such as NFS/EFS are unsupported.
+PostgreSQL and shared operation are deferred.
+
+`storage.artifacts.type` accepts `database` (the default) or `filesystem`.
+Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`; the
+database backend rejects `directory`. Use a directory dedicated to this database;
+installations and fresh-data-directory cutovers must not share it. Existing
+artifacts are not migrated when changing backends.
+Protect artifact storage and the database with appropriate access controls,
+encryption at rest, and backups. Plans, declared workflow files, and backend
+initialization metadata can contain secrets; historical job records and backups
+also require protection. Cached backend configuration includes merged init
+settings and is retained for partial-backend restoration; provide fresh
+authentication through the server or apply workflow when credentials expire.
+
+`storage.retention.plan_artifacts` is a nonnegative Go duration, defaulting to
+`0s`. It retains plans, showfiles, and declared workflow files after their plan
+is applied or invalidated; pending plans and running jobs remain protected.
+`storage.workflow_files` can list additional project-relative files or directories
+to preserve between workflow stages in the plan snapshot bundle. Capture is
+explicit; the checkout, provider caches, and state files are not bundled wholesale.
 
 Unknown storage keys and conflicting backend settings reject startup. Do not
 combine `storage` with `locking-db-type`, `share-plan-dir`, or

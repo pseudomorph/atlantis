@@ -101,6 +101,9 @@ func acquireRecovery(tx *gorm.DB, pullID, owner, actor string, confirmed bool, s
 		if err := tx.Table("jobs").Where("pull_id = ? AND state = ?", pullID, "running").Updates(map[string]any{"state": "interrupted", "error": "operator reconciled stopped execution", "finished_at": now}).Error; err != nil {
 			return err
 		}
+		if err := tx.Where("pull_id = ?", pullID).Delete(&pendingPlan{}).Error; err != nil {
+			return err
+		}
 	} else {
 		var running int64
 		if err := tx.Table("jobs").Where("pull_id = ? AND state = ?", pullID, "running").Count(&running).Error; err != nil {
