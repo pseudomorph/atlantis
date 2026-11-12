@@ -4,7 +4,10 @@
 package events
 
 import (
+	"fmt"
 	"strings"
+
+	"github.com/runatlantis/atlantis/server/events/command"
 
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
@@ -23,6 +26,7 @@ type DeleteLockCommand interface {
 
 // DefaultDeleteLockCommand deletes a specific lock after a request from the LocksController.
 type DefaultDeleteLockCommand struct {
+	Execution        *ExecutionCoordinator
 	Locker           locking.Locker
 	WorkingDir       WorkingDir
 	WorkingDirLocker WorkingDirLocker
@@ -32,7 +36,38 @@ type DefaultDeleteLockCommand struct {
 
 // DeleteLock handles deleting the lock at id
 func (l *DefaultDeleteLockCommand) DeleteLock(logger logging.SimpleLogging, id string) (*models.ProjectLock, error) {
-	lock, err := l.Locker.Unlock(id)
+	var lock *models.ProjectLock
+	var err error
+	if l.Execution != nil {
+		existing, e := l.Locker.GetLock(id)
+		if e != nil || existing == nil {
+			return existing, e
+		}
+		if existing.Pull.Num < 0 {
+			id := "{job-id}"
+			if reader, ok := l.Execution.Store.(interface {
+				RecoveryJob(models.Repo, int) (string, error)
+			}); ok {
+				candidate, err := reader.RecoveryJob(existing.Pull.BaseRepo, existing.Pull.Num)
+				if err != nil {
+					return nil, err
+				}
+				if candidate != "" {
+					id = candidate
+				}
+			}
+			return nil, fmt.Errorf("API invocation reservations require authenticated POST /api/jobs/%s/unlock with a stopped-work attestation", id)
+		}
+		ctx := &command.Context{Pull: existing.Pull, Log: logger}
+		release, e := l.Execution.Acquire(ctx)
+		if e != nil {
+			return nil, e
+		}
+		defer release()
+		lock, err = l.Locker.UnlockOwned(id, ctx.Pull)
+	} else {
+		lock, err = l.Locker.Unlock(id)
+	}
 	if err != nil {
 		return nil, err
 	}

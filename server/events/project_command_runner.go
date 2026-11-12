@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -373,6 +374,8 @@ type DefaultProjectCommandRunner struct {
 	// repository is cloned, so that a committed symlink cannot point a
 	// repository-relative path at a file outside the clone.
 	VarFileAllowlistChecker *VarFileAllowlistChecker
+	Execution               *ExecutionCoordinator
+	Jobs                    *jobs.Service
 }
 
 // checkVarFilesResolved rejects comment var-file arguments that resolve, with
@@ -399,7 +402,7 @@ func (p *DefaultProjectCommandRunner) workingDirLockMetadata(ctx command.Project
 }
 
 // Plan runs terraform plan for the project described by ctx.
-func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) plan(ctx command.ProjectContext) command.ProjectCommandOutput {
 	planSuccess, failure, err := p.doPlan(ctx)
 	return command.ProjectCommandOutput{
 		PlanSuccess: planSuccess,
@@ -409,7 +412,7 @@ func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.P
 }
 
 // PolicyCheck evaluates policies defined with Rego for the project described by ctx.
-func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) policyCheck(ctx command.ProjectContext) command.ProjectCommandOutput {
 	policySuccess, failure, err := p.doPolicyCheck(ctx)
 	return command.ProjectCommandOutput{
 		PolicyCheckResults: policySuccess,
@@ -419,7 +422,7 @@ func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) co
 }
 
 // Apply runs terraform apply for the project described by ctx.
-func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) apply(ctx command.ProjectContext) command.ProjectCommandOutput {
 	applyOut, applyURL, failure, err := p.doApply(ctx)
 	return command.ProjectCommandOutput{
 		Failure:         failure,
@@ -429,7 +432,7 @@ func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.
 	}
 }
 
-func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) approvePolicies(ctx command.ProjectContext) command.ProjectCommandOutput {
 	approvedOut, failure, err := p.doApprovePolicies(ctx)
 	return command.ProjectCommandOutput{
 		Failure:            failure,
@@ -438,7 +441,7 @@ func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext
 	}
 }
 
-func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) version(ctx command.ProjectContext) command.ProjectCommandOutput {
 	versionOut, failure, err := p.doVersion(ctx)
 	return command.ProjectCommandOutput{
 		Failure:        failure,
@@ -448,7 +451,7 @@ func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) comman
 }
 
 // Import runs terraform import for the project described by ctx.
-func (p *DefaultProjectCommandRunner) Import(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) runImport(ctx command.ProjectContext) command.ProjectCommandOutput {
 	importSuccess, failure, err := p.doImport(ctx)
 	return command.ProjectCommandOutput{
 		ImportSuccess: importSuccess,
@@ -458,7 +461,7 @@ func (p *DefaultProjectCommandRunner) Import(ctx command.ProjectContext) command
 }
 
 // StateRm runs terraform state rm for the project described by ctx.
-func (p *DefaultProjectCommandRunner) StateRm(ctx command.ProjectContext) command.ProjectCommandOutput {
+func (p *DefaultProjectCommandRunner) stateRm(ctx command.ProjectContext) command.ProjectCommandOutput {
 	stateRmSuccess, failure, err := p.doStateRm(ctx)
 	return command.ProjectCommandOutput{
 		StateRmSuccess: stateRmSuccess,
@@ -479,7 +482,7 @@ func (p *DefaultProjectCommandRunner) doApprovePolicies(ctx command.ProjectConte
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.ApprovePolicies, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.ApprovePolicies, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return nil, "", err
 	}
@@ -596,7 +599,7 @@ func (p *DefaultProjectCommandRunner) doPolicyCheck(ctx command.ProjectContext) 
 	// Acquire internal lock for the directory we're going to operate in.
 	// We should refactor this to keep the lock for the duration of plan and policy check since as of now
 	// there is a small gap where we don't have the lock and if we can't get this here, we should just unlock the PR.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.PolicyCheck, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.PolicyCheck, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return nil, "", err
 	}
@@ -836,7 +839,7 @@ func (p *DefaultProjectCommandRunner) doPlan(ctx command.ProjectContext) (*model
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Plan, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		if unlockErr := lockAttempt.UnlockFn(); unlockErr != nil {
 			ctx.Log.Err("error unlocking state after plan error: %v", unlockErr)
@@ -984,7 +987,7 @@ func (p *DefaultProjectCommandRunner) doApply(ctx command.ProjectContext) (apply
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Apply, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Apply, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return "", "", "", err
 	}
@@ -1092,7 +1095,7 @@ func (p *DefaultProjectCommandRunner) doVersion(ctx command.ProjectContext) (ver
 	}
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Version, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Version, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return "", "", err
 	}
@@ -1136,7 +1139,7 @@ func (p *DefaultProjectCommandRunner) doImport(ctx command.ProjectContext) (out 
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Import, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.Import, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return nil, "", err
 	}
@@ -1185,7 +1188,7 @@ func (p *DefaultProjectCommandRunner) doStateRm(ctx command.ProjectContext) (out
 	ctx.Log.Debug("acquired lock for project")
 
 	// Acquire internal lock for the directory we're going to operate in.
-	unlockFn, err := p.WorkingDirLocker.TryLock(ctx.Pull.BaseRepo.FullName, ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.State, p.workingDirLockMetadata(ctx))
+	unlockFn, err := p.WorkingDirLocker.TryLock(WorkingDirectoryRepoKey(ctx.Pull.BaseRepo), ctx.Pull.Num, ctx.Workspace, ctx.RepoRelDir, ctx.ProjectName, command.State, p.workingDirLockMetadata(ctx))
 	if err != nil {
 		return nil, "", err
 	}
@@ -1225,6 +1228,12 @@ func (p *DefaultProjectCommandRunner) ensurePlanLoaded(ctx command.ProjectContex
 }
 
 func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.ProjectContext, absPath string) ([]string, error) {
+	if p.Jobs != nil {
+		if err := p.Execution.Store.CheckClaim(ctx.Pull); err != nil {
+			return nil, err
+		}
+	}
+
 	var outputs []string
 
 	// Hold a read lock for the whole step run so clone/reset/merge cannot run in this dir until we're done.
@@ -1233,6 +1242,11 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 
 	envs := make(map[string]string)
 	for _, step := range steps {
+		if p.Jobs != nil {
+			if err := p.Execution.Store.CheckClaim(ctx.Pull); err != nil {
+				return outputs, err
+			}
+		}
 		var out string
 		var err error
 		switch step.StepName {
@@ -1321,4 +1335,62 @@ func (p *ProjectOutputWrapper) PublishDeferredPlanStatuses(projectCmds []command
 			break
 		}
 	}
+}
+
+func (p *DefaultProjectCommandRunner) Plan(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.Plan, p.plan)
+}
+
+func (p *DefaultProjectCommandRunner) PolicyCheck(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.PolicyCheck, p.policyCheck)
+}
+
+func (p *DefaultProjectCommandRunner) Apply(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.Apply, p.apply)
+}
+
+func (p *DefaultProjectCommandRunner) ApprovePolicies(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.ApprovePolicies, p.approvePolicies)
+}
+
+func (p *DefaultProjectCommandRunner) Version(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.Version, p.version)
+}
+
+func (p *DefaultProjectCommandRunner) Import(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.Import, p.runImport)
+}
+
+func (p *DefaultProjectCommandRunner) StateRm(ctx command.ProjectContext) command.ProjectCommandOutput {
+	return p.withDurableJob(ctx, command.State, p.stateRm)
+}
+
+func (p *DefaultProjectCommandRunner) withDurableJob(ctx command.ProjectContext, name command.Name, execute func(command.ProjectContext) command.ProjectCommandOutput) (result command.ProjectCommandOutput) {
+	if p.Jobs == nil {
+		return execute(ctx)
+	}
+	if err := p.Execution.Check(ctx); err != nil {
+		return command.ProjectCommandOutput{Error: err}
+	}
+	ctx.CommandName = name
+	if ctx.JobID == "" {
+		ctx.JobID = uuid.NewString()
+	}
+	if err := p.Jobs.Begin(ctx); err != nil {
+		return command.ProjectCommandOutput{Error: fmt.Errorf("starting durable job: %w", err)}
+	}
+	defer func() {
+		result.JobID = ctx.JobID
+		crashed := recover()
+		if crashed != nil {
+			result.Error = fmt.Errorf("command panicked: %v", crashed)
+		}
+		if err := p.Jobs.Finish(ctx, result); err != nil {
+			result.Error = errors.Join(result.Error, fmt.Errorf("finishing durable job %s: %w", ctx.JobID, err))
+		}
+		if crashed != nil {
+			panic(crashed)
+		}
+	}()
+	return execute(ctx)
 }

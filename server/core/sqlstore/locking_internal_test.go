@@ -37,3 +37,19 @@ func lockStatement(t *testing.T, rowLocking bool) string {
 	Assert(t, statement != "", "no query captured")
 	return statement
 }
+
+func TestOwnerlessCleanupWaitsForCleanupClaim(t *testing.T) {
+	s := conformanceStore(t)
+	p := claimPull()
+	Ok(t, s.ClosePull(p))
+	_, acquired, err := s.ClaimCleanup(p, "cleaner")
+	Ok(t, err)
+	Assert(t, acquired, "cleanup claim was not acquired")
+	Ok(t, s.MarkClosedClean(p))
+	ready, err := s.ClosedPullsReady()
+	Ok(t, err)
+	Equals(t, 0, len(ready))
+	var complete bool
+	Ok(t, s.db.Table("pulls").Select("cleanup_complete").Take(&complete).Error)
+	Assert(t, !complete, "ownerless cleanup completed while a cleaner held the claim")
+}

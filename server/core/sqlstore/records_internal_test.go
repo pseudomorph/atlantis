@@ -19,8 +19,7 @@ func TestRepositoryCredentialsNeverPersist(t *testing.T) {
 	p := claimPull()
 	p.BaseRepo.CloneURL = "https://test-user:distinct-secret-never-persist@git.example:8443/gitlab/team/infra.git"
 	p.BaseRepo.SanitizedCloneURL = "https://test-user:<redacted>@git.example:8443/gitlab/team/infra.git"
-	_, err = s.UpdatePullWithResults(p, nil)
-	Ok(t, err)
+	Ok(t, s.AcquireClaim(p, "owner"))
 	var repo repository
 	Ok(t, s.db.First(&repo).Error)
 	Equals(t, "https://git.example:8443/gitlab/team/infra.git", repo.CloneURL)

@@ -72,7 +72,7 @@ Add `api` to `experiments` to permit command and lock routes. To use authenticat
 
 Request and response fields, error handling, supported providers, and non-PR execution remain experimental. Command and lock responses currently use legacy top-level bodies; drift endpoints use a different envelope. See the [API documentation](api-endpoints.md) for endpoint-specific behavior and limitations.
 
-To disable all command and lock routes, remove `api` from `experiments` and restart. Remove `api-secret` too unless a permitted drift installation still needs it. These routes return HTTP 404 without permission. When `api` is permitted but no secret is configured, the existing read-only lock listing remains available; command requests require a secret.
+To disable all command and lock routes, remove `api` from `experiments` and restart. Remove `api-secret` too unless a permitted drift installation still needs it. These routes return HTTP 404 without permission. When `api` is permitted but no secret is configured, the existing read-only lock listing remains available; command requests require a secret. With durable storage configured, lock listing also requires authentication.
 
 ### API graduation checklist
 
@@ -107,14 +107,16 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 
 ::: warning Incomplete implementation
 This experiment implements the first SQLite portion of ADR 0005: project locks,
-global command locks, and PR status. Plans, job history, logs, execution
-ownership, PostgreSQL, and multi-instance operation are not durable yet.
+global command locks, PR status, job history, execution claims, and
+cancellation. Plans, logs, PostgreSQL, and multi-instance operation are not
+durable yet.
 Use it only for development and testing.
 :::
 
 SQLite uses versioned Goose SQL migrations and works in CGO-disabled builds.
-The database owns project locks, global command locks, and PR status records.
-Plans stay in the working directory, as with BoltDB.
+The database owns project locks, global command locks, PR status, job records,
+execution claims, and cancellation requests. Plans stay in the working
+directory, as with BoltDB.
 
 ### Enable
 
@@ -164,14 +166,86 @@ of this experiment.
 - SQLite requires a 64-bit server and one Atlantis process on local or block-backed storage. NFS/EFS
   and multiple instances are unsupported. Kubernetes deployments must stop the old
   pod before starting its replacement, for example with `strategy: Recreate`.
-- VCS instances, repositories, PRs, and projects share foreign-key relationships.
+- VCS instances, repositories, PRs, projects, and jobs share foreign-key relationships.
   Locks and status are keyed by VCS instance, so same-named repositories on
-  different instances never share them. Working directories include the VCS
-  instance to prevent same-named repo collisions.
+  different instances never share them. Working directories and their in-process
+  locks include the VCS instance to prevent same-named repo collisions.
 - Keep `data-dir` on persistent storage. It holds the database and the working
-  directories with their plans; losing it loses locks, PR status, and pending plans.
+  directories with their plans; losing it loses locks, PR status, job history,
+  execution claims, and pending plans.
+- Every command, autoplan, unlock, and API call holds an execution claim on its
+  PR or API invocation for its whole run, including hooks and publication. Each
+  project command records a job with its issuer, trigger, revision, arguments,
+  workflow step names, outcome, and timestamps. Step commands and environment
+  values are not stored.
+- `atlantis cancel` prevents queued jobs from starting; running jobs continue to
+  completion while their execution claim remains held. Active-process interruption
+  is deferred. After a crash, prior claims become uncertain and block new commands
+  on the affected PR or API invocation. They never permit automatic Terraform
+  retries. There are no heartbeats or expiring leases in this single-instance
+  implementation.
+- Closing a PR cancels queued work and defers cleanup until active work stops.
+  Reopening it accepts commands again once that cleanup finishes.
+- Commands report claim rejection on the PR. A rejected autoplan also fails the
+  plan commit status, as autoplan does when another plan holds the PR's working
+  directory; it is not retried. Closure cleanup holds its own execution claim and is fenced
+  by closure generation before a reopened PR can start new work. If the VCS API
+  cannot verify a close event, a durable retry blocks new and queued projects
+  until the current PR state can be verified. Running Terraform retains ownership.
+- API calls associated with a PR preserve that PR's project reservations.
+  Non-PR API calls remain synchronous. Their temporary negative identifiers are
+  reserved before checkout; a collision retries or fails without reusing history.
+  This experiment adds no execution-group identifiers, persistent API group
+  lifecycle, retries, or group-management UI.
 - Project locks survive successful apply until closure, merge, or explicit unlock.
-  `disable-repo-locking` disables project locks.
+  `disable-repo-locking` disables project locks, while execution claims remain active.
+
+### Unfinished execution after a crash
+
+`atlantis unlock` clears plans and project reservations only after acquiring
+execution ownership. It refuses active work. After a restart, unfinished claims
+are uncertain: Atlantis cannot prove that Terraform or workflow children stopped.
+
+Independently verify that those processes have stopped, including remote work
+started by custom steps, then have an authorized operator comment:
+
+```text
+atlantis unlock --confirm-stopped
+```
+
+This is an operator attestation, not automatic process detection. Recovery records
+its actor, previous owner, and timestamp; marks unfinished jobs interrupted; and
+acquires recovery ownership in one transaction. Unlock then releases the PR's
+reservations and deletes its plans. Job history remains available. A failed
+recovery write rolls back; uncertain work never permits automatic retry. If apply
+may have changed infrastructure, inspect its outcome and create a fresh plan. Do
+not retry the old saved plan.
+
+For a non-PR API invocation, use the authenticated recovery endpoint instead:
+
+```text
+POST /api/jobs/{job-id}/unlock
+X-Atlantis-Token: <api-secret>
+Content-Type: application/json
+
+{"confirm_stopped": true}
+```
+
+The endpoint is available only with durable storage and API or drift permission.
+It resolves the existing invocation by job UUID, refuses active or newer owners,
+and reconciles all projects in that invocation. Its response contains the job UUID
+and released-reservation count. It exposes no execution-group identifier and never
+allocates a new synthetic identity or retries Terraform. Durable command results include `job_id`; an
+API-enabled authenticated `GET /api/locks` also identifies a job for each held
+non-PR reservation if the original client disconnected. The shared API credential
+is audited as `api-token`, not as an individually identified human. Protect that
+credential as an operator recovery capability.
+
+The UI directs non-PR reservation recovery to this endpoint and does not override
+uncertain ownership. To abandon a test database instead,
+stop Atlantis, verify stopped work, preserve a matching database backup,
+then use a fresh data directory and replan all open PRs. This does not recover
+history or migrate existing plans.
 
 ### Disable, upgrade, and roll back
 
@@ -188,8 +262,8 @@ does not migrate state.
 
 ### Durable storage graduation checklist
 
-- [ ] Validate locks and status against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, constraints, and transaction rollback.
-- [ ] Test competing commands, duplicate webhooks, PR close, and instance failure before supporting multiple instances.
+- [ ] Validate locks, status, jobs, and claims against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job recording and history preservation for uncertain executions.
+- [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
 - [ ] Verify restoring pending plans across restarts and PR cleanup.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.

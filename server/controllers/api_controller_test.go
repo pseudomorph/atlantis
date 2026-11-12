@@ -1622,6 +1622,8 @@ func TestAPIController_PlanSkipsPullReqStatusWhenNoPR(t *testing.T) {
 	ac, projectCommandBuilder, _ := setup(t)
 	fetcher := NewMockPullReqStatusFetcher()
 	ac.PullReqStatusFetcher = fetcher
+	statuses := &recordingPullStatusFetcher{}
+	ac.PullStatusFetcher = statuses
 
 	body, _ := json.Marshal(controllers.APIRequest{
 		Repository: "Repo",
@@ -1640,7 +1642,10 @@ func TestAPIController_PlanSkipsPullReqStatusWhenNoPR(t *testing.T) {
 		BuildPlanCommands(Any[*command.Context](), Any[*events.CommentCommand]()).
 		GetCapturedArguments()
 	Assert(t, planCtx.Pull.Num < 0, "expected no-PR API request to use an isolated synthetic pull number")
+	// Without durable storage the synthetic number keeps the legacy clock-derived range.
+	Assert(t, planCtx.Pull.Num > -(1<<40), "legacy synthetic pull number %d left the clock range", planCtx.Pull.Num)
 	Assert(t, planCtx.Pull.HardenedNonPRRefCheckout, "expected no-PR API request to use hardened checkout")
+	Equals(t, 0, len(statuses.calls))
 }
 
 func TestAPIController_PlanContinuesWhenPullReqStatusFetchFails(t *testing.T) {
