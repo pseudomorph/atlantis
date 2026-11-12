@@ -25,6 +25,7 @@ func NewUnlockCommandRunner(
 }
 
 type UnlockCommandRunner struct {
+	Execution         *ExecutionCoordinator
 	vcsClient         vcs.Client
 	deleteLockCommand DeleteLockCommand
 	// SilenceNoProjects is whether Atlantis should respond to PRs if no projects
@@ -33,7 +34,7 @@ type UnlockCommandRunner struct {
 	DisableUnlockLabel string
 }
 
-func (u *UnlockCommandRunner) Run(ctx *command.Context, _ *CommentCommand) {
+func (u *UnlockCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 	baseRepo := ctx.Pull.BaseRepo
 	pullNum := ctx.Pull.Num
 	disableUnlockLabel := u.DisableUnlockLabel
@@ -59,6 +60,20 @@ func (u *UnlockCommandRunner) Run(ctx *command.Context, _ *CommentCommand) {
 
 	var numLocks int
 	if err == nil && !hasLabel {
+		if u.Execution != nil {
+			release, acquireErr := u.Execution.AcquireUnlock(ctx, cmd.ConfirmStopped)
+			if acquireErr != nil {
+				if commentErr := u.vcsClient.CreateComment(ctx.Log, baseRepo, pullNum, "Atlantis could not unlock: "+acquireErr.Error(), command.Unlock.String()); commentErr != nil {
+					ctx.Log.Err("reporting unlock rejection: %v", commentErr)
+				}
+				return
+			}
+			defer release()
+			baseRepo = ctx.Pull.BaseRepo
+			if cmd.ConfirmStopped {
+				ctx.Log.Info("Operator %s attested stopped execution for unlock recovery", ctx.User.Username)
+			}
+		}
 		numLocks, err = u.deleteLockCommand.DeleteLocksByPull(ctx.Log, baseRepo, pullNum)
 		if err != nil {
 			vcsMessage = "Failed to delete PR locks"

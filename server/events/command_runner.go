@@ -548,7 +548,7 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 			return
 		}
 	}
-	if c.Execution != nil && cmd.Name != command.Cancel {
+	if c.Execution != nil && cmd.Name != command.Cancel && cmd.Name != command.Unlock {
 		release, err := c.Execution.Acquire(ctx)
 		if err != nil {
 			ctx.Log.Err("acquiring durable execution: %v", err)
@@ -559,7 +559,7 @@ func (c *DefaultCommandRunner) RunCommentCommand(baseRepo models.Repo, maybeHead
 		}
 		defer release()
 	}
-	if c.Execution != nil && cmd.Name == command.Cancel {
+	if c.Execution != nil && (cmd.Name == command.Cancel || cmd.Name == command.Unlock) {
 		cmdRunner.Run(ctx, cmd)
 		return
 	}

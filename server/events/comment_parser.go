@@ -109,6 +109,9 @@ type CommentParser struct {
 	// extra args (after "--").
 	// Populated by NewCommentParser from UserConfig.ToBlockedExtraArgs().
 	BlockedExtraArgs []string
+
+	// UnlockRecoveryEnabled exposes stopped-work attestation only with durable storage.
+	UnlockRecoveryEnabled bool
 }
 
 // NewCommentParser returns a CommentParser.
@@ -257,6 +260,7 @@ func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) Com
 	var project string
 	var policySet string
 	var clearPolicyApproval bool
+	var confirmedStopped bool
 	var verbose bool
 	var autoMergeDisabled bool
 	var autoMergeMethod string
@@ -297,6 +301,9 @@ func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) Com
 		name = command.Unlock
 		flagSet = pflag.NewFlagSet(command.Unlock.String(), pflag.ContinueOnError)
 		flagSet.SetOutput(io.Discard)
+		if e.UnlockRecoveryEnabled {
+			flagSet.BoolVar(&confirmedStopped, "confirm-stopped", false, "Attest that all Terraform and workflow processes from an uncertain execution have stopped.")
+		}
 	case command.Cancel.String():
 		name = command.Cancel
 		flagSet = pflag.NewFlagSet(command.Cancel.String(), pflag.ContinueOnError)
@@ -369,9 +376,9 @@ func (e *CommentParser) Parse(rawComment string, vcsHost models.VCSHostType) Com
 		}
 	}
 
-	return CommentParseResult{
-		Command: NewCommentCommand(dir, extraArgs, name, subName, verbose, autoMergeDisabled, autoMergeMethod, workspace, project, policySet, clearPolicyApproval),
-	}
+	parsed := NewCommentCommand(dir, extraArgs, name, subName, verbose, autoMergeDisabled, autoMergeMethod, workspace, project, policySet, clearPolicyApproval)
+	parsed.ConfirmStopped = confirmedStopped
+	return CommentParseResult{Command: parsed}
 }
 
 func (e *CommentParser) parseArgs(name command.Name, args []string, flagSet *pflag.FlagSet) (string, []string, string) {
@@ -383,7 +390,7 @@ func (e *CommentParser) parseArgs(name command.Name, args []string, flagSet *pfl
 	}
 	if err != nil {
 		if name == command.Unlock {
-			return "", nil, fmt.Sprintf(UnlockUsage, e.ExecutableName)
+			return "", nil, e.unlockUsage()
 		}
 		return "", nil, e.errMarkdown(err.Error(), name.String(), flagSet)
 	}
@@ -613,25 +620,27 @@ func (e *CommentParser) HelpComment() string {
 	buf := &bytes.Buffer{}
 	var tmpl = template.Must(template.New("").Parse(helpCommentTemplate))
 	if err := tmpl.Execute(buf, struct {
-		ExecutableName       string
-		AllowVersion         bool
-		AllowPlan            bool
-		AllowApply           bool
-		AllowCancel          bool
-		AllowUnlock          bool
-		AllowApprovePolicies bool
-		AllowImport          bool
-		AllowState           bool
+		ExecutableName        string
+		AllowVersion          bool
+		AllowPlan             bool
+		AllowApply            bool
+		AllowCancel           bool
+		AllowUnlock           bool
+		AllowApprovePolicies  bool
+		AllowImport           bool
+		AllowState            bool
+		UnlockRecoveryEnabled bool
 	}{
-		ExecutableName:       e.ExecutableName,
-		AllowVersion:         e.isAllowedCommand(command.Version.String()),
-		AllowPlan:            e.isAllowedCommand(command.Plan.String()),
-		AllowApply:           e.isAllowedCommand(command.Apply.String()),
-		AllowCancel:          e.isAllowedCommand(command.Cancel.String()),
-		AllowUnlock:          e.isAllowedCommand(command.Unlock.String()),
-		AllowApprovePolicies: e.isAllowedCommand(command.ApprovePolicies.String()),
-		AllowImport:          e.isAllowedCommand(command.Import.String()),
-		AllowState:           e.isAllowedCommand(command.State.String()),
+		ExecutableName:        e.ExecutableName,
+		AllowVersion:          e.isAllowedCommand(command.Version.String()),
+		AllowPlan:             e.isAllowedCommand(command.Plan.String()),
+		AllowApply:            e.isAllowedCommand(command.Apply.String()),
+		AllowCancel:           e.isAllowedCommand(command.Cancel.String()),
+		AllowUnlock:           e.isAllowedCommand(command.Unlock.String()),
+		AllowApprovePolicies:  e.isAllowedCommand(command.ApprovePolicies.String()),
+		AllowImport:           e.isAllowedCommand(command.Import.String()),
+		AllowState:            e.isAllowedCommand(command.State.String()),
+		UnlockRecoveryEnabled: e.UnlockRecoveryEnabled,
 	}); err != nil {
 		return fmt.Sprintf("Failed to render template, this is a bug: %v", err)
 	}
@@ -678,6 +687,9 @@ Commands:
 {{- if .AllowUnlock }}
   unlock   Removes all atlantis locks and discards all plans for this PR.
            To unlock a specific plan you can use the Atlantis UI.
+{{- if .UnlockRecoveryEnabled }}
+           Use --confirm-stopped for uncertain durable work only after verifying all processes stopped.
+{{- end }}
 {{- end }}
 {{- if .AllowApprovePolicies }}
   approve_policies
@@ -723,6 +735,13 @@ var UnlockUsage = "`Usage of unlock:`\n\n ```cmake\n" +
 	`%s unlock
 
   Unlocks the entire PR and discards all plans in this PR.
-  Arguments or flags are not supported at the moment.
   If you need to unlock a specific project please use the atlantis UI.` +
 	"\n```"
+
+func (e *CommentParser) unlockUsage() string {
+	usage := fmt.Sprintf(UnlockUsage, e.ExecutableName)
+	if e.UnlockRecoveryEnabled {
+		usage += "\n\nUse `" + e.ExecutableName + " unlock --confirm-stopped` only after independently verifying that all processes from the uncertain execution have stopped."
+	}
+	return usage
+}
