@@ -108,6 +108,8 @@ func (c AutoplanCommand) IsAutoplan() bool {
 
 // CommentCommand is a command that was triggered by a pull request comment.
 type CommentCommand struct {
+	// ConfirmStopped is an operator attestation for uncertain durable executions.
+	ConfirmStopped bool
 	// RepoRelDir is the path relative to the repo root to run the command in.
 	// Will never end in "/". If empty then the comment specified no directory.
 	RepoRelDir string
@@ -568,6 +570,8 @@ func (e *EventParser) ParseGithubPullEvent(logger logging.SimpleLogging, pullEve
 	switch action {
 	case "opened":
 		pullEventType = models.OpenedPullEvent
+	case "reopened":
+		pullEventType = models.ReopenedPullEvent
 	case "ready_for_review":
 		// when an author takes a PR out of 'draft' state a 'ready_for_review'
 		// event is triggered. We want atlantis to treat this as a freshly opened PR
@@ -723,6 +727,8 @@ func (e *EventParser) ParseGitlabMergeRequestEvent(event gitlab.MergeEvent) (pul
 		switch event.ObjectAttributes.Action {
 		case "open":
 			eventType = models.OpenedPullEvent
+		case "reopen":
+			eventType = models.ReopenedPullEvent
 		case "update":
 			eventType = e.ParseGitlabMergeRequestUpdateEvent(event)
 		case "merge", "close":

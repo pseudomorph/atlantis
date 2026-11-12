@@ -18,6 +18,8 @@ type ProjectResult struct {
 
 // ProjectCommandOutput is the output of a plan/policy_check/apply for a specific project.
 type ProjectCommandOutput struct {
+	// JobID is emitted only for durable executions.
+	JobID              string `json:"job_id,omitempty"`
 	Error              error
 	Failure            string
 	PlanSuccess        *models.PlanSuccess

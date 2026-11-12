@@ -5,10 +5,12 @@ package controllers
 
 import (
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -18,13 +20,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/drift"
+
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -37,11 +40,10 @@ import (
 
 const atlantisTokenHeader = "X-Atlantis-Token"
 
-var nonPRPullCounter atomic.Int64
-
 var apiErrorURLCredentialRE = regexp.MustCompile(`(?i)(https?://)([^\s/@]+:)?[^\s/@]+@`)
 
 type APIController struct {
+	Execution                       *events.ExecutionCoordinator
 	APISecret                       []byte
 	Locker                          locking.Locker `validate:"required"`
 	DriftStorage                    drift.Storage
@@ -107,8 +109,22 @@ func (a *APIController) getAPIMiddleware() *APIMiddleware {
 	return a.apiMiddleware
 }
 
+// nextNonPRPullNum returns a synthetic pull number for an API invocation. Durable
+// storage reserves candidates before use and retries collisions; the old
+// clock-derived value wrapped about once a second.
 func nextNonPRPullNum() int {
-	return -int((time.Now().UnixNano() & 0x3fffffff) + nonPRPullCounter.Add(1))
+	id := uuid.New()
+	return syntheticPullNum(binary.BigEndian.Uint64(id[:8]))
+}
+
+// syntheticPullNum maps random bits to a negative int on every architecture,
+// including 32-bit targets where int cannot hold 63 bits.
+func syntheticPullNum(random uint64) int {
+	n := int(random & uint64(math.MaxInt))
+	if n == 0 {
+		n = 1
+	}
+	return -n
 }
 
 func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBranch string) func() {
@@ -125,12 +141,44 @@ func (a *APIController) lockFullDriftDetection(repository, vcsType, ref, baseBra
 }
 
 func (a *APIController) cleanupNonPRWorkingDir(ctx *command.Context) {
+	if ctx.Pull.Execution != nil {
+		defer ctx.Pull.Execution.Close()
+		if a.checkCompletedExecution(ctx) != nil {
+			return
+		}
+	}
+
 	if ctx.Pull.Num >= 0 {
 		return
 	}
 	if err := a.WorkingDir.Delete(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull); err != nil {
 		ctx.Log.Warn("cleaning up API working directory: %s", err)
 	}
+}
+
+// PR reservations belong to the PR, not to the API request that happened to use them.
+func (a *APIController) cleanupProjectLocks(ctx *command.Context) {
+	if a.Execution != nil {
+		if ctx.Pull.Num >= 0 {
+			return
+		}
+		if err := a.checkCompletedExecution(ctx); err != nil {
+			ctx.Log.Err("retaining API project reservations: %v", err)
+			return
+		}
+	}
+	if _, err := a.Locker.UnlockByPull(ctx.Pull.BaseRepo, ctx.Pull.Num); err != nil {
+		ctx.Log.Err("releasing API project reservations: %v", err)
+	}
+}
+
+func (a *APIController) checkCompletedExecution(ctx *command.Context) error {
+	if store, ok := a.Execution.Store.(interface {
+		CheckExecutionStopped(models.PullRequest) error
+	}); ok {
+		return store.CheckExecutionStopped(ctx.Pull)
+	}
+	return a.Execution.Store.CheckClaim(ctx.Pull)
 }
 
 type APIRequest struct {
@@ -306,7 +354,7 @@ func (a *APIController) Plan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ctx.CommandSkipped {
-		defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+		defer a.cleanupProjectLocks(ctx)
 	}
 
 	statusCode := http.StatusOK
@@ -343,7 +391,7 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 		responder.writeJSON(w, http.StatusOK, result)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.cleanupProjectLocks(ctx)
 
 	// The API apply endpoint runs plan first. Refresh PR status afterward so
 	// apply requirements evaluate the VCS state the plan phase just produced.
@@ -367,6 +415,7 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 // LockDetail is deprecated - use LockDetailAPI instead.
 // Kept for backwards compatibility during migration.
 type LockDetail struct {
+	JobID           string `json:"job_id,omitempty"`
 	Name            string
 	ProjectName     string
 	ProjectRepo     string
@@ -393,7 +442,7 @@ func (a *APIController) ListLocks(w http.ResponseWriter, r *http.Request) {
 	middleware := a.getAPIMiddleware()
 	responder := middleware.Responder
 
-	if len(a.APISecret) > 0 && !middleware.RequireAuth(w, r) {
+	if (len(a.APISecret) > 0 || a.Execution != nil) && !middleware.RequireAuth(w, r) {
 		return
 	}
 
@@ -405,7 +454,20 @@ func (a *APIController) ListLocks(w http.ResponseWriter, r *http.Request) {
 
 	result := ListLocksResult{}
 	for name, lock := range locks {
-		result.Locks = append(result.Locks, LockDetail{
+		jobID := ""
+		if a.Execution != nil && lock.Pull.Num < 0 {
+			if reader, ok := a.Execution.Store.(interface {
+				RecoveryJob(models.Repo, int) (string, error)
+			}); ok {
+				var err error
+				jobID, err = reader.RecoveryJob(lock.Pull.BaseRepo, lock.Pull.Num)
+				if err != nil {
+					responder.InternalError(w, r, err)
+					return
+				}
+			}
+		}
+		result.Locks = append(result.Locks, LockDetail{JobID: jobID,
 			Name:            name,
 			ProjectName:     lock.Project.ProjectName,
 			ProjectRepo:     lock.Project.RepoFullName,
@@ -523,6 +585,36 @@ func (a *APIController) DriftStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (err error) {
+	if a.Execution != nil && ctx.Pull.Num > 0 && a.LivePullHeadFetcher != nil {
+		live, liveErr := a.LivePullHeadFetcher.GetLivePullIdentity(command.ProjectContext{Pull: ctx.Pull, Log: ctx.Log})
+		if liveErr != nil {
+			return fmt.Errorf("verifying current API pull request: %w", liveErr)
+		}
+		if live.State != models.OpenPullState {
+			return fmt.Errorf("pull request is closed")
+		}
+		ctx.Pull.State = live.State
+		ctx.Pull.HeadCommit = live.HeadCommit
+		ctx.Pull.URL, ctx.Pull.Author = live.URL, live.Author
+		if ctx.Pull.BaseBranch == "" {
+			ctx.Pull.BaseBranch = live.BaseBranch
+		}
+		if err := a.Execution.Store.RequestReopen(ctx.Pull); err != nil {
+			return err
+		}
+	}
+	if a.Execution != nil && ctx.Pull.Execution == nil {
+		_, claimErr := a.Execution.Acquire(ctx)
+		if claimErr != nil {
+			return claimErr
+		}
+		defer func() {
+			if err != nil {
+				a.cleanupNonPRWorkingDir(ctx)
+			}
+		}()
+	}
+
 	if ctx.Pull.Num < 0 {
 		defer func() {
 			if err != nil {
@@ -535,7 +627,7 @@ func (a *APIController) apiSetup(ctx *command.Context, cmdName command.Name) (er
 	baseRepo := ctx.Pull.BaseRepo
 	headRepo := ctx.HeadRepo
 
-	unlockFn, err := a.WorkingDirLocker.TryLock(baseRepo.FullName, pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
+	unlockFn, err := a.WorkingDirLocker.TryLock(events.WorkingDirectoryRepoKey(baseRepo), pull.Num, events.DefaultWorkspace, events.DefaultRepoRelDir, "", cmdName, events.WorkingDirLockMetadataForPull(pull))
 	if err != nil {
 		return err
 	}
@@ -716,7 +808,7 @@ func (a *APIController) apiPlan(request *APIRequest, ctx *command.Context) (_ *c
 	// some plans ran would leave their project locks behind.
 	defer func() {
 		if err != nil && !ctx.CommandSkipped {
-			a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+			a.cleanupProjectLocks(ctx)
 		}
 	}()
 
@@ -1184,8 +1276,10 @@ func (a *APIController) apiParseAndValidate(r *http.Request) (*APIRequest, *comm
 		SortByExecutionOrder:      true,
 		ExactProjectNameMatching:  true,
 	}
-	a.populatePullRequestStatus(ctx)
-	a.populatePullStatus(ctx)
+	if !syntheticNonPR {
+		a.populatePullRequestStatus(ctx)
+		a.populatePullStatus(ctx)
+	}
 	return &request, ctx, http.StatusOK, nil
 }
 
@@ -1401,7 +1495,7 @@ func (e *apiRemediationExecutor) ExecutePlan(repository, ref, vcsType, projectNa
 	if err != nil {
 		return "", nil, err
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.cleanupProjectLocks(ctx)
 
 	output, driftSummary := planRemediationOutput(result)
 
@@ -1481,7 +1575,7 @@ func (e *apiRemediationExecutor) ExecuteApplyProjects(repository, ref, vcsType s
 	if err != nil {
 		return nil, fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.cleanupProjectLocks(ctx)
 
 	remediationResults := projectRemediationResultsFromPlan(projects, planResult)
 	if planResult.HasErrors() {
@@ -1576,7 +1670,7 @@ func (e *apiRemediationExecutor) ExecuteApply(repository, ref, vcsType, projectN
 	if err != nil {
 		return "", fmt.Errorf("plan failed: %w", err)
 	}
-	defer e.controller.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer e.controller.cleanupProjectLocks(ctx)
 	if planResult.HasErrors() {
 		output, _ := planRemediationOutput(planResult)
 		return output.String(), fmt.Errorf("plan had errors")
@@ -2315,7 +2409,7 @@ func (a *APIController) DetectDrift(w http.ResponseWriter, r *http.Request) {
 		responder.InternalError(w, r, err)
 		return
 	}
-	defer a.Locker.UnlockByPull(ctx.HeadRepo.FullName, ctx.Pull.Num) // nolint: errcheck
+	defer a.cleanupProjectLocks(ctx)
 
 	// Process results and store drift data
 	detectionResult := models.NewDriftDetectionResult(request.Repository)

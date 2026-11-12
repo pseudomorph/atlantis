@@ -58,6 +58,7 @@ type PullReqStatus struct {
 
 // Repo is a VCS repository.
 type Repo struct {
+	Execution *Execution `json:"-"`
 	// FullName is the owner and repo name separated
 	// by a "/", ex. "runatlantis/atlantis", "gitlab/subgroup/atlantis",
 	// "Bitbucket Server/atlantis", "azuredevops/project/atlantis".
@@ -221,6 +222,10 @@ type MergeableStatus struct {
 // PullRequest is a VCS pull request.
 // GitLab calls these Merge Requests.
 type PullRequest struct {
+	// ClosureGeneration fences deferred cleanup across close/reopen cycles.
+	ClosureGeneration   int64      `json:"-"`
+	LifecycleGeneration int64      `json:"-"`
+	Execution           *Execution `json:"-"`
 	// Num is the pull request number or ID.
 	Num int
 	// HeadCommit is a sha256 that points to the head of the branch that is being
@@ -278,6 +283,7 @@ const (
 	UpdatedPullEvent
 	ClosedPullEvent
 	OtherPullEvent
+	ReopenedPullEvent
 )
 
 func (p PullRequestEventType) String() string {
@@ -290,6 +296,8 @@ func (p PullRequestEventType) String() string {
 		return "closed"
 	case OtherPullEvent:
 		return "other"
+	case ReopenedPullEvent:
+		return "reopened"
 	}
 	return "<missing String() implementation>"
 }
