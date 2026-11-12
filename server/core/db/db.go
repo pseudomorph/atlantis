@@ -35,3 +35,21 @@ type Database interface {
 	Ping() error
 	Close() error
 }
+
+// LockKeyCodec provides opaque keys for stores with instance-scoped identities.
+// Legacy stores keep their existing externally visible lock keys.
+type LockKeyCodec interface {
+	LockKey(models.Repo, models.Project, string) string
+	ParseLockKey(string) (models.Repo, models.Project, string, error)
+}
+
+// RepoScopedLocks is implemented by stores that key locks by repository
+// identity, including the VCS host, instead of the repository full name alone.
+// Callers type-assert for it and fall back to the Database methods, which
+// receive repo.FullName, when a store does not implement it.
+type RepoScopedLocks interface {
+	GetLockInRepo(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error)
+	UnlockInRepo(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error)
+	UnlockInRepoIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
+	UnlockByPullInRepo(repo models.Repo, pullNum int) ([]models.ProjectLock, error)
+}
