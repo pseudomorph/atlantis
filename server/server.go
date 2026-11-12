@@ -546,6 +546,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		default:
 			logger.Info("Utilizing Redis DB in single-node mode, host: %s, port: %d", userConfig.RedisHost, userConfig.RedisPort)
 		}
+		logger.Warn(redisDeprecationWarning)
 		database, err = redis.NewWithConfig(redis.Config{
 			Hostname:           userConfig.RedisHost,
 			Port:               userConfig.RedisPort,
@@ -584,6 +585,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			_ = database.Close()
 			return nil, err
+		}
+		if warning := sharedArtifactsWarning(userConfig); warning != "" {
+			logger.Warn("%s", warning)
 		}
 		artifactStore = storage.Artifacts.Blobs
 		projectCmdOutputHandler.(*jobs.DurableOutputHandler).Service = storage.Jobs
@@ -726,6 +730,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	drainer := &events.Drainer{}
 	if storage.Execution != nil {
 		storage.Execution.Drainer = drainer
+		storage.Execution.WorkingDir = workingDir
 	}
 	statusController := &controllers.StatusController{
 		Logger:          logger,
@@ -1202,9 +1207,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	var lifecycleFetcher events.LivePullHeadFetcher
 	var pullReopener events_controllers.PullReopener
+	var deliveries events_controllers.WebhookDeliveries
 	if storage.Store != nil {
 		pullReopener = storage.Store
 		lifecycleFetcher = livePullHeadFetcher
+		deliveries = storage.Store
 	}
 	eventsController := &events_controllers.VCSEventsController{
 		PullReopener:                    pullReopener,
@@ -1231,6 +1238,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		AzureDevopsWebhookBasicPassword: []byte(userConfig.AzureDevopsWebhookPassword),
 		AzureDevopsRequestValidator:     &events_controllers.DefaultAzureDevopsRequestValidator{},
 		GiteaWebhookSecret:              []byte(userConfig.GiteaWebhookSecret),
+		Deliveries:                      deliveries,
 	}
 	githubAppController := &controllers.GithubAppController{
 		AtlantisURL:         parsedURL,

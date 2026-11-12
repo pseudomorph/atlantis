@@ -6335,6 +6335,54 @@ func (durablePlanStore) PendingPlans(models.Repo, int) ([]models.Job, error) { r
 // A pre-workflow hook can recreate the default checkout on a server that never
 // held this PR. `apply -p name` must still check out the project's own
 // workspace instead of failing on it, and must leave existing checkouts alone.
+// Every targeted command, not just apply, clones the workspace it runs in
+// when a pre-workflow hook has already recreated the default checkout.
+func TestDefaultProjectCommandBuilder_TargetedCommandsCloneMissingWorkspace(t *testing.T) {
+	atlantisYAML := `version: 3
+projects:
+- name: myproject
+  dir: project1
+  workspace: staging
+`
+	repo := models.Repo{FullName: "owner/repo", Owner: "owner", Name: "repo"}
+	pull := models.PullRequest{Num: 5, BaseRepo: repo}
+	cases := map[string]func(*events.DefaultProjectCommandBuilder, *command.Context) ([]command.ProjectContext, error){
+		"version": func(b *events.DefaultProjectCommandBuilder, ctx *command.Context) ([]command.ProjectContext, error) {
+			return b.BuildVersionCommands(ctx, &events.CommentCommand{Name: command.Version, ProjectName: "myproject"})
+		},
+		"import": func(b *events.DefaultProjectCommandBuilder, ctx *command.Context) ([]command.ProjectContext, error) {
+			return b.BuildImportCommands(ctx, &events.CommentCommand{Name: command.Import, ProjectName: "myproject", Flags: []string{"addr", "id"}})
+		},
+		"state rm": func(b *events.DefaultProjectCommandBuilder, ctx *command.Context) ([]command.ProjectContext, error) {
+			return b.BuildStateRmCommands(ctx, &events.CommentCommand{Name: command.State, SubName: "rm", ProjectName: "myproject", Flags: []string{"addr"}})
+		},
+		"approve_policies": func(b *events.DefaultProjectCommandBuilder, ctx *command.Context) ([]command.ProjectContext, error) {
+			return b.BuildApprovePoliciesCommands(ctx, &events.CommentCommand{Name: command.ApprovePolicies, ProjectName: "myproject"})
+		},
+	}
+	for name, build := range cases {
+		t.Run(name, func(t *testing.T) {
+			RegisterMockTestingT(t)
+			pullDir := t.TempDir()
+			Ok(t, os.MkdirAll(filepath.Join(pullDir, "default", "project1"), 0o700))
+			Ok(t, os.WriteFile(filepath.Join(pullDir, "default", "atlantis.yaml"), []byte(atlantisYAML), 0o600))
+			workingDir := &fakeWorkingDir{MockWorkingDir: *mocks.NewMockWorkingDir(), pullDir: pullDir}
+			logger := logging.NewNoopLogger(t)
+			scope := metricstest.NewLoggingScope(t, logger, "atlantis")
+			builder := events.NewProjectCommandBuilder(false, &config.ParserValidator{}, &events.DefaultProjectFinder{}, nil,
+				workingDir, events.NewDefaultWorkingDirLocker(), valid.NewGlobalCfgFromArgs(valid.GlobalCfgArgs{AllowAllRepoSettings: true}),
+				&events.DefaultPendingPlanFinder{}, &events.CommentParser{ExecutableName: "atlantis"}, false, false, false, false, false,
+				"", defaultUserConfig.AutoplanFileList, false, "", false, false, "auto", scope, tfclientmocks.NewMockClient(),
+				durablePlanStore{&mockExternalPlanStore{}})
+			ctxs, err := build(builder, &command.Context{Log: logger, Scope: scope, Pull: pull, HeadRepo: repo})
+			Ok(t, err)
+			Equals(t, 1, len(ctxs))
+			Equals(t, "staging", ctxs[0].Workspace)
+			Equals(t, []string{"staging"}, workingDir.cloneCalls)
+		})
+	}
+}
+
 func TestDefaultProjectCommandBuilder_TargetedApplyRecovery_DefaultAlreadyPresent(t *testing.T) {
 	atlantisYAML := `version: 3
 projects:

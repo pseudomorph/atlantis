@@ -21,7 +21,8 @@ import (
 	"github.com/runatlantis/atlantis/server/utils"
 )
 
-const workingDirPrefix = "repos"
+// WorkingDirPrefix is the data-dir subdirectory that holds checkouts.
+const WorkingDirPrefix = "repos"
 
 const prSourceRemote = "source"
 
@@ -927,7 +928,7 @@ func (w *FileWorkspace) Delete(logger logging.SimpleLogging, r models.Repo, p mo
 		return err
 	}
 	logger.Info("Deleting repo pull directory: %s", repoPullDir)
-	cloneErr := removeAllSubPath(filepath.Join(w.DataDir, workingDirPrefix), repoPullDir)
+	cloneErr := removeAllSubPath(filepath.Join(w.DataDir, WorkingDirPrefix), repoPullDir)
 
 	planPullDir, err := w.planPullDir(r, p)
 	if err != nil {
@@ -937,7 +938,7 @@ func (w *FileWorkspace) Delete(logger logging.SimpleLogging, r models.Repo, p mo
 		return cloneErr
 	}
 	logger.Info("Deleting plan pull directory: %s", planPullDir)
-	planErr := removeAllSubPath(filepath.Join(w.localSharePlanDir(), workingDirPrefix), planPullDir)
+	planErr := removeAllSubPath(filepath.Join(w.localSharePlanDir(), WorkingDirPrefix), planPullDir)
 	if cloneErr != nil {
 		return cloneErr
 	}
@@ -1001,12 +1002,12 @@ func removeAllSubPath(baseDir, targetDir string) error {
 }
 
 func (w *FileWorkspace) repoPullDir(r models.Repo, p models.PullRequest) (string, error) {
-	root := filepath.Join(w.DataDir, workingDirPrefix)
+	root := filepath.Join(w.DataDir, WorkingDirPrefix)
 	if w.InstanceScoped {
 		root = filepath.Join(root, r.StorageIdentity().Directory())
 	}
 	dir := filepath.Join(root, r.FullName, strconv.Itoa(p.Num))
-	if err := utils.EnsureSubPath(filepath.Join(w.DataDir, workingDirPrefix), dir); err != nil {
+	if err := utils.EnsureSubPath(filepath.Join(w.DataDir, WorkingDirPrefix), dir); err != nil {
 		return "", fmt.Errorf("repo path traversal detected: %w", err)
 	}
 	return dir, nil
@@ -1024,7 +1025,7 @@ func (w *FileWorkspace) planPullDir(r models.Repo, p models.PullRequest) (string
 		return w.repoPullDir(r, p)
 	}
 	dir := runtime.GetPlanPullDir(w.localSharePlanDir(), r, p)
-	if err := utils.EnsureSubPath(filepath.Join(w.localSharePlanDir(), workingDirPrefix), dir); err != nil {
+	if err := utils.EnsureSubPath(filepath.Join(w.localSharePlanDir(), WorkingDirPrefix), dir); err != nil {
 		return "", fmt.Errorf("plan path traversal detected: %w", err)
 	}
 	return dir, nil
@@ -1131,7 +1132,7 @@ func (w *FileWorkspace) validateCloneDir(r models.Repo, p models.PullRequest, wo
 		return "", err
 	}
 	cloneDir = filepath.Clean(cloneDir)
-	expectedPrefix := filepath.Clean(filepath.Join(w.DataDir, workingDirPrefix)) + string(filepath.Separator)
+	expectedPrefix := filepath.Clean(filepath.Join(w.DataDir, WorkingDirPrefix)) + string(filepath.Separator)
 	if !strings.HasPrefix(cloneDir, expectedPrefix) {
 		return "", fmt.Errorf("clone dir %q escapes managed data directory %q", cloneDir, expectedPrefix)
 	}

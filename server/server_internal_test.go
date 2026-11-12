@@ -196,9 +196,10 @@ func TestDurableStorageStartupBlocksPreviousExecution(t *testing.T) {
 	Assert(t, s.Drainer != nil, "server did not wire execution draining")
 }
 
-// With PostgreSQL the advisory lock taken at startup plays the role of the
-// SQLite file lock: a previous server's claims become uncertain, and a second
-// server against the same schema fails to start.
+// Servers may share a PostgreSQL schema. Starting one leaves claims held by
+// another server active, since that server may still be running them; the
+// expiry sweep handles claims of a server that stopped. Each server needs its
+// own data directory.
 func TestDurableStorageStartupOnPostgres(t *testing.T) {
 	dsn := sqlstoretest.PostgresDSN(t)
 	previous, err := sqlstore.OpenPostgresServer(dsn, t.TempDir())
@@ -207,17 +208,23 @@ func TestDurableStorageStartupOnPostgres(t *testing.T) {
 	Ok(t, previous.AcquireClaim(pull, pull.ExecutionOwner()))
 	Ok(t, previous.Close())
 	t.Setenv("ATLANTIS_TEST_STORAGE_DSN", dsn)
-	config := func() UserConfig {
-		return UserConfig{Experiments: []string{"durable-storage"}, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "ATLANTIS_TEST_STORAGE_DSN"}}, DataDir: t.TempDir(),
+	config := func(dataDir string) UserConfig {
+		return UserConfig{Experiments: []string{"durable-storage"}, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "ATLANTIS_TEST_STORAGE_DSN"}}, DataDir: dataDir,
 			AllowCommands: "plan,apply", AtlantisURL: "http://example.com", GithubHostname: "github.com", GithubUser: "user"}
 	}
-	s, err := NewServer(config(), Config{AtlantisVersion: "test"})
+	dataDir := t.TempDir()
+	s, err := NewServer(config(dataDir), Config{AtlantisVersion: "test"})
 	Ok(t, err)
 	t.Cleanup(func() { Ok(t, s.closeDatabase(time.Second)); Ok(t, s.StatsCloser.Close()) })
-	store := s.database.(*sqlstore.Store)
-	Assert(t, store.CheckClaim(pull) != nil, "startup accepted a previous execution owner")
-	Assert(t, store.AcquireClaim(pull, "replacement") != nil, "startup silently took over unfinished work")
-	_, err = NewServer(config(), Config{AtlantisVersion: "test"})
+	other, err := NewServer(config(t.TempDir()), Config{AtlantisVersion: "test"})
+	Ok(t, err)
+	t.Cleanup(func() { Ok(t, other.closeDatabase(time.Second)); Ok(t, other.StatsCloser.Close()) })
+	for _, server := range []*Server{s, other} {
+		store := server.database.(*sqlstore.Store)
+		Ok(t, store.CheckClaim(pull))
+		Assert(t, store.AcquireClaim(pull, "replacement") != nil, "startup took over another server's claim")
+	}
+	_, err = NewServer(config(dataDir), Config{AtlantisVersion: "test"})
 	ErrContains(t, "already in use by another server", err)
 }
 

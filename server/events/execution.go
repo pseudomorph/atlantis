@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/db"
@@ -19,6 +20,12 @@ import (
 type ExecutionCoordinator struct {
 	Store   db.ExecutionStore
 	Drainer *Drainer
+	// WorkingDir holds this server's checkouts. Durable state lives in the
+	// database and artifact storage, so a checkout lives for one command: it
+	// is removed when the command takes ownership and again before it gives
+	// ownership up. Any server may run the next command for the pull, and
+	// nothing it reads can be left over from an earlier command.
+	WorkingDir WorkingDir
 	// NewAPIPullNumber supplies replacement candidates after an identity collision.
 	NewAPIPullNumber func() int
 }
@@ -85,8 +92,20 @@ func (s *ExecutionCoordinator) acquire(ctx *command.Context, unlock, confirmedSt
 		return nil, claimErr
 	}
 	pull := ctx.Pull
+	if err := s.removeCheckout(ctx.Log, pull); err != nil {
+		if releaseErr := s.Store.ReleaseClaim(pull); releaseErr != nil {
+			ctx.Log.Err("releasing execution claim: %v", releaseErr)
+		}
+		finishDrain()
+		ctx.Pull.Execution = nil
+		ctx.Pull.BaseRepo.Execution = nil
+		return nil, fmt.Errorf("removing previous checkout: %w", err)
+	}
 	handle.Release = func() {
 		defer finishDrain()
+		if err := s.removeCheckout(ctx.Log, pull); err != nil {
+			ctx.Log.Err("removing checkout: %v", err)
+		}
 		if err := s.Store.ReleaseClaim(pull); err != nil {
 			ctx.Log.Err("releasing execution claim: %v", err)
 			if markErr := s.Store.MarkUncertain(pull); markErr != nil {
@@ -95,6 +114,17 @@ func (s *ExecutionCoordinator) acquire(ctx *command.Context, unlock, confirmedSt
 		}
 	}
 	return handle.Close, nil
+}
+
+// removeCheckout deletes this server's checkout of the pull, if it has one.
+func (s *ExecutionCoordinator) removeCheckout(logger logging.SimpleLogging, pull models.PullRequest) error {
+	if s.WorkingDir == nil {
+		return nil
+	}
+	if _, err := s.WorkingDir.GetPullDir(pull.BaseRepo, pull); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return s.WorkingDir.Delete(logger, pull.BaseRepo, pull)
 }
 
 func (s *ExecutionCoordinator) Check(ctx command.ProjectContext) error {

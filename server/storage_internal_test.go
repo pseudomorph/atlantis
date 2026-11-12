@@ -192,3 +192,48 @@ func TestDurableHeartbeatRefreshesAndSweeps(t *testing.T) {
 	// A refreshed claim is live, so the sweep in the same round leaves it active.
 	Ok(t, store.CheckClaim(pull))
 }
+
+func TestSharedArtifactsWarning(t *testing.T) {
+	dataDir := t.TempDir()
+	shared := t.TempDir()
+	for _, c := range []struct {
+		name      string
+		database  string
+		artifacts StorageArtifactsConfig
+		warn      bool
+	}{
+		{"sqlite filesystem", "sqlite", StorageArtifactsConfig{Type: "filesystem"}, false},
+		{"postgres database", "postgres", StorageArtifactsConfig{Type: "database"}, false},
+		{"postgres default directory", "postgres", StorageArtifactsConfig{Type: "filesystem"}, true},
+		{"postgres directory inside data-dir", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: filepath.Join(dataDir, "shared")}, true},
+		{"postgres shared directory", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: shared}, false},
+		{"postgres sibling directory", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: dataDir + "-artifacts"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			config := UserConfig{DataDir: dataDir, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: c.database}, Artifacts: c.artifacts}}
+			Equals(t, c.warn, sharedArtifactsWarning(config) != "")
+		})
+	}
+}
+
+// A new process owns no command, so startup removes checkouts an earlier
+// process left and keeps the rest of the data directory.
+func TestDurableStartupRemovesLeftoverCheckouts(t *testing.T) {
+	store, err := sqlstore.OpenServer(t.TempDir())
+	Ok(t, err)
+	defer store.Close()
+	dataDir := t.TempDir()
+	leftover := filepath.Join(dataDir, "repos", "github.com", "org", "repo", "1", "default", "default.tfplan")
+	Ok(t, os.MkdirAll(filepath.Dir(leftover), 0700))
+	Ok(t, os.WriteFile(leftover, []byte("old plan"), 0600))
+	kept := filepath.Join(dataDir, "bin", "terraform")
+	Ok(t, os.MkdirAll(filepath.Dir(kept), 0700))
+	Ok(t, os.WriteFile(kept, []byte("binary"), 0600))
+	runtime, err := newStorageRuntime(store, UserConfig{DataDir: dataDir, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "sqlite"}}})
+	Ok(t, err)
+	defer runtime.Artifacts.Blobs.Close()
+	_, err = os.Stat(filepath.Join(dataDir, "repos"))
+	Assert(t, os.IsNotExist(err), "startup kept an earlier checkout")
+	_, err = os.Stat(kept)
+	Ok(t, err)
+}

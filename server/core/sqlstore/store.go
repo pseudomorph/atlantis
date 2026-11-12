@@ -15,14 +15,11 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/gofrs/flock"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"gorm.io/gorm"
@@ -38,15 +35,13 @@ func databaseTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsec
 // Store owns the database shared by locks and status. Its schema is managed by Goose.
 // It runs on SQLite or PostgreSQL.
 type Store struct {
-	db    *gorm.DB
-	conn  *sql.DB
+	db   *gorm.DB
+	conn *sql.DB
+	// owner locks the data directory, which belongs to one server.
 	owner *flock.Flock
-	// session holds the PostgreSQL advisory lock that makes this the only server.
-	session   *pgx.Conn
-	sessionMu sync.Mutex
-	// serverLockLost is set when the PostgreSQL session holding the advisory lock
-	// ends. The store then admits no new claims and stops refreshing heartbeats.
-	serverLockLost atomic.Bool
+	// schema is the PostgreSQL schema, which several servers may share. It is
+	// empty for SQLite, which one server uses.
+	schema string
 	// instance identifies this server process in the claims and jobs it writes.
 	instance string
 	// claimExpiry is how long a claim may go without a heartbeat before it is uncertain.
@@ -125,12 +120,12 @@ func checkDataDir(dataDir string, initialized bool) error {
 	return nil
 }
 
-func migrate(conn *sql.DB, dialect goose.Dialect) error {
+func migrate(conn *sql.DB, dialect goose.Dialect, options ...goose.ProviderOption) error {
 	files, err := fs.Sub(migrationFiles, "migrations")
 	if err != nil {
 		return err
 	}
-	migrator, err := goose.NewProvider(dialect, conn, files)
+	migrator, err := goose.NewProvider(dialect, conn, files, options...)
 	if err != nil {
 		return err
 	}
@@ -150,11 +145,6 @@ func (s *Store) Close() error {
 	if s.owner != nil {
 		err = errors.Join(err, s.owner.Unlock())
 	}
-	if s.session != nil {
-		s.sessionMu.Lock()
-		err = errors.Join(err, s.session.Close(context.Background()))
-		s.sessionMu.Unlock()
-	}
 	return err
 }
 func (s *Store) Ping() error { return s.conn.Ping() }
@@ -165,16 +155,9 @@ func OpenServer(dataDir string) (*Store, error) {
 	if strconv.IntSize < 64 {
 		return nil, fmt.Errorf("durable-storage requires a 64-bit server; legacy storage remains supported")
 	}
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return nil, err
-	}
-	owner := flock.New(filepath.Join(dataDir, ".durable-storage.lock"))
-	held, err := owner.TryLock()
+	owner, err := lockDataDir(dataDir, "durable-storage SQLite is already in use by another server")
 	if err != nil {
-		return nil, fmt.Errorf("locking SQLite server: %w", err)
-	}
-	if !held {
-		return nil, fmt.Errorf("durable-storage SQLite is already in use by another server")
+		return nil, err
 	}
 	store, err := openSQLite(dataDir)
 	if err != nil {
@@ -183,4 +166,21 @@ func OpenServer(dataDir string) (*Store, error) {
 	}
 	store.owner = owner
 	return store, nil
+}
+
+// lockDataDir takes the file lock that gives one server a data directory.
+// busy is the error when another process holds it.
+func lockDataDir(dataDir, busy string) (*flock.Flock, error) {
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return nil, fmt.Errorf("creating data directory: %w", err)
+	}
+	owner := flock.New(filepath.Join(dataDir, ".durable-storage.lock"))
+	held, err := owner.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("locking data directory: %w", err)
+	}
+	if !held {
+		return nil, errors.New(busy)
+	}
+	return owner, nil
 }

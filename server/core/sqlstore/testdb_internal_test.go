@@ -46,6 +46,13 @@ func (d TestDatabase) Fresh(t *testing.T) TestDatabase {
 	return SQLiteDatabase(t)
 }
 
+// OtherServer returns the same database with a new data directory, which is
+// what a second server sharing a PostgreSQL schema uses.
+func (d TestDatabase) OtherServer(t *testing.T) TestDatabase {
+	d.DataDir = t.TempDir()
+	return d
+}
+
 // Store starts a server that closes when the test ends.
 func (d TestDatabase) Store(t *testing.T) *Store {
 	t.Helper()
@@ -95,7 +102,7 @@ func (d TestDatabase) gooseDialect() goose.Dialect {
 	return goose.DialectSQLite3
 }
 
-// openUnmanaged opens the database without the server lock or migrations, as
+// openUnmanaged opens the database without the data directory lock or migrations, as
 // an older release would. The caller closes it.
 func openUnmanaged(t *testing.T, d TestDatabase) *gorm.DB {
 	t.Helper()

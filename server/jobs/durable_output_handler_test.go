@@ -13,6 +13,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
+	"github.com/runatlantis/atlantis/server/core/sqlstore/sqlstoretest"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/jobs"
@@ -120,4 +121,48 @@ func TestDurableOutputDrainsFinalFlushAfterEmptyRead(t *testing.T) {
 			Equals(t, []string{"last line", "unterminated tail"}, lines)
 		})
 	}
+}
+
+// A log viewer on one server follows a job that another server sharing the
+// PostgreSQL database runs, from its first line until the job finishes.
+func TestDurableOutputFollowsJobOnAnotherServer(t *testing.T) {
+	dsn := sqlstoretest.PostgresDSN(t)
+	running, err := sqlstore.OpenPostgresServer(dsn, t.TempDir())
+	Ok(t, err)
+	defer running.Close()
+	viewing, err := sqlstore.OpenPostgresServer(dsn, t.TempDir())
+	Ok(t, err)
+	defer viewing.Close()
+	runner := &jobs.Service{Store: running, Logs: &logs.Service{Records: running}}
+	defer runner.Close()
+	writer := &jobs.DurableOutputHandler{Service: runner}
+	viewer := &jobs.DurableOutputHandler{Service: &jobs.Service{Store: viewing, Logs: &logs.Service{Records: viewing}}}
+
+	ctx := projectContext(t)
+	claimContext(t, &fixture{Service: runner}, &ctx)
+	Ok(t, runner.Begin(ctx))
+	Assert(t, viewer.IsKeyExists(ctx.JobID), "viewer cannot find the running job")
+	writer.Send(ctx, "first line", false)
+	receiver := make(chan string, 8)
+	go viewer.Register(ctx.JobID, receiver)
+	next := func() (string, bool) {
+		t.Helper()
+		select {
+		case line, ok := <-receiver:
+			return line, ok
+		case <-time.After(10 * time.Second):
+			t.Fatal("viewer received no output")
+			return "", false
+		}
+	}
+	line, ok := next()
+	Assert(t, ok, "viewer stopped before the first line")
+	Equals(t, "first line", line)
+	writer.Send(ctx, "second line", false)
+	line, ok = next()
+	Assert(t, ok, "viewer stopped before the second line")
+	Equals(t, "second line", line)
+	Ok(t, runner.Finish(ctx, command.ProjectCommandOutput{}))
+	_, ok = next()
+	Assert(t, !ok, "viewer kept following a finished job")
 }
