@@ -24,6 +24,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -135,6 +136,7 @@ type Server struct {
 	artifactStore                  artifacts.SnapshotBackend
 	jobService                     *jobs.Service
 	storageMaintenance             func()
+	storageHeartbeat               func()
 	storageCancel                  context.CancelFunc
 	storageDone                    chan struct{}
 }
@@ -559,10 +561,13 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	case "durable":
 		logger.Warn("using experimental durable storage")
-		database, err = sqlstore.OpenServer(userConfig.DataDir)
+		var store *sqlstore.Store
+		store, err = sqlstore.OpenServer(userConfig.DataDir)
 		if err != nil {
 			return nil, err
 		}
+		logger.Info("durable storage server instance %q", store.InstanceID())
+		database = store
 	case "", "boltdb":
 		logger.Info("Utilizing BoltDB")
 		logger.Warn(boltDBDeprecationWarning)
@@ -793,9 +798,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		PullClosedTemplate: &events.PullClosedEventTemplate{}, LogStreamResourceCleaner: projectCmdOutputHandler, VCSClient: vcsClient, PlanStore: planStore,
 	}
 	pullClosedExecutor := events.NewInstrumentedPullClosedExecutor(statsScope, logger, pullClosedWorker)
-	var storageMaintenance func()
+	var storageMaintenance, storageHeartbeat func()
 	if storage.Store != nil {
 		storageMaintenance = storage.Maintain(pullClosedWorker, logger)
+		storageHeartbeat = storage.Heartbeat(logger)
 	}
 
 	projectFinder := &events.DefaultProjectFinder{}
@@ -1273,6 +1279,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		artifactStore:                  artifactStore,
 		jobService:                     storage.Jobs,
 		storageMaintenance:             storageMaintenance,
+		storageHeartbeat:               storageHeartbeat,
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())
@@ -1347,18 +1354,21 @@ func (s *Server) Start() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		s.storageCancel = cancel
 		s.storageDone = make(chan struct{})
+		var loops sync.WaitGroup
+		loops.Add(2)
 		go func() {
-			defer close(s.storageDone)
-			ticker := time.NewTicker(time.Minute)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					s.runStorageMaintenance()
-				}
-			}
+			defer loops.Done()
+			runEvery(ctx, time.Minute, s.runStorageMaintenance)
+		}()
+		// Heartbeats bypass the drainer: claims held by draining commands stay live
+		// until those commands finish and the database closes.
+		go func() {
+			defer loops.Done()
+			runEvery(ctx, sqlstore.ClaimHeartbeatInterval, s.runStorageHeartbeat)
+		}()
+		go func() {
+			loops.Wait()
+			close(s.storageDone)
 		}()
 		defer cancel()
 	}
@@ -1423,6 +1433,26 @@ func (s *Server) Start() error {
 		return fmt.Errorf("while shutting down: %s", err)
 	}
 	return nil
+}
+
+// runEvery calls fn on each tick until ctx is cancelled.
+func runEvery(ctx context.Context, interval time.Duration, fn func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			fn()
+		}
+	}
+}
+
+func (s *Server) runStorageHeartbeat() {
+	if s.storageHeartbeat != nil {
+		s.storageHeartbeat()
+	}
 }
 
 // runStorageMaintenance participates in the same admission fence as commands.

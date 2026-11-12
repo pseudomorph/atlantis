@@ -47,6 +47,7 @@ type job struct {
 	ManagedPlan                   bool
 	ID                            string `gorm:"primaryKey"`
 	Owner                         string
+	ServerInstanceID              string
 	RepositoryID, PullID          string
 	ProjectID                     *string
 	Command, SubCommand           string

@@ -20,17 +20,28 @@ Commands own persisted execution claims until completion, and lock, status and
 job writes require the live claim. Startup marks leftover claims uncertain,
 preventing new commands and destructive cleanup for those PRs or API
 invocations: a dead parent does not prove Terraform children stopped. There are
-no heartbeats, expiring leases, or automatic retries. Authorized unlock recovery
-requires an explicit stopped-work attestation; it records the actor,
-interrupts unfinished jobs and invalidates pending plans before releasing
-reservations. Closing a pull request
+no automatic retries. Authorized unlock recovery requires an explicit
+stopped-work attestation; it records the actor and the previous and recovering
+server instances, interrupts unfinished jobs and invalidates pending plans before
+releasing reservations. Closing a pull request
 records a closure generation; deferred cleanup holds its own claim and must
 match that generation, and a reopened pull request accepts work only after the
 cleanup completes. Unverified close events persist in `pending_pull_lifecycles`
 and block admission until maintenance verifies the live state.
 
+Each `Store` gets a new server instance ID when it opens. Claims record that
+instance and a heartbeat; jobs record the instance that ran them.
+`RefreshClaimHeartbeats` updates the instance's active claims every
+`ClaimHeartbeatInterval` in one conditional `UPDATE`, so it never revives a claim
+that a sweep or recovery changed. `ExpireClaims` locks each candidate claim,
+rechecks its heartbeat against `ClaimExpiry` in Go, marks it uncertain and seals
+its owner's open logs as interrupted. Recovery treats an active claim with an
+expired heartbeat as uncertain. Expiry never transfers a claim. Heartbeat
+comparisons use database time read by `databaseNow`. With SQLite, startup marks
+claims from every earlier instance uncertain without waiting for expiry.
+
 Run storage tests with `go test -race ./server/core/sqlstore`. PostgreSQL and
-distributed leases are separate follow-up work.
+multi-server execution are separate follow-up work.
 
 Each schema change adds a new numbered file under `migrations/`, and released
 migrations are never edited. An existing database upgrades by applying the newer

@@ -23,7 +23,7 @@ func (s *Store) AcquireUnlockClaim(p models.PullRequest, owner, actor string, co
 		if err != nil {
 			return err
 		}
-		return acquireRecovery(tx, p, row.ID, owner, actor, confirmedStopped, nil)
+		return s.acquireRecovery(tx, p, row.ID, owner, actor, confirmedStopped, nil)
 	})
 }
 
@@ -49,12 +49,12 @@ func (s *Store) AcquireAPIJobUnlock(id, owner, actor string, confirmedStopped bo
 		}
 		p.Execution = &models.Execution{Owner: owner}
 		p.BaseRepo.Execution = p.Execution
-		return acquireRecovery(tx, p, source.PullID, owner, actor, confirmedStopped, &source)
+		return s.acquireRecovery(tx, p, source.PullID, owner, actor, confirmedStopped, &source)
 	})
 	return p, err
 }
 
-func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor string, confirmed bool, source *job) error {
+func (s *Store) acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor string, confirmed bool, source *job) error {
 	// The pull lock also fences the missing-claim case, where no claim row exists to lock.
 	if _, err := lockPull(tx, pullID); err != nil {
 		return err
@@ -68,6 +68,14 @@ func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor str
 	now, err := databaseNow(tx)
 	if err != nil {
 		return err
+	}
+	// A claim whose heartbeat has expired is uncertain even before the sweep
+	// reaches it. Expiry never transfers the claim; it still needs attestation.
+	if !missing && claimExpired(existing, now, s.claimExpiry) {
+		if err := expireClaim(tx, existing, now); err != nil {
+			return err
+		}
+		existing.State = "uncertain"
 	}
 	if !missing {
 		if existing.State != "uncertain" {
@@ -91,11 +99,12 @@ func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor str
 		if source != nil {
 			sourceID = &source.ID
 		}
-		previous := existing.Owner
+		previous, previousInstance := existing.Owner, existing.ServerInstanceID
 		if missing && source != nil {
-			previous = source.Owner
+			previous, previousInstance = source.Owner, source.ServerInstanceID
 		}
-		if err := tx.Exec("INSERT INTO execution_recoveries(id, pull_id, previous_owner, recovery_owner, source_job_id, actor, recovered_at) VALUES (?, ?, ?, ?, ?, ?, ?)", uuid.NewString(), pullID, previous, owner, sourceID, actor, now).Error; err != nil {
+		if err := tx.Exec("INSERT INTO execution_recoveries(id, pull_id, previous_owner, recovery_owner, source_job_id, actor, recovered_at, previous_server_instance_id, recovery_server_instance_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			uuid.NewString(), pullID, previous, owner, sourceID, actor, now, previousInstance, s.instance).Error; err != nil {
 			return err
 		}
 		if err := tx.Table("jobs").Where("pull_id = ? AND state = ?", pullID, "running").Updates(map[string]any{"state": "interrupted", "error": "operator reconciled stopped execution", "finished_at": now}).Error; err != nil {
@@ -122,9 +131,11 @@ func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor str
 		}
 	}
 	if missing {
-		return tx.Create(&executionClaim{PullID: pullID, Owner: owner, State: "active", AcquiredAt: now}).Error
+		claim := s.newClaim(pullID, owner, now)
+		return tx.Create(&claim).Error
 	}
-	result := tx.Model(&executionClaim{}).Where("pull_id = ? AND owner = ? AND state = ?", pullID, existing.Owner, "uncertain").Updates(map[string]any{"owner": owner, "state": "active", "acquired_at": now})
+	result := tx.Model(&executionClaim{}).Where("pull_id = ? AND owner = ? AND state = ?", pullID, existing.Owner, "uncertain").
+		Updates(map[string]any{"owner": owner, "state": "active", "acquired_at": now, "server_instance_id": s.instance, "heartbeat_at": now})
 	if result.Error != nil {
 		return result.Error
 	}

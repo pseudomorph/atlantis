@@ -176,3 +176,19 @@ func TestDurableLogMaintenanceArchivesOutsideArtifactNamespace(t *testing.T) {
 		})
 	}
 }
+
+func TestDurableHeartbeatRefreshesAndSweeps(t *testing.T) {
+	store, err := sqlstore.OpenServer(t.TempDir())
+	Ok(t, err)
+	defer store.Close()
+	runtime, err := newStorageRuntime(store, UserConfig{Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "sqlite"}}})
+	Ok(t, err)
+	defer runtime.Artifacts.Blobs.Close()
+	pull := models.PullRequest{BaseRepo: models.Repo{FullName: "org/repo"}, Num: 1, State: models.OpenPullState}
+	pull.Execution = &models.Execution{Owner: uuid.NewString()}
+	Ok(t, store.AcquireClaim(pull, pull.ExecutionOwner()))
+	heartbeat := runtime.Heartbeat(logging.NewNoopLogger(t))
+	heartbeat()
+	// A refreshed claim is live, so the sweep in the same round leaves it active.
+	Ok(t, store.CheckClaim(pull))
+}
