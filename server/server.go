@@ -40,6 +40,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
+
 	"github.com/runatlantis/atlantis/server/core/redis"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
@@ -466,7 +467,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler
 
-	if userConfig.TFEToken != "" && !userConfig.TFELocalExecutionMode {
+	if userConfig.Storage != nil {
+		projectCmdOutputHandler = &jobs.DurableOutputHandler{}
+	} else if userConfig.TFEToken != "" && !userConfig.TFELocalExecutionMode {
 		// When TFE is enabled and using remote execution mode log streaming is not necessary.
 		projectCmdOutputHandler = &jobs.NoopProjectOutputHandler{}
 	} else {
@@ -578,6 +581,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 			return nil, err
 		}
 		artifactStore = storage.Artifacts.Blobs
+		projectCmdOutputHandler.(*jobs.DurableOutputHandler).Service = storage.Jobs
 		commitStatusUpdater.ClaimCheck = sql.CheckClaim
 	}
 	noOpLocker := locking.NewNoOpLocker()
@@ -728,7 +732,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GlobalCfg:        globalCfg,
 		WorkingDirLocker: workingDirLocker,
 		WorkingDir:       workingDir,
-		PreWorkflowHookRunner: runtime.DefaultPreWorkflowHookRunner{
+		PreWorkflowHookRunner: runtime.DefaultPreWorkflowHookRunner{Jobs: storage.Jobs,
 			OutputHandler: projectCmdOutputHandler,
 		},
 		CommitStatusUpdater: commitStatusUpdater,
@@ -739,7 +743,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		GlobalCfg:        globalCfg,
 		WorkingDirLocker: workingDirLocker,
 		WorkingDir:       workingDir,
-		PostWorkflowHookRunner: runtime.DefaultPostWorkflowHookRunner{
+		PostWorkflowHookRunner: runtime.DefaultPostWorkflowHookRunner{Jobs: storage.Jobs,
 			OutputHandler: projectCmdOutputHandler,
 		},
 		CommitStatusUpdater: commitStatusUpdater,
@@ -864,8 +868,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
-		Jobs:                    storage.Jobs,
-		Artifacts:               storage.Artifacts,
+		Jobs: storage.Jobs, Artifacts: storage.Artifacts,
 		Execution:               storage.Execution,
 		VcsClient:               vcsClient,
 		VarFileAllowlistChecker: varFileAllowlistChecker,
@@ -1473,11 +1476,11 @@ func (s *Server) closeDatabase(timeout time.Duration) error {
 
 	done := make(chan error, 1)
 	go func() {
-		var jobErr error
+		var outputErr error
 		if s.jobService != nil {
-			jobErr = s.jobService.Close()
+			outputErr = s.jobService.Close()
 		}
-		done <- errors.Join(jobErr, s.database.Close())
+		done <- errors.Join(outputErr, s.database.Close())
 	}()
 	select {
 	case err := <-done:

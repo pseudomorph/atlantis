@@ -5,6 +5,8 @@ package sqlstore
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"io/fs"
 	"net/url"
 	"path/filepath"
@@ -183,6 +185,94 @@ func TestUpgradeFromJobsAndClaims(t *testing.T) {
 	Equals(t, plan.ID, got.PlanJobID)
 	Ok(t, s.FinishJob(consumer.ID, "succeeded", ""))
 	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+	Ok(t, err)
+	Equals(t, 0, len(pending))
+}
+
+// writeDurablePlans adds the rows version 3 stores for a published plan from
+// writeJobsAndClaims: tool metadata, a ready snapshot with its database blob,
+// and the pending plan slot.
+func writeDurablePlans(t *testing.T, db *gorm.DB, createdAt time.Time) models.PlanSnapshot {
+	t.Helper()
+	snapshot := validSnapshot("old-plan")
+	manifest, err := json.Marshal(snapshot.Manifest)
+	Ok(t, err)
+	Ok(t, db.Exec("UPDATE jobs SET tool_distribution = 'terraform', tool_version = '1.11.1' WHERE id = 'old-plan'").Error)
+	Ok(t, db.Exec("INSERT INTO plan_snapshots(job_id, manifest, size, sha256, created_at, ready) VALUES ('old-plan', ?, ?, ?, ?, TRUE)", string(manifest), snapshot.Size, snapshot.SHA256, databaseTime(createdAt)).Error)
+	Ok(t, db.Exec("INSERT INTO snapshot_blobs(job_id, content) VALUES ('old-plan', ?)", []byte("bundle")).Error)
+	Ok(t, db.Exec("INSERT INTO pending_plans(project_id, pull_id, job_id, ready) VALUES ('project', 'pull', 'old-plan', TRUE)").Error)
+	return snapshot
+}
+
+func TestUpgradeFromDurablePlans(t *testing.T) {
+	dir := t.TempDir()
+	p := upgradePull()
+	startedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	var snapshot models.PlanSnapshot
+	databaseAt(t, dir, 3, func(db *gorm.DB) {
+		writeLocksAndStatus(t, db, p, startedAt)
+		writeJobsAndClaims(t, db, startedAt)
+		snapshot = writeDurablePlans(t, db, startedAt.Add(time.Minute))
+	})
+
+	s, err := OpenServer(dir)
+	Ok(t, err)
+	defer s.Close()
+
+	// Earlier jobs recorded no output and have no journal.
+	stream, err := s.Log("old-plan")
+	Ok(t, err)
+	Assert(t, stream == nil, "old job gained a log stream: %+v", stream)
+	stream, data, err := s.ReadLogJournal("old-plan", 0, 10)
+	Ok(t, err)
+	Assert(t, stream == nil && data == nil, "old job returned log content")
+	expired, err := s.ExpiredLogs(startedAt.Add(24*time.Hour), time.Hour)
+	Ok(t, err)
+	Equals(t, 0, len(expired))
+	ErrContains(t, "FOREIGN KEY constraint failed", s.db.Create(&logStream{LogStream: models.LogStream{JobID: "missing"}}).Error)
+
+	// The published plan, its blob and its pending slot survive.
+	old, err := s.Job("old-plan")
+	Ok(t, err)
+	Equals(t, "1.11.1", old.ToolVersion)
+	stored, err := s.Snapshot("old-plan")
+	Ok(t, err)
+	Assert(t, stored != nil, "old snapshot is missing")
+	Equals(t, snapshot.Manifest, stored.Manifest)
+	Equals(t, snapshot.SHA256, stored.SHA256)
+	blob, err := BlobStore{Store: s}.OpenSnapshot("old-plan")
+	Ok(t, err)
+	content, err := io.ReadAll(blob)
+	Ok(t, err)
+	Equals(t, "bundle", string(content))
+	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+	Ok(t, err)
+	Equals(t, 1, len(pending))
+	Equals(t, "old-plan", pending[0].ID)
+
+	// A consumer admitted after the upgrade binds the old plan and journals its output.
+	p = claimed(t, s, p)
+	hook := claimJob(p, "hook")
+	hook.Kind, hook.Command = models.WorkflowHookJob, "pre_workflow_hook"
+	Ok(t, s.StartJob(hook))
+	Ok(t, s.FinishJob(hook.ID, "succeeded", ""))
+	consumer := claimJob(p, "apply")
+	consumer.Command = "apply"
+	Ok(t, s.StartJob(consumer))
+	got, err := s.Job(consumer.ID)
+	Ok(t, err)
+	Equals(t, "old-plan", got.PlanJobID)
+	input, err := s.InputSnapshot(consumer.ID)
+	Ok(t, err)
+	Assert(t, input != nil && input.JobID == "old-plan", "consumer lost the old snapshot")
+	Ok(t, s.AppendLogChunk(consumer.ID, []byte("applied")))
+	ErrContains(t, "CHECK constraint failed", s.db.Create(&logChunk{JobID: consumer.ID, StartOffset: 7, Content: []byte{}}).Error)
+	Ok(t, s.FinishJob(consumer.ID, "succeeded", ""))
+	stream, data, err = s.ReadLogJournal(consumer.ID, 0, 100)
+	Ok(t, err)
+	Assert(t, stream != nil && stream.SealedAt != nil, "consumer log was not sealed")
+	Equals(t, "applied", string(data))
+	pending, err = s.PendingPlans(p.BaseRepo, p.Num)
 	Ok(t, err)
 	Equals(t, 0, len(pending))
 }

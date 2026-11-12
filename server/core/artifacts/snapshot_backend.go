@@ -22,15 +22,15 @@ type SnapshotBackend interface {
 	CollectOrphans(map[string]bool, bool, time.Time) error
 }
 
-// ObjectSnapshots keeps plan bundles under their own key prefix, apart from other objects.
+// ObjectSnapshots isolates plan bundles from log archives and other objects.
 type ObjectSnapshots struct{ Store Store }
 
 const snapshotPrefix = "snapshots/v1/"
 const snapshotName = "plan-snapshot.tar.gz"
 
-// orphanGrace keeps unreferenced bundles and leftover write temporaries long
+// OrphanGrace keeps unreferenced bundles and leftover write temporaries long
 // enough that collection never removes an upload that is still in progress.
-const orphanGrace = time.Hour
+const OrphanGrace = time.Hour
 
 // isWriteTemp reports whether tail names a Filesystem.Put temporary file
 // (<name>.<uuid>.tmp) for the snapshot bundle.
@@ -96,7 +96,7 @@ func (s ObjectSnapshots) CollectOrphans(refs map[string]bool, quiescent bool, no
 		if _, err := snapshotKey(id); err != nil {
 			continue
 		}
-		stale := o.ModifiedAt.Before(now.Add(-orphanGrace))
+		stale := o.ModifiedAt.Before(now.Add(-OrphanGrace))
 		switch {
 		case tail == snapshotName:
 			if !refs[id] && stale {

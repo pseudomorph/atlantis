@@ -55,12 +55,13 @@ storage:
   artifacts:
     type: database
   retention:
+    logs: 168h
     plan_artifacts: 0s
 ```
 
 `storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
 under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks,
-PR status, job history, execution claims, pending plans, and the metadata that
+PR status, job history, job logs, execution claims, pending plans, and the metadata that
 locates artifacts in any backend. Run one Atlantis 64-bit process on local or
 block-backed storage; network filesystems such as NFS/EFS are unsupported.
 PostgreSQL and shared operation are deferred.
@@ -68,15 +69,20 @@ PostgreSQL and shared operation are deferred.
 `storage.artifacts.type` accepts `database` (the default) or `filesystem`.
 Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`; the
 database backend rejects `directory`. Use a directory dedicated to this database;
-installations and fresh-data-directory cutovers must not share it. Existing
-artifacts are not migrated when changing backends.
+installations and fresh-data-directory cutovers must not share it. Live logs are
+journaled in the database for both backends; the filesystem backend archives sealed
+logs to the directory. Existing artifacts and logs are not migrated when changing
+backends, and logs already archived to a filesystem become unreadable after
+switching to the database backend.
 Protect artifact storage and the database with appropriate access controls,
-encryption at rest, and backups. Plans, declared workflow files, and backend
+encryption at rest, and backups. Plans, logs, declared workflow files, and backend
 initialization metadata can contain secrets; historical job records and backups
 also require protection. Cached backend configuration includes merged init
 settings and is retained for partial-backend restoration; provide fresh
 authentication through the server or apply workflow when credentials expire.
 
+`storage.retention.logs` is a positive Go duration, defaulting to `168h` after PR
+closure or non-PR job completion.
 `storage.retention.plan_artifacts` is a nonnegative Go duration, defaulting to
 `0s`. It retains plans, showfiles, and declared workflow files after their plan
 is applied or invalidated; pending plans and running jobs remain protected.
