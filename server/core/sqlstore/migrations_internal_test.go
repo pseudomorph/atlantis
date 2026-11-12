@@ -276,3 +276,47 @@ func TestUpgradeFromDurablePlans(t *testing.T) {
 	Ok(t, err)
 	Equals(t, 0, len(pending))
 }
+
+func TestUpgradeFromJobLogs(t *testing.T) {
+	dir := t.TempDir()
+	p := upgradePull()
+	startedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	databaseAt(t, dir, 4, func(db *gorm.DB) {
+		writeLocksAndStatus(t, db, p, startedAt)
+		writeJobsAndClaims(t, db, startedAt)
+		insert := "INSERT INTO jobs(id, repository_id, pull_id, project_id, command, sub_command, arguments, steps, issuer, issuer_teams, trigger, revision, state, error, private, started_at, owner, kind) VALUES ('old-running', 'repository', 'pull', 'project', 'plan', '', '[]', '[]', 'issuer', '[]', 'comment', 'revision', 'running', '', FALSE, ?, 'stopped-owner', 'command')"
+		Ok(t, db.Exec(insert, databaseTime(startedAt.Add(4*time.Minute))).Error)
+		Ok(t, db.Exec("INSERT INTO job_logs(job_id, byte_length) VALUES ('old-running', 0)").Error)
+		Ok(t, db.Exec("INSERT INTO execution_claims(pull_id, owner, state, acquired_at) VALUES ('pull', 'stopped-owner', 'active', ?)", databaseTime(startedAt.Add(4*time.Minute))).Error)
+	})
+
+	s, err := OpenServer(dir)
+	Ok(t, err)
+	defer s.Close()
+
+	// Existing rows have no instance, and a claim's heartbeat starts at acquisition.
+	claim := storedClaim(t, s, "stopped-owner")
+	Equals(t, "", claim.ServerInstanceID)
+	Assert(t, claim.HeartbeatAt.Equal(startedAt.Add(4*time.Minute)), "heartbeat was not backfilled: %s", claim.HeartbeatAt)
+	old, err := s.Job("old-plan")
+	Ok(t, err)
+	Equals(t, "", old.ServerInstance)
+	var audit struct{ PreviousServerInstanceID, RecoveryServerInstanceID string }
+	Ok(t, s.db.Table("execution_recoveries").Where("id = ?", "recovery").Take(&audit).Error)
+	Equals(t, "", audit.PreviousServerInstanceID+audit.RecoveryServerInstanceID)
+
+	// The upgraded claim's heartbeat is long expired; the sweep marks it uncertain
+	// without transferring it, and attested recovery records the unknown instance.
+	expired, err := s.ExpireClaims()
+	Ok(t, err)
+	Equals(t, 1, expired)
+	Equals(t, "uncertain", storedClaim(t, s, "stopped-owner").State)
+	stream, err := s.Log("old-running")
+	Ok(t, err)
+	Assert(t, stream.SealedAt != nil && stream.Interrupted, "upgraded running log was not interrupted")
+	Ok(t, s.AcquireUnlockClaim(p, "recovery", "operator", true))
+	Ok(t, s.db.Table("execution_recoveries").Where("recovery_owner = ?", "recovery").Take(&audit).Error)
+	Equals(t, "", audit.PreviousServerInstanceID)
+	Equals(t, s.InstanceID(), audit.RecoveryServerInstanceID)
+	Equals(t, s.InstanceID(), storedClaim(t, s, "recovery").ServerInstanceID)
+}

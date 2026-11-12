@@ -274,3 +274,17 @@ func TestStorageMaintenanceParticipatesInDraining(t *testing.T) {
 		Equals(t, int32(1), calls.Load())
 	})
 }
+
+func TestStorageHeartbeatContinuesWhileDraining(t *testing.T) {
+	var calls atomic.Int32
+	s := &Server{Drainer: &events.Drainer{}, storageHeartbeat: func() { calls.Add(1) }}
+	Assert(t, s.Drainer.StartOp(), "drainer refused an operation")
+	go s.Drainer.ShutdownBlocking()
+	for !s.Drainer.GetStatus().ShuttingDown {
+		time.Sleep(time.Millisecond)
+	}
+	// Draining commands still hold claims, so their heartbeats must continue.
+	s.runStorageHeartbeat()
+	Equals(t, int32(1), calls.Load())
+	s.Drainer.OpDone()
+}
