@@ -4,6 +4,7 @@
 package events
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -41,6 +42,21 @@ func (l *DefaultDeleteLockCommand) DeleteLock(logger logging.SimpleLogging, id s
 		existing, e := l.Locker.GetLock(id)
 		if e != nil || existing == nil {
 			return existing, e
+		}
+		if existing.Pull.Num < 0 {
+			id := "{job-id}"
+			if reader, ok := l.Execution.Store.(interface {
+				RecoveryJob(models.Repo, int) (string, error)
+			}); ok {
+				candidate, err := reader.RecoveryJob(existing.Pull.BaseRepo, existing.Pull.Num)
+				if err != nil {
+					return nil, err
+				}
+				if candidate != "" {
+					id = candidate
+				}
+			}
+			return nil, fmt.Errorf("API invocation reservations require authenticated POST /api/jobs/%s/unlock with a stopped-work attestation", id)
 		}
 		ctx := &command.Context{Pull: existing.Pull, Log: logger}
 		release, e := l.Execution.Acquire(ctx)

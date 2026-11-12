@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
@@ -172,6 +173,33 @@ func TestFilesystemBypassesJournalAndRejectsEscapingSymlink(t *testing.T) {
 	entries, err := os.ReadDir(outside)
 	Ok(t, err)
 	Equals(t, 0, len(entries))
+}
+
+func TestRetentionPreservesUncertainLogsAndClosureAnchor(t *testing.T) {
+	store, journal, job := setup(t)
+	Ok(t, journal.Append(job.ID, []byte("kept")))
+	Ok(t, store.ClosePull(job.Pull))
+	Ok(t, store.MarkUncertain(job.Pull))
+	Ok(t, journal.Collect(time.Now().Add(24*time.Hour), time.Hour))
+	data, err := journal.ReadAll(job.ID)
+	Ok(t, err)
+	Equals(t, "kept", string(data))
+	Ok(t, store.AcquireUnlockClaim(job.Pull, "recovery", "operator", true))
+	pull := job.Pull
+	pull.Execution = &models.Execution{Owner: "recovery"}
+	Ok(t, store.ReleaseClaim(pull))
+	Ok(t, store.RequestReopen(job.Pull))
+	Ok(t, store.MarkClosedClean(job.Pull))
+	Ok(t, store.AcquireClaim(job.Pull, "new-owner"))
+	pull.Execution = &models.Execution{Owner: "new-owner"}
+	Ok(t, store.ReleaseClaim(pull))
+	Ok(t, journal.Collect(time.Now().Add(24*time.Hour), time.Hour))
+	data, err = journal.ReadAll(job.ID)
+	Ok(t, err)
+	Equals(t, "", string(data))
+	info, err := journal.Info(job.ID)
+	Ok(t, err)
+	Assert(t, info.PurgedAt != nil, "expired log was not purged")
 }
 
 func TestChunkOrphansAndDuplicateOffsetsRejected(t *testing.T) {

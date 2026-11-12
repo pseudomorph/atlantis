@@ -415,6 +415,7 @@ func (a *APIController) Apply(w http.ResponseWriter, r *http.Request) {
 // LockDetail is deprecated - use LockDetailAPI instead.
 // Kept for backwards compatibility during migration.
 type LockDetail struct {
+	JobID           string `json:"job_id,omitempty"`
 	Name            string
 	ProjectName     string
 	ProjectRepo     string
@@ -441,7 +442,7 @@ func (a *APIController) ListLocks(w http.ResponseWriter, r *http.Request) {
 	middleware := a.getAPIMiddleware()
 	responder := middleware.Responder
 
-	if len(a.APISecret) > 0 && !middleware.RequireAuth(w, r) {
+	if (len(a.APISecret) > 0 || a.Execution != nil) && !middleware.RequireAuth(w, r) {
 		return
 	}
 
@@ -453,7 +454,20 @@ func (a *APIController) ListLocks(w http.ResponseWriter, r *http.Request) {
 
 	result := ListLocksResult{}
 	for name, lock := range locks {
-		result.Locks = append(result.Locks, LockDetail{
+		jobID := ""
+		if a.Execution != nil && lock.Pull.Num < 0 {
+			if reader, ok := a.Execution.Store.(interface {
+				RecoveryJob(models.Repo, int) (string, error)
+			}); ok {
+				var err error
+				jobID, err = reader.RecoveryJob(lock.Pull.BaseRepo, lock.Pull.Num)
+				if err != nil {
+					responder.InternalError(w, r, err)
+					return
+				}
+			}
+		}
+		result.Locks = append(result.Locks, LockDetail{JobID: jobID,
 			Name:            name,
 			ProjectName:     lock.Project.ProjectName,
 			ProjectRepo:     lock.Project.RepoFullName,
