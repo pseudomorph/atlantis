@@ -5,20 +5,36 @@ package jobs
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 )
 
-// Service records durable jobs for the project commands that own an execution claim.
+// Service records durable jobs and their output for the project commands that own an execution claim.
 type Service struct {
 	Store     db.JobStore
+	Logs      *logs.Service
+	logsOnce  sync.Once
 	runs      sync.Map
 	lifecycle sync.RWMutex
 	closed    bool
+}
+
+type jobRun struct {
+	job        models.Job
+	mu         sync.Mutex
+	output     strings.Builder
+	err        error
+	closed     bool
+	stop, done chan struct{}
+	once       sync.Once
 }
 
 func (s *Service) Begin(ctx command.ProjectContext) error {
@@ -48,7 +64,25 @@ func (s *Service) Start(j models.Job) error {
 	if err := s.Store.StartJob(j); err != nil {
 		return err
 	}
-	s.runs.Store(j.ID, j)
+	run := &jobRun{job: j, stop: make(chan struct{}), done: make(chan struct{})}
+	s.runs.Store(j.ID, run)
+	go func() {
+		defer close(run.done)
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.flush(run)
+			case <-run.stop:
+				run.mu.Lock()
+				run.closed = true
+				s.flushLocked(run)
+				run.mu.Unlock()
+				return
+			}
+		}
+	}()
 	return nil
 }
 
@@ -57,8 +91,9 @@ func (s *Service) Finish(ctx command.ProjectContext, result command.ProjectComma
 	if result.Error != nil || result.Failure != "" {
 		message = "command failed"
 	}
-	if err := s.Complete(ctx.JobID, message); err != nil {
-		return err
+	finishErr := s.Complete(ctx.JobID, message)
+	if finishErr != nil {
+		return finishErr
 	}
 	completed, err := s.Store.Job(ctx.JobID)
 	if err != nil {
@@ -70,16 +105,27 @@ func (s *Service) Finish(ctx command.ProjectContext, result command.ProjectComma
 	return nil
 }
 
-// Complete records the outcome of a job this service started.
+// Complete flushes output before the database can mark the job terminal.
 func (s *Service) Complete(id, message string) error {
-	if _, ok := s.runs.LoadAndDelete(id); !ok {
-		return fmt.Errorf("job writer is missing")
+	value, ok := s.runs.LoadAndDelete(id)
+	if !ok {
+		return fmt.Errorf("job output writer is missing")
 	}
+	run := value.(*jobRun)
+	run.once.Do(func() { close(run.stop) })
+	<-run.done
+	run.mu.Lock()
+	logErr := run.err
+	run.mu.Unlock()
+	// Durable output is required for job completion; failures remain visible to callers.
 	state := "succeeded"
-	if message != "" {
+	if message != "" || logErr != nil {
 		state = "failed"
+		if logErr != nil {
+			message = "job output could not be persisted"
+		}
 	}
-	return s.Store.FinishJob(id, state, message)
+	return errors.Join(logErr, s.Store.FinishJob(id, state, message))
 }
 
 func jobFromContext(ctx command.ProjectContext) models.Job {
@@ -101,11 +147,87 @@ func jobFromContext(ctx command.ProjectContext) models.Job {
 		Revision: ctx.Pull.HeadCommit, State: "running", Private: ctx.SuppressJobOutput}
 }
 
-// Close rejects new jobs. Running jobs keep their claim and finish normally or
-// become uncertain at the next startup.
+func (s *Service) AppendLog(id, message string) error {
+	value, ok := s.runs.Load(id)
+	if !ok {
+		return fmt.Errorf("job output writer is missing")
+	}
+	run := value.(*jobRun)
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	if run.closed {
+		if run.err == nil {
+			run.err = fmt.Errorf("job output writer is closed")
+		}
+		return run.err
+	}
+	if run.err != nil {
+		return run.err
+	}
+	run.output.WriteString(message)
+	run.output.WriteByte('\n')
+	if run.output.Len() >= 64*1024 {
+		s.flushLocked(run)
+	}
+	return run.err
+}
+
+func (s *Service) flush(run *jobRun) { run.mu.Lock(); defer run.mu.Unlock(); s.flushLocked(run) }
+func (s *Service) flushLocked(run *jobRun) {
+	if run.err != nil || run.output.Len() == 0 {
+		return
+	}
+	journal, err := s.LogService()
+	if err != nil {
+		run.err = err
+		return
+	}
+	run.err = journal.Append(run.job.ID, []byte(run.output.String()))
+	run.output.Reset()
+}
+
+// Close flushes active writers without claiming that their commands completed.
 func (s *Service) Close() error {
 	s.lifecycle.Lock()
 	s.closed = true
 	s.lifecycle.Unlock()
-	return nil
+	var err error
+	s.runs.Range(func(_, value any) bool {
+		run := value.(*jobRun)
+		run.once.Do(func() { close(run.stop) })
+		<-run.done
+		run.mu.Lock()
+		err = errors.Join(err, run.err)
+		run.mu.Unlock()
+		return true
+	})
+	return err
+}
+
+func (s *Service) BeginHook(ctx models.WorkflowHookCommandContext) error {
+	return s.Start(models.Job{Kind: models.WorkflowHookJob, ID: ctx.HookID, Owner: ctx.Pull.ExecutionOwner(), Pull: ctx.Pull, Project: models.NewProject(ctx.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), Workspace: ctx.Workspace,
+		Command: ctx.HookStepName, Arguments: ctx.EscapedCommentArgs, Steps: ctx.HookDescription, Issuer: ctx.User, Trigger: "workflow-hook", Revision: ctx.Pull.HeadCommit, Private: ctx.SuppressJobOutput})
+}
+
+func (s *Service) FinishHook(id string, outcome error) error {
+	message := ""
+	if outcome != nil {
+		message = "workflow hook failed"
+	}
+	return s.Complete(id, message)
+}
+
+// LogService supplies a journal-only log service when callers do not need archival.
+func (s *Service) LogService() (*logs.Service, error) {
+	s.logsOnce.Do(func() {
+		if s.Logs == nil {
+			if store, ok := s.Store.(db.LogStore); ok {
+				s.Logs = &logs.Service{Records: store}
+			}
+		}
+	})
+	if s.Logs == nil {
+		return nil, fmt.Errorf("durable log store is unavailable")
+	}
+	return s.Logs, nil
 }

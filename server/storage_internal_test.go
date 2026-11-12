@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -92,4 +93,86 @@ func TestDurableMaintenanceRetriesLifecycleVerification(t *testing.T) {
 	Ok(t, err)
 	Equals(t, 0, len(pending))
 	Ok(t, store.AcquireClaim(pull, "verified"))
+}
+
+func runtimeLogJob(t *testing.T, runtime *storageRuntime) models.Job {
+	t.Helper()
+	pull := models.PullRequest{Num: -1, BaseRepo: models.Repo{FullName: "org/repo"}, Execution: &models.Execution{Owner: uuid.NewString()}}
+	Ok(t, runtime.Store.AcquireClaim(pull, pull.ExecutionOwner()))
+	job := models.Job{ID: uuid.NewString(), Kind: models.CommandJob, Command: "version", Pull: pull, Project: models.NewProject(pull.BaseRepo.FullName, ".", ""), Workspace: "default"}
+	Ok(t, runtime.Jobs.Start(job))
+	Ok(t, runtime.Jobs.AppendLog(job.ID, "persisted"))
+	Ok(t, runtime.Jobs.Complete(job.ID, ""))
+	Ok(t, runtime.Store.ReleaseClaim(pull))
+	return job
+}
+
+func TestDurableLogBackendWiring(t *testing.T) {
+	for _, mode := range []string{"", "database", "filesystem"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := sqlstore.OpenServer(t.TempDir())
+			Ok(t, err)
+			defer store.Close()
+			directory := t.TempDir()
+			artifactConfig := StorageArtifactsConfig{Type: mode}
+			if mode == "filesystem" {
+				artifactConfig.Directory = directory
+			}
+			runtime, err := newStorageRuntime(store, UserConfig{Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "sqlite"}, Artifacts: artifactConfig}})
+			Ok(t, err)
+			defer runtime.Artifacts.Blobs.Close()
+			Assert(t, runtime.Jobs.Logs == runtime.Logs, "job writers and maintenance use different log services")
+			job := runtimeLogJob(t, runtime)
+			data, err := runtime.Logs.ReadAll(job.ID)
+			Ok(t, err)
+			Equals(t, "persisted\n", string(data))
+			// Sealed output stays in the journal until maintenance runs, for every backend.
+			_, chunks, err := store.ReadLogJournal(job.ID, 0, 1024)
+			Ok(t, err)
+			Equals(t, "persisted\n", string(chunks))
+			Equals(t, mode == "filesystem", runtime.Logs.Archive != nil)
+		})
+	}
+}
+
+func TestDurableLogMaintenanceArchivesOutsideArtifactNamespace(t *testing.T) {
+	for _, mode := range []string{"database", "filesystem"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := sqlstore.OpenServer(t.TempDir())
+			Ok(t, err)
+			defer store.Close()
+			directory := t.TempDir()
+			artifactConfig := StorageArtifactsConfig{Type: mode}
+			if mode == "filesystem" {
+				artifactConfig.Directory = directory
+			}
+			runtime, err := newStorageRuntime(store, UserConfig{Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "sqlite"}, Artifacts: artifactConfig}})
+			Ok(t, err)
+			defer runtime.Artifacts.Blobs.Close()
+			job := runtimeLogJob(t, runtime)
+			runtime.Maintain(&events.PullClosedExecutor{}, logging.NewNoopLogger(t))()
+			info, remaining, err := store.ReadLogJournal(job.ID, 0, 1024)
+			Ok(t, err)
+			archivePath := filepath.Join(directory, filepath.FromSlash(logs.Key(job.ID)))
+			if mode == "filesystem" {
+				Assert(t, info.ArchivedAt != nil, "maintenance did not publish the completed archive")
+				Equals(t, 0, len(remaining))
+				object, err := os.ReadFile(archivePath)
+				Ok(t, err)
+				Equals(t, "persisted\n", string(object))
+				// Artifact orphan collection must leave the log namespace alone.
+				Ok(t, runtime.Artifacts.Collect(time.Now().Add(24*time.Hour), 0))
+				_, err = os.Stat(archivePath)
+				Ok(t, err)
+			} else {
+				Assert(t, info.ArchivedAt == nil, "database backend archived its final journal")
+				Equals(t, "persisted\n", string(remaining))
+				_, err = os.Stat(archivePath)
+				Assert(t, os.IsNotExist(err), "database backend wrote a log file")
+			}
+			data, err := runtime.Logs.ReadAll(job.ID)
+			Ok(t, err)
+			Equals(t, "persisted\n", string(data))
+		})
+	}
 }
