@@ -34,6 +34,7 @@ import (
 	prometheus "github.com/uber-go/tally/v4/prometheus"
 	"github.com/urfave/negroni/v3"
 
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/boltdb"
 	cfg "github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
@@ -130,6 +131,7 @@ type Server struct {
 	EnableProfilingAPI             bool
 	Experiments                    []string
 	database                       db.Database
+	artifactStore                  artifacts.SnapshotBackend
 	jobService                     *jobs.Service
 	storageMaintenance             func()
 	storageCancel                  context.CancelFunc
@@ -568,12 +570,14 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	storage := &storageRuntime{}
+	var artifactStore artifacts.SnapshotBackend
 	if sql, ok := database.(*sqlstore.Store); ok {
-		storage, err = newStorageRuntime(sql)
+		storage, err = newStorageRuntime(sql, userConfig)
 		if err != nil {
 			_ = database.Close()
 			return nil, err
 		}
+		artifactStore = storage.Artifacts.Blobs
 		commitStatusUpdater.ClaimCheck = sql.CheckClaim
 	}
 	noOpLocker := locking.NewNoOpLocker()
@@ -742,7 +746,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		Router:              router,
 	}
 	var planStore runtime.PlanStore
-	if userConfig.EnableExternalStores {
+	if storage.Store != nil {
+		planStore = storage.Artifacts
+	} else if userConfig.EnableExternalStores {
 		psCfg := globalCfg.ExternalStores.PlanStore
 		if psCfg.Type == "" {
 			return nil, fmt.Errorf("--enable-external-stores is set but no external_stores.plan_store.type is configured in the server-side repo config")
@@ -859,6 +865,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
 		Jobs:                    storage.Jobs,
+		Artifacts:               storage.Artifacts,
 		Execution:               storage.Execution,
 		VcsClient:               vcsClient,
 		VarFileAllowlistChecker: varFileAllowlistChecker,
@@ -1260,6 +1267,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
 		Experiments:                    slices.Clone(userConfig.Experiments),
 		database:                       database,
+		artifactStore:                  artifactStore,
 		jobService:                     storage.Jobs,
 		storageMaintenance:             storageMaintenance,
 	}
@@ -1473,6 +1481,9 @@ func (s *Server) closeDatabase(timeout time.Duration) error {
 	}()
 	select {
 	case err := <-done:
+		if s.artifactStore != nil {
+			err = errors.Join(err, s.artifactStore.Close())
+		}
 		return err
 	case <-time.After(timeout):
 		return fmt.Errorf("database close timed out after %s", timeout)

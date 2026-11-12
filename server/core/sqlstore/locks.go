@@ -109,8 +109,7 @@ func loadLocks(tx, query *gorm.DB) ([]models.ProjectLock, error) {
 }
 
 // locks reads and optionally removes the same rows in one transaction. Removal
-// locks each pull through guardRemoval, then deletes exactly the rows it returns
-// and discards their project status.
+// locks each pull through guardRemoval, then deletes exactly the rows it returns.
 func (s *Store) locks(where func(*gorm.DB) *gorm.DB, remove bool, owner string) ([]models.ProjectLock, error) {
 	var result []models.ProjectLock
 	err := s.db.Transaction(func(tx *gorm.DB) error {
@@ -128,7 +127,12 @@ func (s *Store) locks(where func(*gorm.DB) *gorm.DB, remove bool, owner string) 
 				}
 			}
 			for _, lock := range result {
-				if err := tx.Model(&projectStatus{}).Where("pull_id IN (?) AND project_id IN (?)", pullIDs(tx, lock.Pull.BaseRepo, lock.Pull.Num), projectIDs(tx, lock.Pull.BaseRepo, lock.Project, lock.Workspace)).Update("status", models.DiscardedPlanStatus).Error; err != nil {
+				if err := tx.Where("project_id IN (?) AND pull_id IN (?)", projectIDs(tx, lock.Pull.BaseRepo, lock.Project, lock.Workspace), pullIDs(tx, lock.Pull.BaseRepo, lock.Pull.Num)).Delete(&pendingPlan{}).Error; err != nil {
+					return err
+				}
+			}
+			for _, lock := range result {
+				if err := tx.Model(&projectStatus{}).Where("pull_id IN (?) AND project_id IN (?)", pullIDs(tx, lock.Pull.BaseRepo, lock.Pull.Num), projectIDs(tx, lock.Pull.BaseRepo, lock.Project, lock.Workspace)).Updates(map[string]any{"status": models.DiscardedPlanStatus, "plan_hash": ""}).Error; err != nil {
 					return err
 				}
 			}

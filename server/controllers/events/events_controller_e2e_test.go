@@ -1403,6 +1403,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 	if opt.durable != nil {
 		opt.durable.open(t)
 		database = opt.durable.Store
+		planStore = opt.durable.Artifacts
 	} else {
 		b, err := boltdb.New(dataDir)
 		Ok(t, err)
@@ -1588,6 +1589,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 	projectCommandRunner.EnvStepRunner = &runtime.EnvStepRunner{RunStepRunner: projectCommandRunner.RunStepRunner.(*runtime.RunStepRunner)}
 	if opt.durable != nil {
 		projectCommandRunner.Jobs = opt.durable.Jobs
+		projectCommandRunner.Artifacts = opt.durable.Artifacts
 		projectCommandRunner.Execution = opt.durable.Execution
 	}
 

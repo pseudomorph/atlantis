@@ -11,6 +11,47 @@ import (
 	. "github.com/runatlantis/atlantis/testing"
 )
 
+func TestPlanBindingConstraints(t *testing.T) {
+	s := conformanceStore(t)
+	p := claimPull()
+	p.Execution = &models.Execution{Owner: "owner"}
+	Ok(t, s.AcquireClaim(p, "owner"))
+	command := claimJob(p, uuid.NewString())
+	Ok(t, s.StartJob(command))
+	var row job
+	Ok(t, s.db.Where("id = ?", command.ID).Take(&row).Error)
+	ErrContains(t, "CHECK constraint failed", s.db.Create(&planBinding{JobID: row.ID, PlanJobID: row.ID, ProjectID: *row.ProjectID, PullID: row.PullID}).Error)
+	Ok(t, s.FinishJob(command.ID, "succeeded", ""))
+}
+
+func TestAdmissionRejectsInvalidReadyProducer(t *testing.T) {
+	for _, kind := range []string{"apply", "unfinished-plan"} {
+		t.Run(kind, func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			p.Execution = &models.Execution{Owner: "owner"}
+			Ok(t, s.AcquireClaim(p, "owner"))
+			producer := claimJob(p, uuid.NewString())
+			if kind == "apply" {
+				producer.Command = "apply"
+			}
+			Ok(t, s.StartJob(producer))
+			if kind == "apply" {
+				Ok(t, s.FinishJob(producer.ID, "succeeded", ""))
+			}
+			var row job
+			Ok(t, s.db.Where("id = ?", producer.ID).Take(&row).Error)
+			Ok(t, s.db.Create(&pendingPlan{ProjectID: *row.ProjectID, PullID: row.PullID, JobID: row.ID, Ready: true}).Error)
+			consumer := claimJob(p, uuid.NewString())
+			consumer.Command = "apply"
+			ErrContains(t, "not a completed plan", s.StartJob(consumer))
+			absent, err := s.Job(consumer.ID)
+			Ok(t, err)
+			Assert(t, absent == nil, "invalid producer admitted a consumer")
+		})
+	}
+}
+
 func TestCompletionWriteFailureRetainsProjectReservation(t *testing.T) {
 	s := conformanceStore(t)
 	p := claimPull()

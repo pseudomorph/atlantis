@@ -106,17 +106,17 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 ## Durable storage
 
 ::: warning Incomplete implementation
-This experiment implements the first SQLite portion of ADR 0005: project locks,
-global command locks, PR status, job history, execution claims, and
-cancellation. Plans, logs, PostgreSQL, and multi-instance operation are not
-durable yet.
+This experiment implements most of the SQLite portion of ADR 0005: project
+locks, global command locks, PR status, job history, execution claims,
+cancellation, and pending plans. Logs, PostgreSQL, and multi-instance operation
+are not durable yet.
 Use it only for development and testing.
 :::
 
 SQLite uses versioned Goose SQL migrations and works in CGO-disabled builds.
 The database owns project locks, global command locks, PR status, job records,
-execution claims, and cancellation requests. Plans stay in the working
-directory, as with BoltDB.
+pending-plan relationships, execution claims, and cancellation requests.
+Artifacts can use the database or a filesystem directory.
 
 ### Enable
 
@@ -129,11 +129,13 @@ data-dir: /var/lib/atlantis-durable
 storage:
   database:
     type: sqlite
+  artifacts:
+    type: database
 ```
 
 Supply the usual VCS credentials and repository allowlist. See
 [storage configuration](server-configuration.md#durable-storage-configuration)
-for details. Do not combine `storage` with `locking-db-type`, `share-plan-dir`,
+for artifact backends and retention settings. Do not combine `storage` with `locking-db-type`, `share-plan-dir`,
 or `enable-external-stores`.
 
 Experiment permission alone leaves the selected backend unchanged. Configuring
@@ -170,9 +172,36 @@ of this experiment.
   Locks and status are keyed by VCS instance, so same-named repositories on
   different instances never share them. Working directories and their in-process
   locks include the VCS instance to prevent same-named repo collisions.
-- Keep `data-dir` on persistent storage. It holds the database and the working
-  directories with their plans; losing it loses locks, PR status, job history,
-  execution claims, and pending plans.
+- Keep `data-dir` on persistent storage. It holds the database; losing it loses
+  locks, PR status, job history, execution claims, pending plans, and the records
+  that locate artifacts in any backend.
+- Each producing plan job owns one immutable snapshot bundle on the database
+  or filesystem backend. Its manifest binds plan, lock-file, initialization,
+  and declared workflow files to their paths and checksums. Apply and policy checks
+  use the snapshot selected at admission; restoration verifies the archive and its
+  members. A lost or cleaned working directory is restored from the snapshot.
+- Plans also capture the project's `.terraform.lock.hcl`. Custom workflow files
+  or directories must be declared in `storage.workflow_files` to survive loss of
+  a working directory. Snapshot bundles support regular files and directories;
+  symlinks, hard links, state files, and provider caches are excluded. A custom
+  plan workflow must declare its output files in `storage.workflow_files`; a
+  successful command with no recoverable output fails the plan stage.
+- Managed plan consumers initialize restored provider/backend data before apply
+  or policy checks. The producing job records the exact Terraform/OpenTofu
+  distribution and version; a changed version requires a new plan. Terraform
+  0.14.x follows the restored dependency lock file without `-upgrade`; Terraform
+  0.15+ and OpenTofu additionally use `-lockfile=readonly`. Earlier Terraform
+  keeps its existing workflow behavior and requires explicitly configured init.
+  Plan workflows with custom setup or init arguments require an explicit init
+  step in the apply/policy workflow; argument values are not replayed from history.
+- Backend initialization metadata and the project-local `TF_DATA_DIR` are bound
+  to the plan. A changed data directory, external data directory, missing input,
+  checksum mismatch, or unsafe initialization flag rejects restoration. Declare
+  files referenced by init arguments in `storage.workflow_files`. Custom setup
+  outside an initial built-in init step requires an explicit apply/policy init.
+  Terraform state itself is not backed up by artifact storage.
+- Job records survive artifact cleanup. Retention protects pending plans, running
+  consumers, and uncertain executions.
 - Every command, autoplan, unlock, and API call holds an execution claim on its
   PR or API invocation for its whole run, including hooks and publication. Each
   project command records a job with its issuer, trigger, revision, arguments,
@@ -180,7 +209,7 @@ of this experiment.
   values are not stored.
 - `atlantis cancel` prevents queued jobs from starting; running jobs continue to
   completion while their execution claim remains held. Active-process interruption
-  is deferred. After a crash, prior claims become uncertain and block new commands
+  is deferred. PR closure invalidates pending plans. After a crash, prior claims become uncertain and block new commands
   on the affected PR or API invocation. They never permit automatic Terraform
   retries. There are no heartbeats or expiring leases in this single-instance
   implementation.
@@ -214,9 +243,9 @@ atlantis unlock --confirm-stopped
 ```
 
 This is an operator attestation, not automatic process detection. Recovery records
-its actor, previous owner, and timestamp; marks unfinished jobs interrupted; and
-acquires recovery ownership in one transaction. Unlock then releases the PR's
-reservations and deletes its plans. Job history remains available. A failed
+its actor, previous owner, and timestamp; marks unfinished jobs interrupted;
+invalidates pending plans; and acquires recovery ownership in one transaction.
+Unlock then releases the PR's reservations. Job history remains available. A failed
 recovery write rolls back; uncertain work never permits automatic retry. If apply
 may have changed infrastructure, inspect its outcome and create a fresh plan. Do
 not retry the old saved plan.
@@ -243,17 +272,18 @@ credential as an operator recovery capability.
 
 The UI directs non-PR reservation recovery to this endpoint and does not override
 uncertain ownership. To abandon a test database instead,
-stop Atlantis, verify stopped work, preserve a matching database backup,
+stop Atlantis, verify stopped work, preserve matching database/artifact backups,
 then use a fresh data directory and replan all open PRs. This does not recover
 history or migrate existing plans.
 
 ### Disable, upgrade, and roll back
 
-Stop Atlantis before backing up the database. For SQLite, include WAL sidecars or
-use a consistent SQLite backup.
+Stop Atlantis before backing up the database and artifact storage. For SQLite,
+include WAL sidecars or use a consistent SQLite backup. Preserve filesystem
+artifacts with the matching database backup.
 
 To disable or roll back, drain commands, independently verify Terraform has stopped,
-and retain matching binary, configuration, and database backups. Remove
+and retain matching binary, configuration, database, and artifact backups. Remove
 `storage` and experiment permission when returning to a legacy configuration.
 A legacy server started on a data directory that contains durable storage logs a
 warning and runs on its legacy backend; it ignores the locks and plans recorded there.
@@ -262,9 +292,9 @@ does not migrate state.
 
 ### Durable storage graduation checklist
 
-- [ ] Validate locks, status, jobs, and claims against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job recording and history preservation for uncertain executions.
+- [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
 - [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
-- [ ] Verify restoring pending plans across restarts and PR cleanup.
+- [ ] Verify artifact retention and restoring pending plans across restarts and PR cleanup.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.
 

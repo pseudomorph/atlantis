@@ -18,6 +18,7 @@ func TestUnlockRecoveryRequiresStoppedAttestation(t *testing.T) {
 	Ok(t, s.AcquireClaim(p, "crashed"))
 	j := claimJob(p, uuid.NewString())
 	Ok(t, s.StartJob(j))
+	Ok(t, s.StartPlan(j.ID))
 	lock := models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace}
 	acquired, _, err := s.TryLock(lock)
 	Ok(t, err)
@@ -35,6 +36,9 @@ func TestUnlockRecoveryRequiresStoppedAttestation(t *testing.T) {
 	Ok(t, s.db.Where("id = ?", j.ID).Take(&old).Error)
 	Equals(t, "interrupted", old.State)
 	Assert(t, old.FinishedAt != nil, "interrupted job lacks completion time")
+	var pending int64
+	Ok(t, s.db.Table("pending_plans").Count(&pending).Error)
+	Equals(t, int64(0), pending)
 	var actor string
 	Ok(t, s.db.Table("execution_recoveries").Select("actor").Scan(&actor).Error)
 	Equals(t, "operator", actor)

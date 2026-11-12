@@ -4,6 +4,7 @@
 package sqlstore
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -42,7 +43,7 @@ func TestGeneratedStorageTimestamps(t *testing.T) {
 		s := conformanceStore(t)
 		// Missing timestamps must not fall through to GORM's application clock.
 		s.db.NowFunc = func() time.Time { return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC) }
-		before, err := databaseNow(s.db)
+		before, err := s.Now()
 		Ok(t, err)
 		p := claimPull()
 		Ok(t, s.AcquireClaim(p, "owner"))
@@ -54,17 +55,30 @@ func TestGeneratedStorageTimestamps(t *testing.T) {
 		acquired, projectLock, err := s.TryLock(models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace})
 		Ok(t, err)
 		Assert(t, acquired, "project lock unavailable")
+		Ok(t, s.StartPlan(j.ID))
+		snapshot := validSnapshot(j.ID)
+		Ok(t, s.BeginSnapshot(snapshot))
+		blobs := BlobStore{Store: s}
+		meta, err := blobs.PutSnapshot(j.ID, strings.NewReader("output"))
+		Ok(t, err)
+		snapshot.Size, snapshot.SHA256 = meta.Size, meta.SHA256
+		Ok(t, s.CommitSnapshot(snapshot))
+
 		Ok(t, s.FinishJob(j.ID, "succeeded", ""))
 		Ok(t, s.ClosePull(p))
 		job, err := s.Job(j.ID)
 		Ok(t, err)
 		Assert(t, job.FinishedAt != nil, "job did not finish")
+		published, err := s.Snapshot(j.ID)
+		Ok(t, err)
+		Assert(t, published != nil, "snapshot is missing")
 		var closed struct{ ClosedAt time.Time }
 		Ok(t, s.db.Table("pulls").Select("closed_at").Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&closed).Error)
-		after, err := databaseNow(s.db)
+		after, err := s.Now()
 		Ok(t, err)
 		for name, instant := range map[string]time.Time{
-			"job start": job.StartedAt, "job finish": *job.FinishedAt, "closure": closed.ClosedAt, "lock": projectLock.Time,
+			"job start": job.StartedAt, "job finish": *job.FinishedAt, "snapshot": published.CreatedAt,
+			"closure": closed.ClosedAt, "lock": projectLock.Time,
 		} {
 			Assert(t, !instant.Before(before) && !instant.After(after), "%s timestamp did not come from the database clock", name)
 			Equals(t, 0, instant.Nanosecond()%1000)
@@ -83,10 +97,17 @@ func TestEqualJobTimestampsHaveStableOrder(t *testing.T) {
 			j.StartedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 			j.Project = models.NewProject(p.BaseRepo.FullName, ".", id)
 			Ok(t, s.StartJob(j))
+			Ok(t, s.StartPlan(j.ID))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			Ok(t, s.FinishJob(id, "succeeded", ""))
 		}
 		jobs, err := s.Jobs()
 		Ok(t, err)
+		plans, err := s.PendingPlans(p.BaseRepo, p.Num)
+		Ok(t, err)
 		Equals(t, []string{"a", "b"}, []string{jobs[0].ID, jobs[1].ID})
+		Equals(t, []string{"a", "b"}, []string{plans[0].ID, plans[1].ID})
 	})
 }
