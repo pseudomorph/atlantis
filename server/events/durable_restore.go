@@ -7,9 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 )
 
 // prepareDurableRestore applies only to managed saved-plan consumers. Custom
@@ -60,15 +60,18 @@ func (p *DefaultProjectCommandRunner) prepareDurableRestore(ctx command.ProjectC
 			return ctx, nil, false, nil
 		}
 	}
-	var planSteps []valid.Step
+	var planSteps []models.JobStep
 	if err := json.Unmarshal([]byte(plan.Steps), &planSteps); err != nil {
 		return ctx, nil, false, fmt.Errorf("reading plan initialization steps: %w", err)
 	}
 	for _, step := range planSteps {
-		if step.StepName == "init" {
-			return ctx, step.ExtraArgs, true, nil
+		if step.Name == "init" {
+			if step.HasExtraArgs {
+				return ctx, nil, false, fmt.Errorf("plan initialization used custom arguments; configure an explicit init step in the apply/policy workflow")
+			}
+			return ctx, nil, true, nil
 		}
-		if step.StepName != "env" && step.StepName != "multienv" {
+		if step.Name != "env" && step.Name != "multienv" {
 			break
 		}
 	}

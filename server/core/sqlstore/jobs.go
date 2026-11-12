@@ -87,7 +87,7 @@ func (s *Store) StartJob(want models.Job) error {
 		if err := tx.Create(&row).Error; err != nil {
 			return fmt.Errorf("creating job: %w", err)
 		}
-		return nil
+		return tx.Create(&logStream{LogStream: models.LogStream{JobID: row.ID}}).Error
 	})
 }
 
@@ -119,6 +119,12 @@ func (s *Store) FinishJob(id, state, message string) error {
 		}
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("job %q is no longer running", id)
+		}
+		if err := sealLog(tx, id, now, false); err != nil {
+			return err
+		}
+		if err := anchorFinishedLog(tx, row, now); err != nil {
+			return err
 		}
 		if row.Kind == models.CommandJob && row.Command == "plan" {
 			if state != "succeeded" || closed.Closed {

@@ -107,6 +107,23 @@ func (s *S3) Put(key string, r io.Reader) (Metadata, error) {
 	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Body: file, ContentLength: aws.Int64(size)})
 	return Metadata{size, fmt.Sprintf("%x", hash.Sum(nil))}, err
 }
+func (s *S3) OpenRange(key string, offset, length int64) (io.ReadCloser, error) {
+	if !validRange(offset, length) {
+		return nil, fmt.Errorf("invalid artifact range")
+	}
+	key, err := s.key(key)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(key), Range: aws.String(fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &cancelReader{ReadCloser: out.Body, cancel: cancel}, nil
+}
+
 func (s *S3) Open(key string) (io.ReadCloser, error) {
 	key, err := s.key(key)
 	if err != nil {

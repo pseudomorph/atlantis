@@ -48,3 +48,9 @@ type Artifact struct {
 	SHA256       string
 	CreatedAt    time.Time
 }
+
+// JobStep preserves workflow order without persisting commands or argument values.
+type JobStep struct {
+	Name         string `json:"name"`
+	HasExtraArgs bool   `json:"has_extra_args,omitempty"`
+}

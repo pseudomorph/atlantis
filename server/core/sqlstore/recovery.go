@@ -97,6 +97,14 @@ func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor str
 		if err := tx.Table("jobs").Where("pull_id = ? AND state = ?", pullID, "running").Updates(map[string]any{"state": "interrupted", "error": "operator reconciled stopped execution", "finished_at": now}).Error; err != nil {
 			return err
 		}
+		if err := tx.Model(&logStream{}).Where("job_id IN (?) AND sealed_at IS NULL", tx.Model(&job{}).Select("id").Where("pull_id = ?", pullID)).Updates(map[string]any{"sealed_at": now, "interrupted": true}).Error; err != nil {
+			return err
+		}
+		if p.Num < 0 {
+			if err := tx.Model(&logStream{}).Where("job_id IN (?) AND retention_started_at IS NULL", tx.Model(&job{}).Select("id").Where("pull_id = ?", pullID)).Update("retention_started_at", now).Error; err != nil {
+				return err
+			}
+		}
 		if err := tx.Where("pull_id = ?", pullID).Delete(&pendingPlan{}).Error; err != nil {
 			return err
 		}

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -23,7 +24,7 @@ func TestDurableOutputSurvivesCleanupAndRestart(t *testing.T) {
 	Ok(t, err)
 	blobs, err := artifacts.NewFilesystem(artifactDir)
 	Ok(t, err)
-	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+	service := &jobs.Service{Store: db, Logs: &logs.Service{Records: db, Mode: "database"}, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
 	handler := &jobs.DurableOutputHandler{Service: service}
 	repo := models.Repo{FullName: "org/repo", VCSHost: models.VCSHost{Hostname: "git.example"}}
 	ctx := command.ProjectContext{JobID: uuid.NewString(), CommandName: command.Version, BaseRepo: repo, Pull: models.PullRequest{BaseRepo: repo, Num: 1}, RepoRelDir: ".", Workspace: "default", Log: logging.NewNoopLogger(t)}
@@ -41,7 +42,7 @@ func TestDurableOutputSurvivesCleanupAndRestart(t *testing.T) {
 	blobs, err = artifacts.NewFilesystem(artifactDir)
 	Ok(t, err)
 	defer blobs.Close()
-	handler = &jobs.DurableOutputHandler{Service: &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}}
+	handler = &jobs.DurableOutputHandler{Service: &jobs.Service{Store: db, Logs: &logs.Service{Records: db, Mode: "database"}, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}}
 	Assert(t, handler.IsKeyExists(ctx.JobID), "lost job on restart")
 	receiver := make(chan string, 4)
 	go handler.Register(ctx.JobID, receiver)

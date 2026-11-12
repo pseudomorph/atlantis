@@ -258,7 +258,16 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 // MarkPreviousExecutionsUncertain blocks work left by the prior server.
 // The SQLite process lock proves the server exited, not that Terraform children stopped.
 func (s *Store) MarkPreviousExecutionsUncertain() error {
-	return s.db.Model(&executionClaim{}).Where("state = ?", "active").Update("state", "uncertain").Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&executionClaim{}).Where("state = ?", "active").Update("state", "uncertain").Error; err != nil {
+			return err
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&logStream{}).Where("sealed_at IS NULL").Updates(map[string]any{"sealed_at": now, "interrupted": true}).Error
+	})
 }
 
 // ClaimCleanup serializes destructive cleanup with other cleaners and commands.
@@ -317,6 +326,9 @@ func (s *Store) CheckExecutionStopped(p models.PullRequest) error {
 // Each log's retention clock belongs to the closure after its job, not to a later
 // reopen/close cycle of the same PR. Final cleanup also anchors late log chunks.
 func anchorClosedLogs(tx *gorm.DB, pullID string) error {
+	if err := anchorLogRetention(tx, pullID); err != nil {
+		return err
+	}
 	return tx.Exec(`UPDATE artifacts SET unreferenced_at = (SELECT closed_at FROM pulls WHERE id = ?)
       WHERE kind = 'log' AND unreferenced_at IS NULL AND job_id IN (SELECT id FROM jobs WHERE pull_id = ?)`, pullID, pullID).Error
 }

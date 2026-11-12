@@ -6,7 +6,6 @@ package jobs_test
 import (
 	"crypto/sha256"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +15,9 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -34,7 +36,7 @@ func setup(t *testing.T) (*jobs.Service, string) {
 	blobs, err := artifacts.NewFilesystem(dir)
 	Ok(t, err)
 	t.Cleanup(func() { _ = blobs.Close() })
-	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+	service := &jobs.Service{Store: db, Logs: &logs.Service{Records: db, Mode: "database"}, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
 	t.Cleanup(func() { _ = service.Close() })
 	return service, dir
 }
@@ -67,7 +69,7 @@ func TestJobArtifactsAndPendingPlanBinding(t *testing.T) {
 	Assert(t, j.FinishedAt != nil, "job never finished")
 	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 3, len(records))
+	Equals(t, 2, len(records))
 	for _, a := range records {
 		Assert(t, a.Size > 0 && len(a.SHA256) == 64, "missing artifact integrity metadata")
 		_, err := os.Stat(filepath.Join(root, a.Location))
@@ -107,8 +109,8 @@ func TestJobArtifactsAndPendingPlanBinding(t *testing.T) {
 	Equals(t, 3, len(jobs))
 	records, err = service.Artifacts.Records.Artifacts(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 3, len(records))
-	log, err := service.Artifacts.ReadLog(ctx.JobID)
+	Equals(t, 2, len(records))
+	log, err := service.Logs.ReadAll(ctx.JobID)
 	Ok(t, err)
 	Equals(t, "planning\n", string(log))
 }
@@ -181,7 +183,7 @@ func TestRecoveryKeepsUncertainExecutionHistory(t *testing.T) {
 	j, err := service.Store.Job(apply.JobID)
 	Ok(t, err)
 	Equals(t, "running", j.State)
-	log, err := service.Artifacts.ReadLog(apply.JobID)
+	log, err := service.Logs.ReadAll(apply.JobID)
 	Ok(t, err)
 	Equals(t, "applying\n", string(log))
 	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
@@ -297,7 +299,7 @@ func TestLogChunksPersistDuringExecutionAndReplayOnce(t *testing.T) {
 	Ok(t, service.AppendLog(ctx.JobID, "first"))
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		data, err := service.Artifacts.ReadLog(ctx.JobID)
+		data, err := service.Logs.ReadAll(ctx.JobID)
 		Ok(t, err)
 		if string(data) == "first\n" {
 			break
@@ -330,15 +332,15 @@ func TestLogChunksPersistDuringExecutionAndReplayOnce(t *testing.T) {
 	}
 }
 
-type rejectedArtifactStore struct{ artifacts.Store }
+type rejectedLogStore struct{ db.LogStore }
 
-func (rejectedArtifactStore) Put(string, io.Reader) (artifacts.Metadata, error) {
-	return artifacts.Metadata{}, fmt.Errorf("injected artifact write failure")
+func (rejectedLogStore) AppendLogChunk(string, []byte) error {
+	return fmt.Errorf("injected journal write failure")
 }
 
 func TestLogWriteFailurePreventsSuccessfulCompletion(t *testing.T) {
 	service, _ := setup(t)
-	service.Artifacts.Blobs = rejectedArtifactStore{service.Artifacts.Blobs}
+	service.Logs.Records = rejectedLogStore{service.Logs.Records}
 	ctx := projectContext(t)
 	claimContext(t, service, &ctx)
 	Ok(t, service.Begin(ctx))
@@ -360,7 +362,7 @@ func TestShutdownPreservesLogFailuresUntilCompletion(t *testing.T) {
 			claimContext(t, service, &ctx)
 			Ok(t, service.Begin(ctx))
 			if failure == "flush" {
-				service.Artifacts.Blobs = rejectedArtifactStore{service.Artifacts.Blobs}
+				service.Logs.Records = rejectedLogStore{service.Logs.Records}
 				Ok(t, service.AppendLog(ctx.JobID, "output"))
 				Assert(t, service.Close() != nil, "shutdown ignored failed output flush")
 			} else {
@@ -428,7 +430,10 @@ func TestHookOutcomeDoesNotChangePendingPlan(t *testing.T) {
 func TestConcurrentPlanLogsAndRetention(t *testing.T) {
 	for _, backend := range []string{"filesystem", "database"} {
 		t.Run(backend, func(t *testing.T) {
-			service, _ := setup(t)
+			service, outputRoot := setup(t)
+			if backend == "filesystem" {
+				service.Logs.Mode, service.Logs.Directory = "filesystem", filepath.Join(outputRoot, "job-output")
+			}
 			if backend == "database" {
 				service.Artifacts.Blobs = sqlstore.BlobStore{Store: service.Store.(*sqlstore.Store)}
 			}
@@ -481,7 +486,7 @@ func TestConcurrentPlanLogsAndRetention(t *testing.T) {
 				Ok(t, err)
 			}
 			Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
-			log, err := service.Artifacts.ReadLog(ctx.JobID)
+			log, err := service.Logs.ReadAll(ctx.JobID)
 			Ok(t, err)
 			Equals(t, 16*(64*1024+1), len(log))
 			pending, err := service.Artifacts.Records.PendingPlans(ctx.BaseRepo, ctx.Pull.Num)
@@ -516,4 +521,22 @@ func TestPlanSnapshotRestoresDependencyLockFile(t *testing.T) {
 	content, err := os.ReadFile(lockFile)
 	Ok(t, err)
 	Equals(t, "provider selections at plan time", string(content))
+}
+
+func TestPersistedStepsExcludeInlineSecrets(t *testing.T) {
+	service, _ := setup(t)
+	ctx := projectContext(t)
+	ctx.Steps = []valid.Step{
+		{StepName: "env", EnvVarName: "TOKEN", EnvVarValue: "distinct-inline-secret", RunCommand: "echo distinct-command-secret"},
+		{StepName: "run", RunCommand: "curl --token distinct-command-secret", ExtraArgs: []string{"distinct-argument-secret"}},
+	}
+	claimContext(t, service, &ctx)
+	Ok(t, service.Begin(ctx))
+	stored, err := service.Store.Job(ctx.JobID)
+	Ok(t, err)
+	Equals(t, `[{"name":"env"},{"name":"run","has_extra_args":true}]`, stored.Steps)
+	for _, secret := range []string{"distinct-inline-secret", "distinct-command-secret", "distinct-argument-secret"} {
+		Assert(t, !strings.Contains(stored.Steps, secret), "inline workflow secret persisted")
+	}
+	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 }

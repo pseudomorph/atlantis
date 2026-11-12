@@ -52,7 +52,12 @@ func (h *DurableOutputHandler) Register(id string, receiver chan string) {
 	h.receivers[receiver] = cancel
 	h.mu.Unlock()
 	defer func() { cancel(); h.mu.Lock(); delete(h.receivers, receiver); h.mu.Unlock(); close(receiver) }()
-	var sequence int64
+	journal, err := h.Service.LogService()
+	if err != nil {
+		return
+	}
+	var offset int64
+	var partial string
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -60,11 +65,12 @@ func (h *DurableOutputHandler) Register(id string, receiver chan string) {
 		if err != nil || job == nil || job.Private {
 			return
 		}
-		data, next, err := h.Service.Artifacts.ReadLogAfter(*job, sequence)
+		data, next, err := journal.ReadAfter(job.ID, offset)
 		if err != nil {
 			return
 		}
-		lines := strings.Split(string(data), "\n")
+		lines := strings.Split(partial+string(data), "\n")
+		partial = lines[len(lines)-1]
 		lines = lines[:len(lines)-1]
 		for _, line := range lines {
 			select {
@@ -73,8 +79,22 @@ func (h *DurableOutputHandler) Register(id string, receiver chan string) {
 				return
 			}
 		}
-		sequence = next
-		if job.State != "running" {
+		offset = next
+		if len(data) != 0 {
+			continue
+		}
+		stream, err := journal.Info(id)
+		// A final flush may commit between the empty read and the seal check.
+		if err == nil && stream != nil && stream.DeletedAt == nil && stream.ByteLength > offset {
+			continue
+		}
+		if err != nil || stream == nil || stream.SealedAt != nil || job.State != "running" {
+			if partial != "" {
+				select {
+				case receiver <- partial:
+				case <-ctx.Done():
+				}
+			}
 			return
 		}
 		select {

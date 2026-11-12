@@ -13,6 +13,7 @@ import (
 
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 )
@@ -20,6 +21,8 @@ import (
 type Service struct {
 	Store     db.JobStore
 	Artifacts *artifacts.Service
+	Logs      *logs.Service
+	logsOnce  sync.Once
 	runs      sync.Map
 	lifecycle sync.RWMutex
 	closed    bool
@@ -37,11 +40,15 @@ type jobRun struct {
 
 func (s *Service) Begin(ctx command.ProjectContext) error {
 	j := jobFromContext(ctx)
-	steps, err := json.Marshal(ctx.Steps)
+	steps := make([]models.JobStep, 0, len(ctx.Steps))
+	for _, step := range ctx.Steps {
+		steps = append(steps, models.JobStep{Name: step.StepName, HasExtraArgs: len(step.ExtraArgs) > 0})
+	}
+	encodedSteps, err := json.Marshal(steps)
 	if err != nil {
 		return err
 	}
-	j.Steps = string(steps)
+	j.Steps = string(encodedSteps)
 	return s.Start(j)
 }
 
@@ -171,7 +178,12 @@ func (s *Service) flushLocked(run *jobRun) {
 	if run.err != nil || run.output.Len() == 0 {
 		return
 	}
-	run.err = s.Artifacts.Publish(run.job, "log", "", strings.NewReader(run.output.String()))
+	journal, err := s.LogService()
+	if err != nil {
+		run.err = err
+		return
+	}
+	run.err = journal.Append(run.job.ID, []byte(run.output.String()))
 	run.output.Reset()
 }
 
@@ -204,4 +216,19 @@ func (s *Service) FinishHook(id string, outcome error) error {
 		message = "workflow hook failed"
 	}
 	return s.Complete(id, message)
+}
+
+// LogService supplies a database journal when callers don't need external archival.
+func (s *Service) LogService() (*logs.Service, error) {
+	s.logsOnce.Do(func() {
+		if s.Logs == nil {
+			if store, ok := s.Store.(db.LogStore); ok {
+				s.Logs = &logs.Service{Records: store, Mode: "database"}
+			}
+		}
+	})
+	if s.Logs == nil {
+		return nil, fmt.Errorf("durable log store is unavailable")
+	}
+	return s.Logs, nil
 }
