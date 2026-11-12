@@ -1383,7 +1383,6 @@ var UnlockUsage = "`Usage of unlock:`\n\n ```cmake\n" +
 	`atlantis unlock
 
   Unlocks the entire PR and discards all plans in this PR.
-  Arguments or flags are not supported at the moment.
   If you need to unlock a specific project please use the atlantis UI.` +
 	"\n```"
 

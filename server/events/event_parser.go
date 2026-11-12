@@ -108,6 +108,8 @@ func (c AutoplanCommand) IsAutoplan() bool {
 
 // CommentCommand is a command that was triggered by a pull request comment.
 type CommentCommand struct {
+	// ConfirmStopped is an operator attestation for uncertain durable executions.
+	ConfirmStopped bool
 	// RepoRelDir is the path relative to the repo root to run the command in.
 	// Will never end in "/". If empty then the comment specified no directory.
 	RepoRelDir string

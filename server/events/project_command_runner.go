@@ -1435,12 +1435,13 @@ func (p *DefaultProjectCommandRunner) withDurableJob(ctx command.ProjectContext,
 		return command.ProjectCommandOutput{Error: fmt.Errorf("starting durable job: %w", err)}
 	}
 	defer func() {
+		result.JobID = ctx.JobID
 		crashed := recover()
 		if crashed != nil {
 			result.Error = fmt.Errorf("command panicked: %v", crashed)
 		}
 		if err := p.Jobs.Finish(ctx, result); err != nil {
-			result.Error = errors.Join(result.Error, fmt.Errorf("finishing durable job: %w", err))
+			result.Error = errors.Join(result.Error, fmt.Errorf("finishing durable job %s: %w", ctx.JobID, err))
 		}
 		if crashed != nil {
 			panic(crashed)

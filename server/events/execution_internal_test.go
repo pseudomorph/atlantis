@@ -99,7 +99,7 @@ func TestAPICollisionRetriesBeforeReturningExecutionContext(t *testing.T) {
 	Ok(t, store.ReleaseClaim(historical))
 	attempts := 0
 	coordinator := &ExecutionCoordinator{Store: store, NewAPIPullNumber: func() int { attempts++; return -2 }}
-	ctx := &command.Context{Pull: models.PullRequest{Num: -1, BaseRepo: repo}, Log: logging.NewNoopLogger(t)}
+	ctx := &command.Context{API: true, Pull: models.PullRequest{Num: -1, BaseRepo: repo}, Log: logging.NewNoopLogger(t)}
 	release, err := coordinator.Acquire(ctx)
 	Ok(t, err)
 	defer release()
@@ -108,6 +108,6 @@ func TestAPICollisionRetriesBeforeReturningExecutionContext(t *testing.T) {
 	Ok(t, store.CheckClaim(ctx.Pull))
 
 	coordinator.NewAPIPullNumber = func() int { return -1 }
-	_, err = coordinator.Acquire(&command.Context{Pull: models.PullRequest{Num: -1, BaseRepo: repo}, Log: ctx.Log})
+	_, err = coordinator.Acquire(&command.Context{API: true, Pull: models.PullRequest{Num: -1, BaseRepo: repo}, Log: ctx.Log})
 	Assert(t, err != nil, "exhausted collision retries reused historical identity")
 }

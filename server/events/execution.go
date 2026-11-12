@@ -13,6 +13,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
+	"github.com/runatlantis/atlantis/server/logging"
 )
 
 type ExecutionCoordinator struct {
@@ -24,6 +25,15 @@ type ExecutionCoordinator struct {
 
 // Acquire owns the whole command, including hooks, policy, publication and cleanup.
 func (s *ExecutionCoordinator) Acquire(ctx *command.Context) (func(), error) {
+	return s.acquire(ctx, false, false)
+}
+
+// AcquireUnlock gives reconciliation its own admission path, including closed PRs.
+func (s *ExecutionCoordinator) AcquireUnlock(ctx *command.Context, confirmedStopped bool) (func(), error) {
+	return s.acquire(ctx, true, confirmedStopped)
+}
+
+func (s *ExecutionCoordinator) acquire(ctx *command.Context, unlock, confirmedStopped bool) (func(), error) {
 	if ctx.Pull.ExecutionOwner() != "" {
 		if err := s.Store.CheckClaim(ctx.Pull); err != nil {
 			return nil, err
@@ -43,8 +53,19 @@ func (s *ExecutionCoordinator) Acquire(ctx *command.Context) (func(), error) {
 	ctx.Pull.BaseRepo.Execution = handle
 	var claimErr error
 	for attempt := 0; attempt < 8; attempt++ {
-		claimErr = s.Store.AcquireClaim(ctx.Pull, handle.Owner)
-		if !errors.Is(claimErr, db.ErrSyntheticPullCollision) || ctx.Pull.Num >= 0 {
+		if unlock {
+			recovery, ok := s.Store.(interface {
+				AcquireUnlockClaim(models.PullRequest, string, string, bool) error
+			})
+			if !ok {
+				claimErr = fmt.Errorf("execution recovery is unavailable")
+			} else {
+				claimErr = recovery.AcquireUnlockClaim(ctx.Pull, handle.Owner, ctx.User.Username, confirmedStopped)
+			}
+		} else {
+			claimErr = s.Store.AcquireClaim(ctx.Pull, handle.Owner)
+		}
+		if !errors.Is(claimErr, db.ErrSyntheticPullCollision) || !ctx.API || ctx.Pull.Num >= 0 {
 			break
 		}
 		next := s.NewAPIPullNumber
@@ -97,4 +118,39 @@ func newAPIPullNumber() int {
 		n = 1
 	}
 	return -n
+}
+
+// RecoverAPIJob addresses existing API ownership by job UUID. It never enters
+// fresh-request allocation, including when the invocation has a negative PR ID.
+func (s *ExecutionCoordinator) RecoverAPIJob(id, actor string, logger logging.SimpleLogging) (models.PullRequest, func(), error) {
+	finish := func() {}
+	if s.Drainer != nil {
+		if !s.Drainer.StartOp() {
+			return models.PullRequest{}, nil, fmt.Errorf("server is shutting down")
+		}
+		finish = s.Drainer.OpDone
+	}
+	store, ok := s.Store.(interface {
+		AcquireAPIJobUnlock(string, string, string, bool) (models.PullRequest, error)
+	})
+	if !ok {
+		finish()
+		return models.PullRequest{}, nil, fmt.Errorf("API job recovery is unavailable")
+	}
+	pull, err := store.AcquireAPIJobUnlock(id, "recovery:"+uuid.NewString(), actor, true)
+	if err != nil {
+		finish()
+		return models.PullRequest{}, nil, err
+	}
+	handle := pull.Execution
+	handle.Release = func() {
+		defer finish()
+		if err := s.Store.ReleaseClaim(pull); err != nil {
+			logger.Err("releasing API recovery ownership: %v", err)
+			if err := s.Store.MarkUncertain(pull); err != nil {
+				logger.Err("marking API recovery uncertain: %v", err)
+			}
+		}
+	}
+	return pull, handle.Close, nil
 }
