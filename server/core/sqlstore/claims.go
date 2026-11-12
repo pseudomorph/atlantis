@@ -33,9 +33,6 @@ func (s *Store) AcquireClaim(p models.PullRequest, owner string) error {
 	if owner == "" {
 		return fmt.Errorf("invalid execution claim")
 	}
-	if err := s.checkServerLock(); err != nil {
-		return err
-	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		row, err := savePull(tx, p)
 		if err != nil {
@@ -322,10 +319,16 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 }
 
 // MarkPreviousExecutionsUncertain blocks work left by earlier server instances
-// without waiting for their claims to expire. The server lock (the SQLite file
-// lock or the PostgreSQL advisory lock) proves the earlier server exited or lost
-// its lock, not that Terraform children stopped.
+// without waiting for their claims to expire. With SQLite the data directory
+// lock proves the earlier server exited, not that Terraform children stopped.
+// With PostgreSQL other servers may share the database and hold live claims, so
+// startup marks only claims of this instance, and instance IDs are new in each
+// process, so there are none. Claims of a server that stopped become uncertain
+// when the expiry sweep finds their heartbeat expired.
 func (s *Store) MarkPreviousExecutionsUncertain() error {
+	if s.schema != "" {
+		return nil
+	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&executionClaim{}).Where("state = ? AND server_instance_id <> ?", "active", s.instance).Update("state", "uncertain").Error; err != nil {
 			return err
@@ -340,9 +343,6 @@ func (s *Store) MarkPreviousExecutionsUncertain() error {
 
 // ClaimCleanup serializes destructive cleanup with other cleaners and commands.
 func (s *Store) ClaimCleanup(p models.PullRequest, owner string) (models.PullRequest, bool, error) {
-	if err := s.checkServerLock(); err != nil {
-		return p, false, err
-	}
 	claimed := false
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var row struct {

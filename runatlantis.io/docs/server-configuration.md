@@ -60,7 +60,9 @@ storage:
 ```
 
 `storage.database.type` accepts `sqlite` or `postgres`. Both require a 64-bit
-server, and both allow exactly one Atlantis process per database.
+server. SQLite allows one Atlantis process. Several servers can share one
+PostgreSQL schema, each with its own `data-dir`; see
+[Supported topologies](experiments.md#supported-topologies).
 
 With `sqlite`, the database is `atlantis.sqlite` under `data-dir`. Keep `data-dir`
 on persistent storage: losing it loses locks, PR status, job history, job logs,
@@ -92,16 +94,21 @@ ATLANTIS_STORAGE_DATABASE_URL="postgres://atlantis:<password>@db.example:5432/at
 The connection string uses the libpq URL or keyword/value format. Its
 `search_path` selects the schema, which must already exist; the default is
 `public`. Atlantis runs its migrations in that schema at startup, so the role
-needs permission to create tables there. At startup Atlantis takes a
-session-level PostgreSQL advisory lock for the schema and holds it on a
-dedicated connection. A second server against the same schema fails to start
-with an `already in use by another server` error. Multiple instances and
-high availability are unsupported.
+needs permission to create tables there. Migrations run under a PostgreSQL
+advisory lock for the schema, so when several servers start together one
+migrates and the others wait. Maintenance passes also take advisory locks, so
+the role needs permission to call `pg_try_advisory_lock`, which PostgreSQL grants
+to every role by default. A second server that uses the same `data-dir` fails
+to start with an `already in use by another server` error.
 
 `storage.artifacts.type` accepts `database` (the default) or `filesystem`.
 Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`; the
 database backend rejects `directory`. Use a directory dedicated to this database;
-installations and fresh-data-directory cutovers must not share it. Live logs are
+installations and fresh-data-directory cutovers must not share it. When several
+servers share a PostgreSQL schema, every server must use one directory on a
+shared disk that renames files atomically; the default under `data-dir` belongs
+to one server, and Atlantis logs a warning when PostgreSQL uses it. S3-compatible
+object storage is not available yet. Live logs are
 journaled in the database for both backends; the filesystem backend archives sealed
 logs to the directory. Existing artifacts and logs are not migrated when changing
 backends, and logs already archived to a filesystem become unreadable after
@@ -1299,10 +1306,12 @@ ATLANTIS_LOCKING_DB_TYPE="<boltdb|redis>"
 The locking database type to use for storing plan and apply locks. Defaults to `boltdb`.
 
 ::: warning Deprecated
-`boltdb` is deprecated. Single-instance installs should move to the
-[durable storage](experiments.md#durable-storage) experiment with SQLite. See the
-[BoltDB deprecation notice](experiments.md#boltdb-deprecation) for the timeline and
-migration steps. `redis` is not deprecated.
+`boltdb` and `redis` are deprecated. Single-instance installs should move to the
+[durable storage](experiments.md#durable-storage) experiment with SQLite, and
+installs with several servers to durable storage with PostgreSQL. See the
+[BoltDB deprecation notice](experiments.md#boltdb-deprecation) and the
+[Redis deprecation notice](experiments.md#redis-deprecation) for the timeline and
+migration steps.
 :::
 
 Notes:

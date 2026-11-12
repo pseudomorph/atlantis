@@ -316,3 +316,27 @@ func TestUpgradeFromJobLogs(t *testing.T) {
 		Equals(t, s.InstanceID(), storedClaim(t, s, "recovery").ServerInstanceID)
 	})
 }
+
+func TestUpgradeFromClaimLiveness(t *testing.T) {
+	ForEachDatabase(t, func(t *testing.T, d TestDatabase) {
+		p := upgradePull()
+		startedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		databaseAt(t, d, 5, func(db *gorm.DB) {
+			writeLocksAndStatus(t, db, p, startedAt)
+			writeJobsAndClaims(t, db, startedAt)
+		})
+
+		s, err := d.Open()
+		Ok(t, err)
+		defer s.Close()
+		var deliveries int64
+		Ok(t, s.db.Model(&webhookDelivery{}).Count(&deliveries).Error)
+		Equals(t, int64(0), deliveries)
+		first, err := s.RecordDelivery("github", "after-upgrade")
+		Ok(t, err)
+		Assert(t, first, "upgraded database rejected a new delivery")
+		old, err := s.Job("old-plan")
+		Ok(t, err)
+		Equals(t, "succeeded", old.State)
+	})
+}

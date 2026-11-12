@@ -16,16 +16,28 @@ and production retention cutoffs use `databaseNow`, which reads SQLite's
 `strftime('now')` or PostgreSQL's `clock_timestamp()`; explicitly supplied event
 timestamps retain their instant. SQLite's clock has millisecond resolution.
 
-`OpenServer` holds a process lock before opening or migrating SQLite. Run one
-server on local or block-backed storage; network filesystems are unsupported.
-`OpenPostgresServer` takes a session-level advisory lock, keyed by the schema
-in `search_path`, on a dedicated pgx connection before migrating, and holds it
-until `Close`. A second server against the same schema fails to start. The
-advisory lock ends with its session, so `VerifyServerLock` pings that session
-on each heartbeat; once it fails, the store refuses new claims and heartbeat
-refreshes, and its claims expire into stopped-work recovery.
+Both open functions lock the data directory with a file lock, so each server
+needs its own `data-dir`. SQLite runs one server on local or block-backed
+storage; network filesystems are unsupported. Several servers may share one
+PostgreSQL schema. `OpenPostgresServer` runs Goose migrations under Goose's
+PostgreSQL session locker, an advisory lock keyed by the schema in
+`search_path`, so servers that start together migrate once while the others
+wait (`TestConcurrentStartupMigratesOnce`). A server refuses to start against a
+schema newer than it supports.
+
+`RunMaintenance` runs each maintenance pass (lifecycle verification, deferred
+cleanup, and log archiving with retention) under a session-level advisory lock
+taken with `pg_try_advisory_lock` on a dedicated connection, so one server runs
+a given pass at a time and the others skip it. The lock only avoids duplicate
+work and duplicate VCS comments; correctness still comes from the row-lock
+rule below, because a lost connection ends the lock while its pass may still
+be running. For the same reason a log archive write that lands after
+retention expired the log is deleted by the writer when its handoff finds
+`deleted_at` set. SQLite runs every pass.
+
 The store holds project locks, global command locks, pull request status, jobs,
-execution claims, pending plans, plan snapshot metadata and job log journals.
+execution claims, pending plans, plan snapshot metadata, job log journals and
+recent webhook delivery IDs.
 
 Commands own persisted execution claims until completion, and lock, status and
 job writes require the live claim. Startup marks leftover claims uncertain,
@@ -48,9 +60,20 @@ that a sweep or recovery changed. `ExpireClaims` locks each candidate claim,
 rechecks its heartbeat against `ClaimExpiry` in Go, marks it uncertain and seals
 its owner's open logs as interrupted. Recovery treats an active claim with an
 expired heartbeat as uncertain. Expiry never transfers a claim. Heartbeat
-comparisons use database time read by `databaseNow`. Because the server lock
-proves earlier servers exited or lost their lock, startup marks claims from
-every earlier instance uncertain without waiting for expiry.
+comparisons use database time read by `databaseNow`. With SQLite the data
+directory lock proves earlier servers exited, so startup marks claims from
+every earlier instance uncertain without waiting for expiry. With PostgreSQL,
+`MarkPreviousExecutionsUncertain` changes nothing: another server may hold live
+claims, and this process's instance ID is new, so it has no earlier claims.
+Claims of a server that stopped become uncertain when any server's sweep finds
+their heartbeat expired (`TestServersSharePostgresSchema`).
+
+`RecordDelivery` inserts a webhook's provider and delivery ID into
+`webhook_deliveries` with `ON CONFLICT DO NOTHING`; the affected row count
+tells servers that receive the same delivery which one handles it.
+`ForgetDelivery` removes a delivery whose response was not a success, so the
+provider's retry is handled. Retention deletes rows older than
+`DeliveryRetention`.
 
 Run storage tests with `go test -race ./server/core/sqlstore`. They run on
 SQLite, and on PostgreSQL too when `ATLANTIS_TEST_POSTGRES_DSN` holds a
@@ -63,8 +86,10 @@ ATLANTIS_TEST_POSTGRES_DSN='postgres://postgres:atlantis@localhost:55432/atlanti
 ```
 
 Set `ATLANTIS_TEST_DURABLE_DATABASE=postgres` as well to run the durable
-end-to-end tests in `server/controllers/events` on PostgreSQL. Multi-server
-execution is separate follow-up work.
+end-to-end tests in `server/controllers/events` on PostgreSQL. The
+multi-server acceptance tests there (`durable_multiinstance_e2e_test.go` and
+`durable_log_viewer_e2e_test.go`) start two servers on one schema whenever
+`ATLANTIS_TEST_POSTGRES_DSN` is set.
 
 Each schema change adds a new numbered file under `migrations/`, and released
 migrations are never edited. An existing database upgrades by applying the newer

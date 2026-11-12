@@ -83,6 +83,9 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			s, err = d.Open()
 			Ok(t, err)
 			Ok(t, s.MarkPreviousExecutionsUncertain())
+			if d.Name == "postgres" {
+				expireOtherInstances(t, s)
+			}
 			Assert(t, s.FinishJob(j.ID, "succeeded", "") != nil, "uncertain owner published completion")
 			Assert(t, s.AcquireClaim(p, "owner-b") != nil, "unfinished work allowed takeover")
 			locked, err := s.GetLockInRepo(p.BaseRepo, j.Project, j.Workspace)
