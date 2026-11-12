@@ -56,7 +56,7 @@ func (c UserConfig) ValidateExperiments() error {
 			return fmt.Errorf("storage requires --experiments=durable-storage; see %s", ExperimentsDocumentationURL)
 		}
 		if c.SharePlanDir != "" && c.SharePlanDir != c.DataDir {
-			return fmt.Errorf("storage cannot be combined with share-plan-dir; see %s", ExperimentsDocumentationURL)
+			return fmt.Errorf("storage cannot be combined with share-plan-dir; use storage.artifacts.directory")
 		}
 		if c.EnableExternalStores || (c.LockingDBType != "" && c.LockingDBType != "boltdb") {
 			return fmt.Errorf("storage cannot be combined with legacy storage selection; see %s", ExperimentsDocumentationURL)

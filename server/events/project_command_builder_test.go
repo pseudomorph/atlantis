@@ -14,21 +14,24 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/hashicorp/go-version"
 	. "github.com/petergtz/pegomock/v4"
-	"github.com/runatlantis/atlantis/server/core/runtime"
-	"github.com/runatlantis/atlantis/server/core/terraform"
-	tfclientmocks "github.com/runatlantis/atlantis/server/core/terraform/tfclient/mocks"
-	"github.com/runatlantis/atlantis/server/metrics/metricstest"
-
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
+	"github.com/runatlantis/atlantis/server/core/terraform"
+	tfclientmocks "github.com/runatlantis/atlantis/server/core/terraform/tfclient/mocks"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/mocks"
 	"github.com/runatlantis/atlantis/server/events/models"
 	vcsmocks "github.com/runatlantis/atlantis/server/events/vcs/mocks"
+	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/logging"
+	"github.com/runatlantis/atlantis/server/metrics/metricstest"
 	. "github.com/runatlantis/atlantis/testing"
 )
 
@@ -5825,6 +5828,8 @@ type fakeWorkingDir struct {
 	// onClone runs after a workspace is cloned, to seed files a real clone
 	// would have brought with it (e.g. atlantis.yaml).
 	onClone func(workspace, dir string) error
+	// workingDirErrs makes GetWorkingDir fail for a workspace.
+	workingDirErrs map[string]error
 }
 
 func (f *fakeWorkingDir) Clone(_ logging.SimpleLogging, _ models.Repo, _ models.PullRequest, workspace string) (string, error) {
@@ -5859,6 +5864,9 @@ func (f *fakeWorkingDir) GetPullDir(_ models.Repo, _ models.PullRequest) (string
 }
 
 func (f *fakeWorkingDir) GetWorkingDir(_ models.Repo, _ models.PullRequest, workspace string) (string, error) {
+	if err := f.workingDirErrs[workspace]; err != nil {
+		return "", err
+	}
 	workspaceDir := filepath.Join(f.pullDir, workspace)
 	if _, err := os.Stat(workspaceDir); err != nil {
 		return "", err
@@ -6316,4 +6324,204 @@ projects:
 	Equals(t, "staging", ctxs[0].Workspace)
 	Assert(t, slices.Contains(workingDir.cloneCalls, "staging"),
 		"expected the project's workspace to be cloned, cloned: %v", workingDir.cloneCalls)
+}
+
+// durablePlanStore marks a plan store as durable, the way artifacts.Service
+// does by implementing planstore.Inventory.
+type durablePlanStore struct{ *mockExternalPlanStore }
+
+func (durablePlanStore) PendingPlans(models.Repo, int) ([]models.Job, error) { return nil, nil }
+
+// A pre-workflow hook can recreate the default checkout on a server that never
+// held this PR. `apply -p name` must still check out the project's own
+// workspace instead of failing on it, and must leave existing checkouts alone.
+func TestDefaultProjectCommandBuilder_TargetedApplyRecovery_DefaultAlreadyPresent(t *testing.T) {
+	atlantisYAML := `version: 3
+projects:
+- name: myproject
+  dir: project1
+  workspace: staging
+`
+	repo := models.Repo{FullName: "owner/repo", Owner: "owner", Name: "repo"}
+	pull := models.PullRequest{Num: 5, BaseRepo: repo}
+	seedDefault := func(t *testing.T, pullDir string) {
+		t.Helper()
+		Ok(t, os.MkdirAll(filepath.Join(pullDir, "default", "project1"), 0o700))
+		Ok(t, os.WriteFile(filepath.Join(pullDir, "default", "atlantis.yaml"), []byte(atlantisYAML), 0o600))
+	}
+	build := func(t *testing.T, workingDir events.WorkingDir, planStore runtime.PlanStore) ([]command.ProjectContext, error) {
+		t.Helper()
+		logger := logging.NewNoopLogger(t)
+		scope := metricstest.NewLoggingScope(t, logger, "atlantis")
+		builder := events.NewProjectCommandBuilder(false, &config.ParserValidator{}, &events.DefaultProjectFinder{}, nil,
+			workingDir, events.NewDefaultWorkingDirLocker(), valid.NewGlobalCfgFromArgs(valid.GlobalCfgArgs{AllowAllRepoSettings: true}),
+			&events.DefaultPendingPlanFinder{}, &events.CommentParser{ExecutableName: "atlantis"}, false, false, false, false, false,
+			"", defaultUserConfig.AutoplanFileList, false, "", false, false, "auto", scope, tfclientmocks.NewMockClient(),
+			planStore)
+		return builder.BuildApplyCommands(&command.Context{Log: logger, Scope: scope, Pull: pull, HeadRepo: repo},
+			&events.CommentCommand{Name: command.Apply, ProjectName: "myproject"})
+	}
+
+	t.Run("missing workspace is cloned", func(t *testing.T) {
+		RegisterMockTestingT(t)
+		pullDir := t.TempDir()
+		seedDefault(t, pullDir)
+		workingDir := &fakeWorkingDir{MockWorkingDir: *mocks.NewMockWorkingDir(), pullDir: pullDir}
+		ctxs, err := build(t, workingDir, durablePlanStore{&mockExternalPlanStore{}})
+		Ok(t, err)
+		Equals(t, 1, len(ctxs))
+		Equals(t, "staging", ctxs[0].Workspace)
+		Equals(t, []string{"staging"}, workingDir.cloneCalls)
+	})
+
+	t.Run("existing workspace is kept", func(t *testing.T) {
+		RegisterMockTestingT(t)
+		pullDir := t.TempDir()
+		seedDefault(t, pullDir)
+		planFile := filepath.Join(pullDir, "staging", "project1", "myproject-staging.tfplan")
+		Ok(t, os.MkdirAll(filepath.Dir(planFile), 0o700))
+		Ok(t, os.WriteFile(planFile, []byte("plan-data"), 0o600))
+		workingDir := &fakeWorkingDir{MockWorkingDir: *mocks.NewMockWorkingDir(), pullDir: pullDir}
+		ctxs, err := build(t, workingDir, durablePlanStore{&mockExternalPlanStore{}})
+		Ok(t, err)
+		Equals(t, 1, len(ctxs))
+		Equals(t, 0, len(workingDir.cloneCalls))
+		Equals(t, "", ctxs[0].ExpectedPlanHash)
+	})
+
+	t.Run("other errors are returned", func(t *testing.T) {
+		RegisterMockTestingT(t)
+		pullDir := t.TempDir()
+		seedDefault(t, pullDir)
+		workingDir := &fakeWorkingDir{
+			MockWorkingDir: *mocks.NewMockWorkingDir(),
+			pullDir:        pullDir,
+			workingDirErrs: map[string]error{"staging": os.ErrPermission},
+		}
+		_, err := build(t, workingDir, durablePlanStore{&mockExternalPlanStore{}})
+		ErrContains(t, "checking working directory for workspace \"staging\"", err)
+		Equals(t, 0, len(workingDir.cloneCalls))
+	})
+
+	t.Run("local plan store is unchanged", func(t *testing.T) {
+		RegisterMockTestingT(t)
+		pullDir := t.TempDir()
+		seedDefault(t, pullDir)
+		workingDir := &fakeWorkingDir{MockWorkingDir: *mocks.NewMockWorkingDir(), pullDir: pullDir}
+		_, err := build(t, workingDir, &runtime.LocalPlanStore{})
+		ErrContains(t, "getting working directory for workspace \"staging\"", err)
+		Equals(t, 0, len(workingDir.cloneCalls))
+	})
+}
+
+func TestDurableApplyAllUsesPendingPlanInventory(t *testing.T) {
+	for _, missingCheckout := range []bool{false, true} {
+		name := "existing checkout"
+		if missingCheckout {
+			name = "missing checkout"
+		}
+		t.Run(name, func(t *testing.T) {
+			RegisterMockTestingT(t)
+			databaseDir := t.TempDir()
+			db, err := sqlstore.OpenServer(databaseDir)
+			Ok(t, err)
+			defer func() { _ = db.Close() }()
+			blobs, err := artifacts.NewFilesystem(t.TempDir())
+			Ok(t, err)
+			defer blobs.Close()
+			files := &artifacts.Service{Records: db, Blobs: artifacts.ObjectSnapshots{Store: blobs}}
+			service := &jobs.Service{Store: db}
+			repo := models.Repo{FullName: "org/repo", Owner: "org", Name: "repo"}
+			pull := models.PullRequest{BaseRepo: repo, Num: 1, Execution: &models.Execution{Owner: uuid.NewString()}}
+			Ok(t, db.AcquireClaim(pull, pull.ExecutionOwner()))
+			repo.Execution = pull.Execution
+			var projects []models.ProjectStatus
+			var planContexts []command.ProjectContext
+			for _, workspace := range []string{"default", "staging"} {
+				ctx := command.ProjectContext{ArtifactRoot: t.TempDir(), JobID: uuid.NewString(), CommandName: command.Plan, BaseRepo: repo, Pull: pull, RepoRelDir: "infra", Workspace: workspace}
+				locked, _, err := db.TryLock(models.ProjectLock{Pull: pull, Project: models.NewProject(repo.FullName, "infra", ""), Workspace: workspace})
+				Ok(t, err)
+				Assert(t, locked, "project lock was not acquired")
+				Ok(t, service.Begin(ctx))
+				Ok(t, db.StartPlan(ctx.JobID))
+				file := filepath.Join(ctx.ArtifactRoot, "plan")
+				Ok(t, os.WriteFile(file, []byte("durable plan"), 0600))
+				Ok(t, files.SnapshotPlan(ctx, ctx.ArtifactRoot, file))
+				Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
+				projects = append(projects, models.ProjectStatus{RepoRelDir: "infra", Workspace: workspace, Status: models.PlannedPlanStatus})
+				planContexts = append(planContexts, ctx)
+			}
+			// Reopen the database so discovery must use persisted pending plans.
+			Ok(t, db.Close())
+			db, err = sqlstore.OpenServer(databaseDir)
+			Ok(t, err)
+			service.Store = db
+			files.Records = db
+
+			pullDir := t.TempDir()
+			if missingCheckout {
+				pullDir = filepath.Join(pullDir, "checkout")
+			}
+			workingDir := &fakeWorkingDir{
+				MockWorkingDir: *mocks.NewMockWorkingDir(),
+				pullDir:        pullDir,
+				onClone: func(workspace, dir string) error {
+					projectDir := filepath.Join(dir, "infra")
+					if err := os.MkdirAll(projectDir, 0700); err != nil {
+						return err
+					}
+					// Tracked plan paths are invisible to the legacy untracked-file finder.
+					file := filepath.Join(projectDir, workspace+".tfplan")
+					if err := os.WriteFile(file, []byte("stale checkout plan"), 0600); err != nil {
+						return err
+					}
+					if err := exec.Command("git", "-C", dir, "add", ".").Run(); err != nil {
+						return err
+					}
+					return os.WriteFile(filepath.Join(dir, "stray-"+workspace+".tfplan"), []byte("unregistered plan"), 0600)
+				},
+			}
+			logger := logging.NewNoopLogger(t)
+			scope := metricstest.NewLoggingScope(t, logger, "atlantis")
+			builder := events.NewProjectCommandBuilder(false, &config.ParserValidator{}, &events.DefaultProjectFinder{}, nil,
+				workingDir, events.NewDefaultWorkingDirLocker(), valid.NewGlobalCfgFromArgs(valid.GlobalCfgArgs{}),
+				nil, &events.CommentParser{ExecutableName: "atlantis"}, false, false, false, false, false,
+				"", defaultUserConfig.AutoplanFileList, false, "", false, false, "auto", scope, tfclientmocks.NewMockClient(),
+				files)
+			ctx := &command.Context{Log: logger, Scope: scope, Pull: pull, PullStatus: &models.PullStatus{Projects: projects}}
+			commands, err := builder.BuildApplyCommands(ctx, &events.CommentCommand{Name: command.Apply})
+			Ok(t, err)
+			Equals(t, 2, len(commands))
+			for _, c := range commands {
+				Equals(t, "infra", c.RepoRelDir)
+				// The runner restores the bound snapshot; a plan file on this
+				// server's disk is neither restored over nor trusted here.
+				Equals(t, "", c.ExpectedPlanHash)
+				content, err := os.ReadFile(filepath.Join(pullDir, c.Workspace, "infra", c.Workspace+".tfplan"))
+				Ok(t, err)
+				Equals(t, "stale checkout plan", string(content))
+			}
+
+			apply := planContexts[0]
+			apply.JobID = uuid.NewString()
+			apply.CommandName = command.Apply
+			Ok(t, service.Begin(apply))
+			Ok(t, service.Finish(apply, command.ProjectCommandOutput{}))
+			lock, err := db.GetLockInRepo(repo, models.NewProject(repo.FullName, "infra", ""), "default")
+			Ok(t, err)
+			Assert(t, lock != nil, "apply completion released the project lock")
+			Equals(t, pull.Num, lock.Pull.Num)
+			ctx.PullStatus.Projects[0].Status = models.AppliedPlanStatus
+			commands, err = builder.BuildApplyCommands(ctx, &events.CommentCommand{Name: command.Apply})
+			Ok(t, err)
+			Equals(t, 1, len(commands))
+			Equals(t, "staging", commands[0].Workspace)
+			locks, err := db.UnlockByPullInRepo(repo, pull.Num)
+			Ok(t, err)
+			Equals(t, 2, len(locks))
+			pending, err := db.PendingPlans(repo, pull.Num)
+			Ok(t, err)
+			Equals(t, 0, len(pending))
+		})
+	}
 }
