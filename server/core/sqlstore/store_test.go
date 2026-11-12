@@ -43,6 +43,7 @@ func TestDurabilityAndOwnership(t *testing.T) {
 	dir := t.TempDir()
 	s := openStore(t, dir)
 	want := fixture()
+	ensureClaim(t, s, &want.Pull)
 	ok, _, err := s.TryLock(want)
 	Ok(t, err)
 	Assert(t, ok, "lock not acquired")
@@ -79,6 +80,8 @@ func TestDurabilityAndOwnership(t *testing.T) {
 	Ok(t, err)
 	Assert(t, deleted != nil, "owner could not unlock")
 	want.Pull.Num = 43
+	want.Pull.Execution = nil
+	ensureClaim(t, s, &want.Pull)
 	ok, _, err = s.TryLock(want)
 	Ok(t, err)
 	Assert(t, ok, "next owner could not acquire")
@@ -95,6 +98,7 @@ func TestInstanceIsolationAndLockKeys(t *testing.T) {
 	for _, u := range urls {
 		want := fixture()
 		want.Pull.BaseRepo.CloneURL = u
+		ensureClaim(t, s, &want.Pull)
 		lock, err := client.TryLock(want.Project, want.Workspace, want.Pull, want.User)
 		Ok(t, err)
 		Assert(t, lock.LockAcquired, "instance collision for %s", u)
@@ -111,6 +115,7 @@ func TestInstanceIsolationAndLockKeys(t *testing.T) {
 	Ok(t, err)
 	Equals(t, 4, len(locks))
 	want := fixture()
+	ensureClaim(t, s, &want.Pull)
 	deleted, err := client.UnlockByPull(want.Pull.BaseRepo, want.Pull.Num)
 	Ok(t, err)
 	Equals(t, 1, len(deleted))
@@ -119,7 +124,8 @@ func TestInstanceIsolationAndLockKeys(t *testing.T) {
 		if lock == nil {
 			continue
 		}
-		_, err := client.Unlock(key)
+		ensureClaim(t, s, &lock.Pull)
+		_, err := client.UnlockOwned(key, lock.Pull)
 		Ok(t, err)
 	}
 	locks, err = client.List()
@@ -145,6 +151,7 @@ func TestConcurrentLocksAndStatus(t *testing.T) {
 		wg.Go(func() {
 			want := fixture()
 			want.Pull.Num = i + 1
+			ensureClaim(t, store, &want.Pull)
 			ok, _, err := store.TryLock(want)
 			if err != nil {
 				errors <- err
@@ -157,6 +164,7 @@ func TestConcurrentLocksAndStatus(t *testing.T) {
 	close(winners)
 	Equals(t, 1, len(winners))
 	statusPull := fixture().Pull
+	ensureClaim(t, store, &statusPull)
 	for i := range 16 {
 		wg.Go(func() {
 			_, err := store.UpdatePullWithResults(statusPull, []command.ProjectResult{result(fmt.Sprintf("project-%d", i))})
@@ -204,6 +212,7 @@ func TestPlanHashPersistsAndTracksApplicablePlan(t *testing.T) {
 	dir := t.TempDir()
 	s := openStore(t, dir)
 	pull := fixture().Pull
+	ensureClaim(t, s, &pull)
 	planned := result("network")
 	planned.Command = command.Plan
 	planned.PlanSuccess.PlanHash = strings.Repeat("a", 64)
@@ -243,10 +252,72 @@ func TestPlanHashPersistsAndTracksApplicablePlan(t *testing.T) {
 	check("")
 }
 
+func ensureClaim(t *testing.T, s *sqlstore.Store, p *models.PullRequest) {
+	t.Helper()
+	if p.ExecutionOwner() == "" {
+		p.Execution = &models.Execution{Owner: fmt.Sprintf("test:%s:%s:%d", p.BaseRepo.StorageIdentity().Directory(), p.BaseRepo.FullName, p.Num)}
+	}
+	if s.CheckClaim(*p) != nil {
+		Ok(t, s.AcquireClaim(*p, p.ExecutionOwner()))
+	}
+	p.BaseRepo.Execution = p.Execution
+}
 func publicLock(lock models.ProjectLock) models.ProjectLock {
+	lock.Pull.Execution = nil
+	lock.Pull.BaseRepo.Execution = nil
 	u, _ := url.Parse(lock.Pull.BaseRepo.CloneURL)
 	u.User = nil
 	lock.Pull.BaseRepo.CloneURL = u.String()
 	lock.Pull.BaseRepo.SanitizedCloneURL = u.String()
 	return lock
+}
+
+func TestReopenWaitsForClosureCleanup(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	p := fixture().Pull
+	p.State = models.OpenPullState
+	claim := func(owner string) error {
+		p.Execution = &models.Execution{Owner: owner}
+		return s.AcquireClaim(p, owner)
+	}
+	release := func() {
+		t.Helper()
+		Ok(t, s.ReleaseClaim(p))
+	}
+
+	Ok(t, s.ClosePull(p))
+	ErrContains(t, "pull request is closed", claim("after-close"))
+
+	// A reopen before deferred cleanup finishes must not admit work that
+	// cleanup could delete.
+	Ok(t, s.RequestReopen(p))
+	ErrContains(t, "cleanup from its closure has not finished", claim("before-cleanup"))
+	// Deferred cleanup must use the existing closure, not replay a close event.
+
+	Ok(t, s.MarkClosedClean(p))
+	Ok(t, claim("after-cleanup"))
+	cancelled, err := s.IsCancelled(p)
+	Ok(t, err)
+	Assert(t, !cancelled, "reopened pull request still reports cancellation")
+	release()
+
+	// Closing again requires a fresh cleanup and a fresh reopen request.
+	Ok(t, s.ClosePull(p))
+	ready, err := s.ClosedPullsReady()
+	Ok(t, err)
+	Equals(t, 1, len(ready))
+	Ok(t, s.MarkClosedClean(p))
+	ErrContains(t, "pull request is closed", claim("closed-again"))
+}
+
+func TestReopenRequestIgnoresOpenPullRequest(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	p := fixture().Pull
+	Ok(t, s.RequestReopen(p))
+	Ok(t, s.AcquireClaim(p, "owner"))
+	p.Execution = &models.Execution{Owner: "owner"}
+	Ok(t, s.ReleaseClaim(p))
+	Ok(t, s.ClosePull(p))
+	Ok(t, s.MarkClosedClean(p))
+	ErrContains(t, "pull request is closed", s.AcquireClaim(p, "later"))
 }

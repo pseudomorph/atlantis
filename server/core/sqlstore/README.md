@@ -13,7 +13,20 @@ SQLite's clock has millisecond resolution.
 
 `OpenServer` holds a process lock before opening or migrating SQLite. Run one
 server on local or block-backed storage; network filesystems are unsupported.
-The store holds project locks, global command locks and pull request status.
+The store holds project locks, global command locks, pull request status, jobs
+and execution claims.
+
+Commands own persisted execution claims until completion, and lock, status and
+job writes require the live claim. Startup marks leftover claims uncertain,
+preventing new commands and destructive cleanup for those PRs or API
+invocations: a dead parent does not prove Terraform children stopped. There are
+no heartbeats, expiring leases, or automatic retries. Authorized unlock recovery
+requires an explicit stopped-work attestation; it records the actor and
+interrupts unfinished jobs before releasing reservations. Closing a pull request
+records a closure generation; deferred cleanup holds its own claim and must
+match that generation, and a reopened pull request accepts work only after the
+cleanup completes. Unverified close events persist in `pending_pull_lifecycles`
+and block admission until maintenance verifies the live state.
 
 Run storage tests with `go test -race ./server/core/sqlstore`. PostgreSQL and
 distributed leases are separate follow-up work.
@@ -26,9 +39,10 @@ or adds a table keyed by the parent row.
 
 SQLite serializes writers with `_txlock=immediate` and one connection, but
 correctness does not depend on that. A transaction that reads pull-scoped state
-and writes based on it first locks the governing `pulls` row with `lockPull`.
-Every lock and status row belongs to a pull, so the lock also fences inserts
-that a missing-row check cannot. Other writes are single conditional `UPDATE` or
+and writes based on it first locks the governing `pulls` row with `lockPull`
+(then the execution claim, when it has one). Every claim, job, lock, status and
+lifecycle row belongs to a pull, so the lock also fences inserts that a
+missing-row check cannot. Other writes are single conditional `UPDATE` or
 `DELETE` statements whose affected row count is checked. The SQLite dialector
 omits `FOR UPDATE`; a backend with row locks under `READ COMMITTED` must honor it.
 
@@ -38,8 +52,12 @@ must copy typed rows into a schema initialized by Goose.
 The experiment requires a 64-bit server. Repositories are identified by VCS
 instance (host, port and installation path) plus full name, so two instances
 with the same repository name never share locks or status. Lock keys encode that
-identity and never contain credentials. Credential-bearing clone URLs are never
-persisted.
+identity and never contain credentials. Synthetic non-PR pull numbers are
+insert-only identities reserved before checkout; collisions never upsert an old
+invocation. There is no execution-scope table: jobs, claims and recovery audits
+reference `pulls.id`. Negative rows represent existing synchronous API
+invocations; only the matching claim owner can revisit one. Credential-bearing
+clone URLs are never persisted.
 
 Store one credential-free clone URL and populate both repository model URL fields
 when loading it. Repository owner/name/hostname derive on load. Status rows

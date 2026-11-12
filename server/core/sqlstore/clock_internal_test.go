@@ -45,13 +45,48 @@ func TestGeneratedStorageTimestamps(t *testing.T) {
 		before, err := databaseNow(s.db)
 		Ok(t, err)
 		p := claimPull()
+		Ok(t, s.AcquireClaim(p, "owner"))
+		p.Execution = &models.Execution{Owner: "owner"}
+		j := claimJob(p, "generated-times")
+		j.StartedAt = time.Time{}
+		Ok(t, s.StartJob(j))
 		// Direct callers can omit lock time; the shared locking client supplies an event time.
-		acquired, projectLock, err := s.TryLock(models.ProjectLock{Pull: p, Project: models.NewProject(p.BaseRepo.FullName, ".", ""), Workspace: "default"})
+		acquired, projectLock, err := s.TryLock(models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace})
 		Ok(t, err)
 		Assert(t, acquired, "project lock unavailable")
+		Ok(t, s.FinishJob(j.ID, "succeeded", ""))
+		Ok(t, s.ClosePull(p))
+		job, err := s.Job(j.ID)
+		Ok(t, err)
+		Assert(t, job.FinishedAt != nil, "job did not finish")
+		var closed struct{ ClosedAt time.Time }
+		Ok(t, s.db.Table("pulls").Select("closed_at").Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&closed).Error)
 		after, err := databaseNow(s.db)
 		Ok(t, err)
-		Assert(t, !projectLock.Time.Before(before) && !projectLock.Time.After(after), "lock timestamp did not come from the database clock")
-		Equals(t, 0, projectLock.Time.Nanosecond()%1000)
+		for name, instant := range map[string]time.Time{
+			"job start": job.StartedAt, "job finish": *job.FinishedAt, "closure": closed.ClosedAt, "lock": projectLock.Time,
+		} {
+			Assert(t, !instant.Before(before) && !instant.After(after), "%s timestamp did not come from the database clock", name)
+			Equals(t, 0, instant.Nanosecond()%1000)
+		}
+	})
+}
+
+func TestEqualJobTimestampsHaveStableOrder(t *testing.T) {
+	t.Run("sqlite", func(t *testing.T) {
+		s := conformanceStore(t)
+		p := claimPull()
+		Ok(t, s.AcquireClaim(p, "owner"))
+		p.Execution = &models.Execution{Owner: "owner"}
+		for _, id := range []string{"b", "a"} {
+			j := claimJob(p, id)
+			j.StartedAt = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			j.Project = models.NewProject(p.BaseRepo.FullName, ".", id)
+			Ok(t, s.StartJob(j))
+			Ok(t, s.FinishJob(id, "succeeded", ""))
+		}
+		jobs, err := s.Jobs()
+		Ok(t, err)
+		Equals(t, []string{"a", "b"}, []string{jobs[0].ID, jobs[1].ID})
 	})
 }

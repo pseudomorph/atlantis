@@ -55,8 +55,8 @@ storage:
 ```
 
 `storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
-under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks and
-PR status. Run one Atlantis 64-bit process on local or block-backed storage;
+under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks,
+PR status, job history, and execution claims. Run one Atlantis 64-bit process on local or block-backed storage;
 network filesystems such as NFS/EFS are unsupported. PostgreSQL and shared
 operation are deferred.
 

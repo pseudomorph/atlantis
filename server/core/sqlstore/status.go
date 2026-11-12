@@ -66,7 +66,7 @@ func (s *Store) GetPullStatus(p models.PullRequest) (*models.PullStatus, error) 
 
 func (s *Store) DeletePullStatus(p models.PullRequest) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := s.guard(tx, p); err != nil {
+		if err := s.guardRemoval(tx, p); err != nil {
 			return err
 		}
 		return tx.Where("pull_id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&pullStatus{}).Error
@@ -77,7 +77,7 @@ func (s *Store) DeletePullStatus(p models.PullRequest) error {
 // in status order, with this workspace and repoRelDir, whatever its name.
 func (s *Store) UpdateProjectStatus(p models.PullRequest, workspace, directory string, status models.ProjectPlanStatus) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := s.guard(tx, p); err != nil {
+		if err := s.guardRemoval(tx, p); err != nil {
 			return err
 		}
 		projects := tx.Model(&project{}).Select("id").Where("repository_id IN (?) AND directory = ? AND workspace = ?", repoIDs(tx, p.BaseRepo), directory, workspace)
@@ -96,11 +96,7 @@ func (s *Store) UpdateProjectStatus(p models.PullRequest, workspace, directory s
 func (s *Store) UpdatePullWithResults(p models.PullRequest, results []command.ProjectResult) (models.PullStatus, error) {
 	var next models.PullStatus
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		row, err := savePull(tx, p)
-		if err != nil {
-			return err
-		}
-		if _, err := lockPull(tx, row.ID); err != nil {
+		if err := s.guard(tx, p); err != nil {
 			return err
 		}
 		prior, err := readStatus(tx, p)
@@ -108,6 +104,10 @@ func (s *Store) UpdatePullWithResults(p models.PullRequest, results []command.Pr
 			return err
 		}
 		next = mergeStatus(prior, p, results)
+		row, err := savePull(tx, p)
+		if err != nil {
+			return err
+		}
 		status := pullStatus{PullID: row.ID, Revision: p.HeadCommit, BaseBranch: p.BaseBranch}
 		if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "pull_id"}}, DoUpdates: clause.AssignmentColumns([]string{"revision", "base_branch"})}).Create(&status).Error; err != nil {
 			return err

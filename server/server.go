@@ -130,6 +130,10 @@ type Server struct {
 	EnableProfilingAPI             bool
 	Experiments                    []string
 	database                       db.Database
+	jobService                     *jobs.Service
+	storageMaintenance             func()
+	storageCancel                  context.CancelFunc
+	storageDone                    chan struct{}
 }
 
 // Config holds config for server that isn't passed in by the user.
@@ -563,6 +567,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
+	storage := &storageRuntime{}
+	if sql, ok := database.(*sqlstore.Store); ok {
+		storage, err = newStorageRuntime(sql)
+		if err != nil {
+			_ = database.Close()
+			return nil, err
+		}
+		commitStatusUpdater.ClaimCheck = sql.CheckClaim
+	}
 	noOpLocker := locking.NewNoOpLocker()
 	if userConfig.DisableRepoLocking {
 		logger.Info("Repo Locking is disabled")
@@ -575,9 +588,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	applyLockingClient = locking.NewApplyClient(database, disableApply, disableGlobalApplyLock)
 	workingDirLocker := events.NewDefaultWorkingDirLocker()
 
-	_, durable := database.(*sqlstore.Store)
 	var workingDir events.WorkingDir = &events.FileWorkspace{
-		InstanceScoped:    durable,
+		InstanceScoped:    storage.Store != nil,
 		DataDir:           userConfig.DataDir,
 		LocalSharePlanDir: userConfig.SharePlanDir,
 		CheckoutMerge:     userConfig.CheckoutStrategy == "merge",
@@ -625,6 +637,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ExecutableName: userConfig.ExecutableName,
 	}
 	deleteLockCommand := &events.DefaultDeleteLockCommand{
+		Execution:        storage.Execution,
 		Locker:           lockingClient,
 		WorkingDir:       workingDir,
 		WorkingDirLocker: workingDirLocker,
@@ -667,6 +680,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		allowCommands,
 		userConfig.ToBlockedExtraArgs(),
 	)
+	commentParser.UnlockRecoveryEnabled = storage.Execution != nil
 	defaultTfDistribution := distribution
 	terraformBinDir := binDir
 
@@ -697,6 +711,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		ProjectCmdOutputHandler: projectCmdOutputHandler,
 	}
 	drainer := &events.Drainer{}
+	if storage.Execution != nil {
+		storage.Execution.Drainer = drainer
+	}
 	statusController := &controllers.StatusController{
 		Logger:          logger,
 		Drainer:         drainer,
@@ -760,19 +777,16 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 
 	deleteLockCommand.PlanStore = planStore
 
-	pullClosedExecutor := events.NewInstrumentedPullClosedExecutor(
-		statsScope,
-		logger,
-		&events.PullClosedExecutor{
-			Locker:                   lockingClient,
-			WorkingDir:               workingDir,
-			Database:                 database,
-			PullClosedTemplate:       &events.PullClosedEventTemplate{},
-			LogStreamResourceCleaner: projectCmdOutputHandler,
-			VCSClient:                vcsClient,
-			PlanStore:                planStore,
-		},
-	)
+	pullClosedWorker := &events.PullClosedExecutor{
+		LivePullHeadFetcher: livePullHeadFetcher,
+		Executions:          storage.Claims, Locker: lockingClient, WorkingDir: workingDir, Database: database,
+		PullClosedTemplate: &events.PullClosedEventTemplate{}, LogStreamResourceCleaner: projectCmdOutputHandler, VCSClient: vcsClient, PlanStore: planStore,
+	}
+	pullClosedExecutor := events.NewInstrumentedPullClosedExecutor(statsScope, logger, pullClosedWorker)
+	var storageMaintenance func()
+	if storage.Store != nil {
+		storageMaintenance = storage.Maintain(pullClosedWorker, logger)
+	}
 
 	projectFinder := &events.DefaultProjectFinder{}
 	projectCommandBuilder := events.NewInstrumentedProjectCommandBuilder(
@@ -833,7 +847,10 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		),
 	}
 
-	cancellationTracker := events.NewCancellationTracker()
+	var cancellationTracker events.CancellationTracker = events.NewCancellationTracker()
+	if storage.Store != nil {
+		cancellationTracker = &events.DurableCancellationTracker{Store: storage.Store}
+	}
 
 	varFileAllowlistChecker, err := events.NewVarFileAllowlistChecker(userConfig.VarFileAllowlist)
 	if err != nil {
@@ -841,6 +858,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
+		Jobs:                    storage.Jobs,
+		Execution:               storage.Execution,
 		VcsClient:               vcsClient,
 		VarFileAllowlistChecker: varFileAllowlistChecker,
 		Locker:                  projectLocker,
@@ -891,6 +910,12 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	pullUpdater := &events.PullUpdater{
+		ClaimCheck: func(p models.PullRequest) error {
+			if storage.Store != nil && p.ExecutionOwner() != "" {
+				return storage.Store.CheckClaim(p)
+			}
+			return nil
+		},
 		HidePrevPlanComments: userConfig.HidePrevPlanComments,
 		VCSClient:            vcsClient,
 		MarkdownRenderer:     markdownRenderer,
@@ -1019,6 +1044,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		userConfig.SilenceNoProjects,
 	)
 
+	unlockCommandRunner.Execution = storage.Execution
+
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
 		command.Plan:            planCommandRunner,
 		command.Apply:           applyCommandRunner,
@@ -1050,6 +1077,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	commandRunner := &events.DefaultCommandRunner{
+		LivePullHeadFetcher:            livePullHeadFetcher,
+		Execution:                      storage.Execution,
 		VCSClient:                      vcsClient,
 		GithubPullGetter:               githubClient,
 		GitlabMergeRequestGetter:       gitlabClient,
@@ -1081,7 +1110,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		return nil, err
 	}
 	locksController := &controllers.LocksController{
-		Durable:            durable,
+		Durable:            storage.Store != nil,
 		AtlantisVersion:    config.AtlantisVersion,
 		AtlantisURL:        parsedURL,
 		Locker:             lockingClient,
@@ -1115,6 +1144,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	}
 
 	apiController := &controllers.APIController{
+		Execution:                       storage.Execution,
 		APISecret:                       []byte(userConfig.APISecret),
 		Locker:                          lockingClient,
 		Logger:                          logger,
@@ -1154,7 +1184,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		apiController.DriftWebhookSender = driftWebhookSender
 	}
 
+	var lifecycleFetcher events.LivePullHeadFetcher
+	var pullReopener events_controllers.PullReopener
+	if storage.Store != nil {
+		pullReopener = storage.Store
+		lifecycleFetcher = livePullHeadFetcher
+	}
 	eventsController := &events_controllers.VCSEventsController{
+		PullReopener:                    pullReopener,
+		LivePullHeadFetcher:             lifecycleFetcher,
 		CommandRunner:                   commandRunner,
 		PullCleaner:                     pullClosedExecutor,
 		Parser:                          eventParser,
@@ -1222,6 +1260,8 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		EnableProfilingAPI:             userConfig.EnableProfilingAPI,
 		Experiments:                    slices.Clone(userConfig.Experiments),
 		database:                       database,
+		jobService:                     storage.Jobs,
+		storageMaintenance:             storageMaintenance,
 	}
 
 	validate := validator.New(validator.WithRequiredStructEnabled())
@@ -1249,6 +1289,9 @@ func (s *Server) SetupRoutes() {
 		s.Router.HandleFunc("/api/plan", s.APIController.Plan).Methods("POST")
 		s.Router.HandleFunc("/api/apply", s.APIController.Apply).Methods("POST")
 		s.Router.HandleFunc("/api/locks", s.APIController.ListLocks).Methods("GET")
+	}
+	if s.APIController != nil && s.APIController.Execution != nil && (slices.Contains(s.Experiments, apiExperiment) || slices.Contains(s.Experiments, driftExperiment)) {
+		s.Router.HandleFunc("/api/jobs/{job-id}/unlock", s.APIController.UnlockJob).Methods("POST")
 	}
 	if slices.Contains(s.Experiments, driftExperiment) {
 		s.Router.HandleFunc("/api/drift/status", s.APIController.DriftStatus).Methods("GET")
@@ -1289,6 +1332,25 @@ func (s *Server) SetupRoutes() {
 
 // Start creates the routes and starts serving traffic.
 func (s *Server) Start() error {
+	if s.storageMaintenance != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		s.storageCancel = cancel
+		s.storageDone = make(chan struct{})
+		go func() {
+			defer close(s.storageDone)
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					s.runStorageMaintenance()
+				}
+			}
+		}()
+		defer cancel()
+	}
 	s.SetupRoutes()
 
 	n := negroni.New(&negroni.Recovery{
@@ -1352,6 +1414,20 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// runStorageMaintenance participates in the same admission fence as commands.
+func (s *Server) runStorageMaintenance() {
+	if s.storageMaintenance == nil {
+		return
+	}
+	if s.Drainer != nil {
+		if !s.Drainer.StartOp() {
+			return
+		}
+		defer s.Drainer.OpDone()
+	}
+	s.storageMaintenance()
+}
+
 // waitForDrain blocks until draining is complete.
 func (s *Server) waitForDrain() {
 	drainComplete := make(chan bool, 1)
@@ -1373,13 +1449,28 @@ func (s *Server) waitForDrain() {
 
 // closeDatabase attempts to close the database, waiting up to the given timeout.
 func (s *Server) closeDatabase(timeout time.Duration) error {
+	if s.storageCancel != nil {
+		s.storageCancel()
+		select {
+		case <-s.storageDone:
+		case <-time.After(timeout):
+			return fmt.Errorf("storage maintenance did not stop before timeout")
+		}
+	}
+
 	if s.database == nil {
 		return nil
 	}
 	s.Logger.Info("Shutting down database")
 
 	done := make(chan error, 1)
-	go func() { done <- s.database.Close() }()
+	go func() {
+		var jobErr error
+		if s.jobService != nil {
+			jobErr = s.jobService.Close()
+		}
+		done <- errors.Join(jobErr, s.database.Close())
+	}()
 	select {
 	case err := <-done:
 		return err

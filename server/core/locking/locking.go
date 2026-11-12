@@ -34,6 +34,7 @@ type Client struct {
 type Locker interface {
 	TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error)
 	Unlock(key string) (*models.ProjectLock, error)
+	UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error)
 	UnlockIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
 	List() (map[string]models.ProjectLock, error)
 	UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error)
@@ -75,6 +76,20 @@ func (c *Client) Unlock(key string) (*models.ProjectLock, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.unlock(repo, project, workspace)
+}
+
+// UnlockOwned carries an internal claim owner without adding it to the public lock key.
+func (c *Client) UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error) {
+	repo, project, workspace, err := c.decodeKey(key)
+	if err != nil {
+		return nil, err
+	}
+	repo.Execution = pull.Execution
+	return c.unlock(repo, project, workspace)
+}
+
+func (c *Client) unlock(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error) {
 	if scoped, ok := c.database.(db.RepoScopedLocks); ok {
 		return scoped.UnlockInRepo(repo, project, workspace)
 	}
@@ -205,4 +220,8 @@ func (c *NoOpLocker) GetLock(_ string) (*models.ProjectLock, error) {
 
 func (c *NoOpLocker) key(p models.Project, workspace string) string {
 	return models.GenerateLockKey(p, workspace)
+}
+
+func (c *NoOpLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
 }

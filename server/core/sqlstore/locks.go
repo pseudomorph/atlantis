@@ -34,11 +34,7 @@ func (s *Store) TryLock(want models.ProjectLock) (bool, models.ProjectLock, erro
 	var acquired bool
 	var actual models.ProjectLock
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		p, err := savePull(tx, want.Pull)
-		if err != nil {
-			return err
-		}
-		if _, err := lockPull(tx, p.ID); err != nil {
+		if err := s.guard(tx, want.Pull); err != nil {
 			return err
 		}
 		rows, err := loadLocks(tx, tx.Where("project_id IN (?)", projectIDs(tx, want.Pull.BaseRepo, want.Project, want.Workspace)))
@@ -48,6 +44,10 @@ func (s *Store) TryLock(want models.ProjectLock) (bool, models.ProjectLock, erro
 		if len(rows) != 0 {
 			actual = rows[0]
 			return nil
+		}
+		p, err := savePull(tx, want.Pull)
+		if err != nil {
+			return err
 		}
 		project, err := saveProject(tx, p.RepositoryID, want.Project.Path, want.Project.ProjectName, want.Workspace)
 		if err != nil {
@@ -109,9 +109,9 @@ func loadLocks(tx, query *gorm.DB) ([]models.ProjectLock, error) {
 }
 
 // locks reads and optionally removes the same rows in one transaction. Removal
-// locks each pull through guard, then deletes exactly the rows it returns and
-// discards their project status.
-func (s *Store) locks(where func(*gorm.DB) *gorm.DB, remove bool) ([]models.ProjectLock, error) {
+// locks each pull through guardRemoval, then deletes exactly the rows it returns
+// and discards their project status.
+func (s *Store) locks(where func(*gorm.DB) *gorm.DB, remove bool, owner string) ([]models.ProjectLock, error) {
 	var result []models.ProjectLock
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var err error
@@ -121,7 +121,9 @@ func (s *Store) locks(where func(*gorm.DB) *gorm.DB, remove bool) ([]models.Proj
 		}
 		if remove {
 			for _, lock := range result {
-				if err := s.guard(tx, lock.Pull); err != nil {
+				p := lock.Pull
+				p.Execution = &models.Execution{Owner: owner}
+				if err := s.guardRemoval(tx, p); err != nil {
 					return err
 				}
 			}
@@ -156,25 +158,25 @@ func firstLock(locks []models.ProjectLock, err error) (*models.ProjectLock, erro
 }
 
 func (s *Store) List() ([]models.ProjectLock, error) {
-	return s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Model(&lock{}) }, false)
+	return s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Model(&lock{}) }, false, "")
 }
 
 func (s *Store) GetLockInRepo(repo models.Repo, p models.Project, workspace string) (*models.ProjectLock, error) {
-	return firstLock(s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("project_id IN (?)", projectIDs(tx, repo, p, workspace)) }, false))
+	return firstLock(s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("project_id IN (?)", projectIDs(tx, repo, p, workspace)) }, false, ""))
 }
 
 func (s *Store) UnlockInRepo(repo models.Repo, p models.Project, workspace string) (*models.ProjectLock, error) {
-	return firstLock(s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("project_id IN (?)", projectIDs(tx, repo, p, workspace)) }, true))
+	return firstLock(s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("project_id IN (?)", projectIDs(tx, repo, p, workspace)) }, true, repo.ExecutionOwner()))
 }
 
 func (s *Store) UnlockInRepoIfOwnedByPull(repo models.Repo, p models.Project, workspace string, number int) (*models.ProjectLock, error) {
 	return firstLock(s.locks(func(tx *gorm.DB) *gorm.DB {
 		return tx.Where("project_id IN (?) AND pull_id IN (?)", projectIDs(tx, repo, p, workspace), pullIDs(tx, repo, number))
-	}, true))
+	}, true, repo.ExecutionOwner()))
 }
 
 func (s *Store) UnlockByPullInRepo(repo models.Repo, number int) ([]models.ProjectLock, error) {
-	return s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("pull_id IN (?)", pullIDs(tx, repo, number)) }, true)
+	return s.locks(func(tx *gorm.DB) *gorm.DB { return tx.Where("pull_id IN (?)", pullIDs(tx, repo, number)) }, true, repo.ExecutionOwner())
 }
 
 // errRepositoryIdentityRequired rejects lock lookups by repository full name.

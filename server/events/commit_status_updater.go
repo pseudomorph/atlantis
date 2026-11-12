@@ -36,7 +36,8 @@ type CommitStatusUpdater interface {
 
 // DefaultCommitStatusUpdater implements CommitStatusUpdater.
 type DefaultCommitStatusUpdater struct {
-	Client vcs.Client
+	ClaimCheck func(models.PullRequest) error
+	Client     vcs.Client
 	// StatusName is the name used to identify Atlantis when creating PR statuses.
 	StatusName string
 }
@@ -55,6 +56,11 @@ func (d *DefaultCommitStatusUpdater) UpdateCombined(logger logging.SimpleLogging
 		descripWords = genProjectStatusDescription(cmdName.String(), "failed.")
 	case models.SuccessCommitStatus:
 		descripWords = genProjectStatusDescription(cmdName.String(), "succeeded.")
+	}
+	if d.ClaimCheck != nil && pull.ExecutionOwner() != "" {
+		if err := d.ClaimCheck(pull); err != nil {
+			return err
+		}
 	}
 	return d.Client.UpdateStatus(logger, repo, pull, status, src, descripWords, "")
 }
@@ -112,6 +118,11 @@ func (d *DefaultCommitStatusUpdater) UpdateCombinedCount(logger logging.SimpleLo
 		}
 	}
 
+	if d.ClaimCheck != nil && pull.ExecutionOwner() != "" {
+		if err := d.ClaimCheck(pull); err != nil {
+			return err
+		}
+	}
 	return d.Client.UpdateStatus(logger, repo, pull, status, src, descrip, "")
 }
 
@@ -132,6 +143,11 @@ func (d *DefaultCommitStatusUpdater) UpdateProject(ctx command.ProjectContext, c
 			descripWords = result.PlanSuccess.DiffSummary()
 		} else {
 			descripWords = genProjectStatusDescription(cmdName.String(), "succeeded.")
+		}
+	}
+	if d.ClaimCheck != nil && ctx.Pull.ExecutionOwner() != "" {
+		if err := d.ClaimCheck(ctx.Pull); err != nil {
+			return err
 		}
 	}
 	return d.Client.UpdateStatus(ctx.Log, ctx.BaseRepo, ctx.Pull, status, src, descripWords, url)
@@ -187,5 +203,10 @@ func (d *DefaultCommitStatusUpdater) updateWorkflowHook(log logging.SimpleLoggin
 		}
 	}
 
+	if d.ClaimCheck != nil && pull.ExecutionOwner() != "" {
+		if err := d.ClaimCheck(pull); err != nil {
+			return err
+		}
+	}
 	return d.Client.UpdateStatus(log, pull.BaseRepo, pull, status, src, descripWords, url)
 }

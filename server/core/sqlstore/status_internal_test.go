@@ -31,6 +31,8 @@ func TestRevisionAndTargetChangesReplaceProjects(t *testing.T) {
 func TestStatusRelationshipsAndCascade(t *testing.T) {
 	s := conformanceStore(t)
 	p := claimPull()
+	p.Execution = &models.Execution{Owner: "first"}
+	Ok(t, s.AcquireClaim(p, p.ExecutionOwner()))
 	result := command.ProjectResult{RepoRelDir: ".", Workspace: "default"}
 	_, err := s.UpdatePullWithResults(p, []command.ProjectResult{result})
 	Ok(t, err)
@@ -39,6 +41,8 @@ func TestStatusRelationshipsAndCascade(t *testing.T) {
 
 	other := p
 	other.BaseRepo.FullName = "team/other"
+	other.Execution = &models.Execution{Owner: "other-repository"}
+	Ok(t, s.AcquireClaim(other, other.ExecutionOwner()))
 	_, err = s.UpdatePullWithResults(other, []command.ProjectResult{result})
 	Ok(t, err)
 	var second projectStatus
@@ -49,7 +53,8 @@ func TestStatusRelationshipsAndCascade(t *testing.T) {
 
 	withoutStatus := p
 	withoutStatus.Num++
-	storedLock(t, s, withoutStatus, "no-status")
+	withoutStatus.Execution = &models.Execution{Owner: "no-status"}
+	Ok(t, s.AcquireClaim(withoutStatus, withoutStatus.ExecutionOwner()))
 	var stored pull
 	Ok(t, s.db.Where("id IN (?)", pullIDs(s.db, withoutStatus.BaseRepo, withoutStatus.Num)).Take(&stored).Error)
 	ErrContains(t, "FOREIGN KEY constraint failed", s.db.Exec("UPDATE project_statuses SET pull_id = ? WHERE pull_id = ?", stored.ID, first.PullID).Error)

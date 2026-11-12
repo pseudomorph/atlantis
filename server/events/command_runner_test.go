@@ -18,6 +18,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/metrics/metricstest"
@@ -1887,6 +1888,10 @@ func (l failUnlockByPullLocker) Unlock(string) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
+func (l failUnlockByPullLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
+}
+
 func (l failUnlockByPullLocker) List() (map[string]models.ProjectLock, error) {
 	return nil, nil
 }
@@ -2984,6 +2989,43 @@ func TestRunCommentCommand_VarFileOutsideAllowlistRejectedForEveryCommand(t *tes
 			vcsClient.VerifyWasCalledOnce().CreateComment(
 				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num),
 				Eq("```\nvar file path /etc/passwd is not allowed by the current allowlist: []\n```"), Eq(""))
+		})
+	}
+}
+
+// A durable execution claim that autoplan cannot take is reported like a busy
+// working-directory pull lock in legacy autoplan: failed plan status and a PR
+// comment, with no retry.
+func TestRunAutoplanCommand_DurableClaimRejectionFailsPlan(t *testing.T) {
+	for name, prepare := range map[string]func(*testing.T, *sqlstore.Store, models.PullRequest){
+		"claim held": func(t *testing.T, store *sqlstore.Store, pull models.PullRequest) {
+			pull.Execution = &models.Execution{Owner: "running-command"}
+			Ok(t, store.AcquireClaim(pull, "running-command"))
+		},
+		"reopened before closure cleanup": func(t *testing.T, store *sqlstore.Store, pull models.PullRequest) {
+			Ok(t, store.ClosePull(pull))
+			Ok(t, store.RequestReopen(pull))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vcsClient := setup(t)
+			store, err := sqlstore.OpenServer(t.TempDir())
+			Ok(t, err)
+			t.Cleanup(func() { _ = store.Close() })
+			ch.Execution = &events.ExecutionCoordinator{Store: store}
+			pull := testdata.Pull
+			pull.BaseRepo = testdata.GithubRepo
+			prepare(t, store, pull)
+
+			ch.RunAutoplanCommand(testdata.GithubRepo, testdata.GithubRepo, pull, testdata.User)
+
+			projectCommandBuilder.VerifyWasCalled(Never()).BuildAutoplanCommands(Any[*command.Context]())
+			commitUpdater.VerifyWasCalledOnce().UpdateCombined(
+				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Any[models.PullRequest](), Eq(models.FailedCommitStatus), Eq(command.Plan))
+			_, _, _, comment, _ := vcsClient.VerifyWasCalledOnce().CreateComment(
+				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(pull.Num), Any[string](), Eq("plan")).GetCapturedArguments()
+			Assert(t, strings.Contains(comment, "Plan Error"), "got: %s", comment)
+			Assert(t, strings.Contains(comment, "starting autoplan"), "got: %s", comment)
 		})
 	}
 }
