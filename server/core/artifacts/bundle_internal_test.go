@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -265,6 +266,57 @@ func TestPlanBundleLoadChecksRawPlanChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+func TestPlanBundleInitializationMetadataStagesWithPlan(t *testing.T) {
+	for _, fixture := range []string{"invalid", "valid", "no provider lock", "resources", "outputs", "check_results"} {
+		t.Run(fixture, func(t *testing.T) {
+			valid := fixture == "valid" || fixture == "no provider lock"
+			service, records, blobs, ctx, root := bundleFixture(t)
+			ctx.RequiresAtlantisManagedPlanFile = true
+			ctx.TerraformVersion = version.Must(version.NewVersion("1.1.0"))
+			distribution := "terraform"
+			ctx.TerraformDistribution = &distribution
+			ctx.Workspace = "default"
+			if err := os.Mkdir(filepath.Join(root, ".terraform"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			metadata := `{"resources":[{"sensitive":"actual state"}]}`
+			if valid {
+				metadata = `{"version":3,"serial":1,"lineage":"init-metadata","backend":{"type":"s3","config":{"bucket":"state"},"hash":123}}`
+			}
+			if fixture != "invalid" && !valid {
+				metadata = fmt.Sprintf(`{"backend":{"type":"s3"},%q:[]}`, fixture)
+			}
+			if err := os.WriteFile(filepath.Join(root, ".terraform/terraform.tfstate"), []byte(metadata), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if fixture == "no provider lock" {
+				if err := os.Remove(filepath.Join(root, DependencyLockFile)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := service.SnapshotPlanWithEnvironment(ctx, root, filepath.Join(root, "project.tfplan"), map[string]string{"TF_WORKSPACE": "default"})
+			if !valid {
+				if err == nil || records.begins != 0 || blobs.puts != 0 {
+					t.Fatal("invalid backend published part of a snapshot")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if records.ready.Manifest.DataDirectory != ".terraform" {
+				t.Fatal("lost runtime directory")
+			}
+			if _, ok := records.ready.Manifest.File("backend"); !ok {
+				t.Fatal("lost backend metadata")
+			}
+			if _, ok := records.ready.Manifest.File("workspace"); !ok {
+				t.Fatal("lost workspace")
+			}
+		})
+	}
+}
+
 func TestPlanBundleNormalizesPermissionsAndOverlappingDeclarations(t *testing.T) {
 	service, records, _, ctx, root := bundleFixture(t)
 	plan := filepath.Join(root, "project.tfplan")

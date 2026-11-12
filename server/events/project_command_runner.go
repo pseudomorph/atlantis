@@ -18,6 +18,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/terraform"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -1276,11 +1277,22 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 	defer unlock()
 
 	envs := make(map[string]string)
+	ctx, restoredInitArgs, initializeRestored, err := p.prepareDurableRestore(ctx)
+	if err != nil {
+		return outputs, err
+	}
 	for _, step := range steps {
 		if p.Jobs != nil {
 			if err := p.Execution.Store.CheckClaim(ctx.Pull); err != nil {
 				return outputs, err
 			}
+		}
+		if initializeRestored && step.StepName != "env" && step.StepName != "multienv" {
+			out, err := p.InitStepRunner.Run(ctx, restoredInitArgs, absPath, envs)
+			if err != nil {
+				return append(outputs, out), fmt.Errorf("initializing restored plan: %w", err)
+			}
+			initializeRestored = false
 		}
 		var out string
 		var err error
@@ -1345,7 +1357,7 @@ func (p *DefaultProjectCommandRunner) runSteps(steps []valid.Step, ctx command.P
 		}
 	}
 	if p.Artifacts != nil && ctx.CommandName == command.Plan {
-		if err := p.Artifacts.SnapshotPlan(ctx, absPath, runtime.GetPlanFilePath(ctx, absPath)); err != nil {
+		if err := p.Artifacts.SnapshotPlanWithEnvironment(ctx, absPath, runtime.GetPlanFilePath(ctx, absPath), envs); err != nil {
 			return outputs, err
 		}
 	}
@@ -1428,6 +1440,18 @@ func (p *DefaultProjectCommandRunner) withDurableJob(ctx command.ProjectContext,
 		return command.ProjectCommandOutput{Error: err}
 	}
 	ctx.CommandName = name
+	if init, ok := p.InitStepRunner.(*runtime.InitStepRunner); ok {
+		if ctx.TerraformVersion == nil {
+			ctx.TerraformVersion = init.DefaultTFVersion
+		}
+		if ctx.TerraformDistribution == nil && init.DefaultTFDistribution != nil {
+			distribution := "terraform"
+			if init.DefaultTFDistribution.BinName() == terraform.NewDistributionOpenTofu().BinName() {
+				distribution = "opentofu"
+			}
+			ctx.TerraformDistribution = &distribution
+		}
+	}
 	if ctx.JobID == "" {
 		ctx.JobID = uuid.NewString()
 	}
