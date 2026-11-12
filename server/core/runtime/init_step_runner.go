@@ -64,7 +64,7 @@ func (i *InitStepRunner) Run(ctx command.ProjectContext, extraArgs []string, pat
 	}
 
 	if ctx.RestoredDataDirectory != "" {
-		if !common.FileExists(terraformLockfilePath) {
+		if ctx.RestoredLockHash != "" && !common.FileExists(terraformLockfilePath) {
 			return "", fmt.Errorf("restored dependency lock file is missing; run plan again")
 		}
 		if ctx.RestoredLockHash != "" {

@@ -6,13 +6,13 @@ package events
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/hashicorp/go-version"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -21,7 +21,7 @@ import (
 )
 
 func TestDurableRestoreAdmission(t *testing.T) {
-	for _, name := range []string{"default", "explicit init", "changed version", "changed distribution", "missing version", "corrupt manifest", "custom setup", "old prerelease"} {
+	for _, name := range []string{"default", "explicit init", "changed version", "changed distribution", "missing version", "corrupt manifest", "custom setup", "custom init arguments", "old prerelease"} {
 		t.Run(name, func(t *testing.T) {
 			store, err := sqlstore.OpenServer(t.TempDir())
 			Ok(t, err)
@@ -29,7 +29,7 @@ func TestDurableRestoreAdmission(t *testing.T) {
 			blobs, err := artifacts.NewFilesystem(t.TempDir())
 			Ok(t, err)
 			defer blobs.Close()
-			service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: blobs}}
+			service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 			defer service.Close()
 			tool := "terraform"
 			toolVersion := version.Must(version.NewVersion("1.15.0"))
@@ -40,6 +40,9 @@ func TestDurableRestoreAdmission(t *testing.T) {
 			ctx := command.ProjectContext{ArtifactRoot: t.TempDir(), JobID: uuid.NewString(), CommandName: command.Plan, BaseRepo: repo, Pull: models.PullRequest{BaseRepo: repo, Num: 1, HeadCommit: "revision", Execution: &models.Execution{Owner: "owner"}}, RepoRelDir: ".", Workspace: "default", RequiresAtlantisManagedPlanFile: true, TerraformVersion: toolVersion, TerraformDistribution: &tool, Steps: []valid.Step{{StepName: "init"}, {StepName: "plan"}}}
 			if name == "custom setup" {
 				ctx.Steps = append([]valid.Step{{StepName: "run", RunCommand: "custom setup"}}, ctx.Steps...)
+			}
+			if name == "custom init arguments" {
+				ctx.Steps[0].ExtraArgs = []string{"-backend-config=secret=value"}
 			}
 			if name == "missing version" {
 				ctx.TerraformVersion = nil
@@ -53,14 +56,7 @@ func TestDurableRestoreAdmission(t *testing.T) {
 			Ok(t, service.Artifacts.SnapshotPlanWithEnvironment(ctx, ctx.ArtifactRoot, planPath, nil))
 			Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 			if name == "corrupt manifest" {
-				records, err := store.Artifacts(ctx.JobID)
-				Ok(t, err)
-				for _, artifact := range records {
-					if artifact.Kind == "runtime" {
-						_, err := blobs.Put(artifact.Location, strings.NewReader("corrupt"))
-						Ok(t, err)
-					}
-				}
+				service.Artifacts.Records = corruptSnapshotStore{store}
 			}
 			consumer := ctx
 			consumer.JobID, consumer.CommandName = uuid.NewString(), command.Apply
@@ -93,4 +89,14 @@ func TestDurableRestoreAdmission(t *testing.T) {
 			}
 		})
 	}
+}
+
+type corruptSnapshotStore struct{ db.SnapshotStore }
+
+func (s corruptSnapshotStore) InputSnapshot(id string) (*models.PlanSnapshot, error) {
+	snapshot, err := s.SnapshotStore.InputSnapshot(id)
+	if snapshot != nil {
+		snapshot.Manifest.DataDirectory = "../escape"
+	}
+	return snapshot, err
 }

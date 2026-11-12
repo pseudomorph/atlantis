@@ -41,7 +41,7 @@ func TestDurableApplyAllUsesPendingPlanInventory(t *testing.T) {
 			blobs, err := artifacts.NewFilesystem(t.TempDir())
 			Ok(t, err)
 			defer blobs.Close()
-			service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+			service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 			repo := models.Repo{FullName: "org/repo", Owner: "org", Name: "repo"}
 			pull := models.PullRequest{BaseRepo: repo, Num: 1, Execution: &models.Execution{Owner: uuid.NewString()}}
 			Ok(t, db.AcquireClaim(pull, pull.ExecutionOwner()))
@@ -57,7 +57,7 @@ func TestDurableApplyAllUsesPendingPlanInventory(t *testing.T) {
 				Ok(t, db.StartPlan(ctx.JobID))
 				file := filepath.Join(ctx.ArtifactRoot, "plan")
 				Ok(t, os.WriteFile(file, []byte("durable plan"), 0600))
-				Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
+				Ok(t, service.Artifacts.SnapshotPlan(ctx, ctx.ArtifactRoot, file))
 				Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 				projects = append(projects, models.ProjectStatus{RepoRelDir: "infra", Workspace: workspace, Status: models.PlannedPlanStatus})
 				planContexts = append(planContexts, ctx)

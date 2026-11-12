@@ -37,18 +37,6 @@ type Job struct {
 	FinishedAt       *time.Time
 }
 
-type Artifact struct {
-	Sequence     int64
-	RelativePath string
-	ID           string
-	JobID        string
-	Kind         string
-	Location     string
-	Size         int64
-	SHA256       string
-	CreatedAt    time.Time
-}
-
 // JobStep preserves workflow order without persisting commands or argument values.
 type JobStep struct {
 	Name         string `json:"name"`

@@ -38,73 +38,38 @@ func (p *Service) Load(ctx command.ProjectContext, filename string) error {
 		if plan.Revision != ctx.Pull.HeadCommit {
 			return fmt.Errorf("pending plan revision differs; run plan again")
 		}
-		records, err := p.Records.InputArtifacts(ctx.JobID)
+		snapshot, err := p.Records.InputSnapshot(ctx.JobID)
 		if err != nil {
 			return err
 		}
-		root := ctx.ArtifactRoot
-		verifiedPlan := ctx.ExpectedPlanHash == ""
-		for _, a := range records {
-			if a.Kind == "plan" {
-				if ctx.ExpectedPlanHash != "" && a.SHA256 != ctx.ExpectedPlanHash {
-					return fmt.Errorf("pending plan differs from expected plan checksum")
-				}
-				verifiedPlan = true
-				break
-			}
+		if snapshot == nil || snapshot.JobID != plan.ID {
+			return fmt.Errorf("pending plan snapshot is missing")
 		}
-		if !verifiedPlan {
-			return fmt.Errorf("expected plan checksum requires a plan artifact")
+		file, havePlan := snapshot.Manifest.File("plan")
+		if ctx.ExpectedPlanHash != "" && (!havePlan || file.SHA256 != ctx.ExpectedPlanHash) {
+			return fmt.Errorf("pending plan differs from expected plan checksum")
 		}
-		if ctx.RestoredDataDirectory != "" {
-			selected := records[:0]
-			for _, artifact := range records {
-				if artifact.Kind == "plan" || artifact.Kind == "show" {
-					selected = append(selected, artifact)
-				}
-			}
-			records = selected
+		if plan.ManagedPlan && !havePlan {
+			return fmt.Errorf("plan snapshot has no managed plan")
 		}
-		return p.restoreArtifacts(plan, records, filename, filepath.Join(filepath.Dir(filename), ctx.GetShowResultFileName()), root, root)
+		return p.restoreSnapshot(*snapshot, filename, filepath.Join(filepath.Dir(filename), ctx.GetShowResultFileName()), ctx.ArtifactRoot, ctx.ArtifactRoot, ctx.RestoredDataDirectory != "")
 	}
 	return fmt.Errorf("pending plan was invalidated or replaced; run plan again")
 }
 func (p *Service) restoreJob(job models.Job, planPath, showPath, root string) error {
-	records, err := p.Records.Artifacts(job.ID)
+	snapshot, err := p.Records.Snapshot(job.ID)
 	if err != nil {
 		return err
 	}
-	return p.restoreArtifacts(job, records, planPath, showPath, root, filepath.Join(root, job.Workspace))
-}
-func (p *Service) restoreArtifacts(job models.Job, records []models.Artifact, planPath, showPath, root, workflowRoot string) error {
-	havePlan, haveShow := false, false
-	for _, a := range records {
-		if a.Kind == "workflow" || a.Kind == "lockfile" || a.Kind == "backend" || a.Kind == "workspace" {
-			if !filepath.IsLocal(a.RelativePath) {
-				return fmt.Errorf("invalid workflow artifact destination")
-			}
-			if err := p.Restore(a, filepath.Join(workflowRoot, a.RelativePath), root); err != nil {
-				return err
-			}
-		}
-		if a.Kind == "plan" && !havePlan {
-			if err := p.Restore(a, planPath, root); err != nil {
-				return err
-			}
-			havePlan = true
-		}
-		if a.Kind == "show" && !haveShow {
-			if err := p.Restore(a, showPath, root); err != nil {
-				return err
-			}
-			haveShow = true
-		}
+	if snapshot == nil {
+		return fmt.Errorf("plan snapshot is missing for job %q", job.ID)
 	}
-	if !havePlan && job.ManagedPlan {
-		return fmt.Errorf("plan artifact missing for job %q", job.ID)
+	if _, exists := snapshot.Manifest.File("plan"); job.ManagedPlan && !exists {
+		return fmt.Errorf("plan snapshot has no managed plan")
 	}
-	return nil
+	return p.restoreSnapshot(*snapshot, planPath, showPath, root, filepath.Join(root, job.Workspace), false)
 }
+
 func (p *Service) Remove(_ command.ProjectContext, filename string) error {
 	err := os.Remove(filename)
 	showErr := os.Remove(strings.TrimSuffix(filename, ".tfplan") + ".json")

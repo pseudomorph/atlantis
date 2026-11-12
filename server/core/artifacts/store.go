@@ -11,7 +11,7 @@ type Metadata struct {
 }
 
 // Store uses opaque relative keys confined to a backend root.
-// Filesystem and S3 live here; sqlstore.BlobStore uses the application database.
+// Filesystem and S3 implement byte transport; database snapshots use a typed foreign key.
 type Store interface {
 	Close() error
 	List() ([]Object, error)

@@ -71,30 +71,40 @@ func TestPortableSchemaConformance(t *testing.T) {
 			stored, err := s.GetLock(p.BaseRepo, j.Project, j.Workspace)
 			Ok(t, err)
 			Assert(t, stored.Time.Equal(j.StartedAt.Truncate(time.Microsecond)), "lock timestamp changed instant")
-			a := models.Artifact{ID: uuid.NewString(), JobID: j.ID, Kind: "log", Location: "test/log", CreatedAt: j.StartedAt}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
-			rows, err := s.Artifacts(j.ID)
+			Ok(t, s.StartPlan(j.ID))
+			snapshot := validSnapshot(j.ID)
+			snapshot.CreatedAt = j.StartedAt
+			Ok(t, s.BeginSnapshot(snapshot))
+			Ok(t, s.CommitSnapshot(snapshot))
+			published, err := s.Snapshot(j.ID)
 			Ok(t, err)
-			Equals(t, 1, len(rows))
-			Assert(t, rows[0].CreatedAt.Equal(j.StartedAt.Truncate(time.Microsecond)), "artifact timestamp changed instant")
-			auto := a
-			auto.ID, auto.Location, auto.CreatedAt = uuid.NewString(), "test/auto-log", time.Time{}
-			Ok(t, s.BeginArtifact(auto))
-			Ok(t, s.CommitArtifact(auto))
-			var automatic models.Artifact
-			Ok(t, s.db.Table("artifacts").Where("id = ?", auto.ID).Take(&automatic).Error)
-			Assert(t, time.Since(automatic.CreatedAt).Abs() < time.Minute, "automatic timestamp changed instant")
-			Assert(t, automatic.CreatedAt.Location() == time.UTC && automatic.CreatedAt.Nanosecond()%1000 == 0, "automatic time is not UTC microseconds")
-			Ok(t, s.db.Table("artifacts").Where("id = ? AND created_at = ?", auto.ID, automatic.CreatedAt.UTC().Truncate(time.Microsecond)).Count(&matching).Error)
+			Assert(t, published != nil, "snapshot is missing")
+			Assert(t, published.CreatedAt.Equal(j.StartedAt.Truncate(time.Microsecond)), "snapshot timestamp changed instant")
+			autoJob := claimJob(p, uuid.NewString())
+			autoJob.Project = models.NewProject(p.BaseRepo.FullName, "another", "")
+			Ok(t, s.StartJob(autoJob))
+			Ok(t, s.StartPlan(autoJob.ID))
+			automatic := validSnapshot(autoJob.ID)
+			Ok(t, s.BeginSnapshot(automatic))
+			Ok(t, s.CommitSnapshot(automatic))
+			var generated struct{ CreatedAt time.Time }
+			Ok(t, s.db.Table("plan_snapshots").Where("job_id = ?", autoJob.ID).Take(&generated).Error)
+			Assert(t, time.Since(generated.CreatedAt).Abs() < time.Minute, "automatic timestamp changed instant")
+			Assert(t, generated.CreatedAt.Location() == time.UTC && generated.CreatedAt.Nanosecond()%1000 == 0, "automatic time is not UTC microseconds")
+			Ok(t, s.db.Table("plan_snapshots").Where("job_id = ? AND created_at = ?", autoJob.ID, generated.CreatedAt.UTC().Truncate(time.Microsecond)).Count(&matching).Error)
 			Equals(t, int64(1), matching)
+			Ok(t, s.FinishJob(autoJob.ID, "succeeded", ""))
 			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
 			got, err = s.Job(j.ID)
 			Ok(t, err)
 			Assert(t, got.FinishedAt != nil && time.Since(*got.FinishedAt).Abs() < time.Minute, "completion timestamp changed instant")
 			Ok(t, s.ClosePull(p))
 			Ok(t, s.ReleaseClaim(p))
-			rows, err = s.ExpiredArtifacts(time.Now().Add(2*time.Hour), time.Hour, 0)
+			now := time.Now().Add(2 * time.Hour)
+			rows, err := s.ExpiredSnapshots(now, time.Hour)
+			Ok(t, err)
+			Equals(t, 0, len(rows))
+			rows, err = s.ExpiredSnapshots(now.Add(time.Hour), time.Hour)
 			Ok(t, err)
 			Equals(t, 2, len(rows))
 		})
@@ -116,7 +126,7 @@ func TestPortableSchemaConformance(t *testing.T) {
 			Equals(t, "first", locks[0].Project.Path)
 			Equals(t, "second", locks[1].Project.Path)
 		})
-		t.Run("artifact ordering and retention comparisons", func(t *testing.T) {
+		t.Run("snapshot identity and retention comparisons", func(t *testing.T) {
 			s := conformanceStore(t)
 			p := claimPull()
 			Ok(t, s.AcquireClaim(p, "live"))
@@ -125,24 +135,24 @@ func TestPortableSchemaConformance(t *testing.T) {
 			Ok(t, s.StartJob(j))
 			Ok(t, s.StartPlan(j.ID))
 			at := time.Date(2026, 11, 5, 12, 0, 0, 987654321, time.UTC)
-			a := models.Artifact{ID: uuid.NewString(), JobID: j.ID, Kind: "workflow", RelativePath: "custom.plan", Location: uuid.NewString(), CreatedAt: at}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
-			duplicate := a
-			duplicate.ID = uuid.NewString()
-			duplicate.Location = uuid.NewString()
-			Assert(t, s.BeginArtifact(duplicate) != nil, "duplicate logical artifact accepted")
-			latest := a.ID
+			snapshot := validSnapshot(j.ID)
+			snapshot.CreatedAt = at
+			Ok(t, s.BeginSnapshot(snapshot))
+			Ok(t, s.CommitSnapshot(snapshot))
+			duplicate := snapshot
+			duplicate.Manifest = models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "other.tfplan", Size: 1, SHA256: snapshot.SHA256, Mode: 0600}}}
+			Assert(t, s.CommitSnapshot(duplicate) != nil, "published snapshot manifest changed")
 
 			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
 			consumer := claimJob(p, uuid.NewString())
 			consumer.Command = "apply"
 			Ok(t, s.StartJob(consumer))
-			inputs, err := s.InputArtifacts(consumer.ID)
+			input, err := s.InputSnapshot(consumer.ID)
 			Ok(t, err)
-			Equals(t, 1, len(inputs))
-			Equals(t, latest, inputs[0].ID)
-			Assert(t, inputs[0].CreatedAt.Equal(at.Truncate(time.Microsecond)), "artifact timestamp precision differs")
+			Assert(t, input != nil, "selected snapshot is missing")
+			Equals(t, j.ID, input.JobID)
+			Equals(t, snapshot.Manifest, input.Manifest)
+			Assert(t, input.CreatedAt.Equal(at.Truncate(time.Microsecond)), "snapshot timestamp precision differs")
 		})
 		t.Run("binary values and booleans", func(t *testing.T) {
 			s := conformanceStore(t)
@@ -151,24 +161,25 @@ func TestPortableSchemaConformance(t *testing.T) {
 			for i := range allBytes {
 				allBytes[i] = byte(i)
 			}
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
 			for _, payload := range [][]byte{{}, []byte("123.0"), allBytes} {
-				meta, err := store.Put("test/object", bytes.NewReader(payload))
+				j := claimJob(p, uuid.NewString())
+				Ok(t, s.StartJob(j))
+				snapshot := validSnapshot(j.ID)
+				Ok(t, s.BeginSnapshot(snapshot))
+				meta, err := store.PutSnapshot(j.ID, bytes.NewReader(payload))
 				Ok(t, err)
 				Equals(t, fmt.Sprintf("%x", sha256.Sum256(payload)), meta.SHA256)
-				r, err := store.Open("test/object")
+				r, err := store.OpenSnapshot(j.ID)
 				Ok(t, err)
 				got, err := io.ReadAll(r)
 				Ok(t, err)
 				Ok(t, r.Close())
 				Assert(t, bytes.Equal(payload, got), "binary payload changed")
+
 			}
-			objects, err := store.List()
-			Ok(t, err)
-			Equals(t, 1, len(objects))
-			Assert(t, time.Since(objects[0].ModifiedAt).Abs() < time.Minute, "blob timestamp changed instant")
-			p := claimPull()
-			Ok(t, s.AcquireClaim(p, "owner"))
-			p.Execution = &models.Execution{Owner: "owner"}
 			j := claimJob(p, uuid.NewString())
 			j.Private = true
 			Ok(t, s.StartJob(j))

@@ -12,63 +12,55 @@ import (
 
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 )
 
-type blob struct {
-	Key        string `gorm:"primaryKey"`
-	Content    []byte
-	ModifiedAt time.Time
+type snapshotBlob struct {
+	JobID   string `gorm:"primaryKey"`
+	Content []byte
 }
 
-func (blob) TableName() string { return "artifact_blobs" }
+func (snapshotBlob) TableName() string { return "snapshot_blobs" }
 
-// BlobStore shares the application database connection; it does not own its lifecycle.
+// BlobStore stores one bundle under its reserved snapshot foreign key.
+// The application store owns the shared database connection.
 type BlobStore struct{ Store *Store }
 
+var _ artifacts.SnapshotBackend = BlobStore{}
+
 func (s BlobStore) Close() error { return nil }
-func (s BlobStore) Put(key string, r io.Reader) (artifacts.Metadata, error) {
-	if !artifacts.ValidKey(key) {
-		return artifacts.Metadata{}, fmt.Errorf("invalid artifact key")
-	}
+func (s BlobStore) PutSnapshot(id string, r io.Reader) (artifacts.Metadata, error) {
 	content, err := io.ReadAll(r)
 	if err != nil {
 		return artifacts.Metadata{}, err
 	}
 	err = s.Store.db.Transaction(func(tx *gorm.DB) error {
-		now, err := databaseNow(tx)
-		if err != nil {
+		if _, err := s.Store.artifactJob(tx, id); err != nil {
 			return err
 		}
-		row := blob{key, content, now}
-		return tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "key"}}, DoUpdates: clause.AssignmentColumns([]string{"content", "modified_at"})}).Create(&row).Error
+		var intent planSnapshot
+		if err := tx.Where("job_id = ? AND ready = ? AND deleted = ?", id, false, false).Take(&intent).Error; err != nil {
+			return err
+		}
+		return tx.Create(&snapshotBlob{JobID: id, Content: content}).Error
 	})
 	return artifacts.Metadata{Size: int64(len(content)), SHA256: fmt.Sprintf("%x", sha256.Sum256(content))}, err
 }
-func (s BlobStore) Open(key string) (io.ReadCloser, error) {
-	if !artifacts.ValidKey(key) {
-		return nil, fmt.Errorf("invalid artifact key")
-	}
-	var row blob
-	if err := s.Store.db.Where("key = ?", key).Take(&row).Error; err != nil {
+func (s BlobStore) OpenSnapshot(id string) (io.ReadCloser, error) {
+	var row snapshotBlob
+	if err := s.Store.db.Where("job_id = ?", id).Take(&row).Error; err != nil {
 		return nil, err
 	}
 	return io.NopCloser(bytes.NewReader(row.Content)), nil
 }
-func (s BlobStore) Delete(key string) error {
-	if !artifacts.ValidKey(key) {
-		return fmt.Errorf("invalid artifact key")
-	}
-	return s.Store.db.Where("key = ?", key).Delete(&blob{}).Error
+func (s BlobStore) DeleteSnapshot(id string) error {
+	return s.Store.db.Transaction(func(tx *gorm.DB) error {
+		var row planSnapshot
+		if err := tx.Where("job_id = ? AND deleted = ?", id, true).Take(&row).Error; err != nil {
+			return err
+		}
+		return tx.Where("job_id = ?", id).Delete(&snapshotBlob{}).Error
+	})
 }
-func (s BlobStore) List() ([]artifacts.Object, error) {
-	var rows []blob
-	if err := s.Store.db.Select("key", "modified_at").Find(&rows).Error; err != nil {
-		return nil, err
-	}
-	var out []artifacts.Object
-	for _, r := range rows {
-		out = append(out, artifacts.Object{Key: r.Key, ModifiedAt: r.ModifiedAt})
-	}
-	return out, nil
-}
+
+// Database blobs cannot be orphaned: their parent reservation is created first.
+func (s BlobStore) CollectOrphans(map[string]bool, bool, time.Time) error { return nil }

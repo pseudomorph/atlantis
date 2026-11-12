@@ -326,9 +326,5 @@ func (s *Store) CheckExecutionStopped(p models.PullRequest) error {
 // Each log's retention clock belongs to the closure after its job, not to a later
 // reopen/close cycle of the same PR. Final cleanup also anchors late log chunks.
 func anchorClosedLogs(tx *gorm.DB, pullID string) error {
-	if err := anchorLogRetention(tx, pullID); err != nil {
-		return err
-	}
-	return tx.Exec(`UPDATE artifacts SET unreferenced_at = (SELECT closed_at FROM pulls WHERE id = ?)
-      WHERE kind = 'log' AND unreferenced_at IS NULL AND job_id IN (SELECT id FROM jobs WHERE pull_id = ?)`, pullID, pullID).Error
+	return anchorLogRetention(tx, pullID)
 }

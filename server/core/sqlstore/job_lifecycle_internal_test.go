@@ -17,9 +17,9 @@ func readyLifecyclePlan(t *testing.T, s *Store, p models.PullRequest) models.Job
 	plan.Revision = p.HeadCommit
 	Ok(t, s.StartJob(plan))
 	Ok(t, s.StartPlan(plan.ID))
-	artifact := models.Artifact{ID: uuid.NewString(), JobID: plan.ID, Kind: "plan", Location: "test/" + plan.ID}
-	Ok(t, s.BeginArtifact(artifact))
-	Ok(t, s.CommitArtifact(artifact))
+	snapshot := validSnapshot(plan.ID)
+	Ok(t, s.BeginSnapshot(snapshot))
+	Ok(t, s.CommitSnapshot(snapshot))
 	Ok(t, s.FinishJob(plan.ID, "succeeded", ""))
 	return plan
 }

@@ -45,7 +45,7 @@ func TestDurableJobAdmissionRechecksPendingClosure(t *testing.T) {
 	blobs, err := artifacts.NewFilesystem(t.TempDir())
 	Ok(t, err)
 	defer blobs.Close()
-	service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: blobs}}
+	service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 	defer service.Close()
 	repo := models.Repo{FullName: "org/repo"}
 	ctx := command.ProjectContext{ArtifactRoot: t.TempDir(), JobID: uuid.NewString(), BaseRepo: repo, Pull: models.PullRequest{Num: 1, BaseRepo: repo, HeadCommit: "revision", Execution: &models.Execution{Owner: "owner"}}, RepoRelDir: ".", Workspace: "default", CommandName: command.Plan, RequiresAtlantisManagedPlanFile: true}
@@ -54,7 +54,7 @@ func TestDurableJobAdmissionRechecksPendingClosure(t *testing.T) {
 	Ok(t, store.StartPlan(ctx.JobID))
 	path := filepath.Join(ctx.ArtifactRoot, "default.tfplan")
 	Ok(t, os.WriteFile(path, []byte("saved plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", path))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, ctx.ArtifactRoot, path))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}}))
 	planID := ctx.JobID
 	ctx.JobID = uuid.NewString()

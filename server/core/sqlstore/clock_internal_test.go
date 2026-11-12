@@ -49,37 +49,36 @@ func TestGeneratedStorageTimestamps(t *testing.T) {
 		Ok(t, s.AcquireClaim(p, "owner"))
 		p.Execution = &models.Execution{Owner: "owner"}
 		j := claimJob(p, "generated-times")
-		j.Command, j.StartedAt = "version", time.Time{}
+		j.StartedAt = time.Time{}
 		Ok(t, s.StartJob(j))
 		// Direct callers can omit lock time; the shared locking client supplies an event time.
 		acquired, projectLock, err := s.TryLock(models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace})
 		Ok(t, err)
 		Assert(t, acquired, "project lock unavailable")
-		a := models.Artifact{ID: "generated-artifact", JobID: j.ID, Kind: "log", Location: "test/generated"}
-		Ok(t, s.BeginArtifact(a))
+		Ok(t, s.StartPlan(j.ID))
+		snapshot := validSnapshot(j.ID)
+		Ok(t, s.BeginSnapshot(snapshot))
 		blobs := BlobStore{Store: s}
-		meta, err := blobs.Put("test/generated", strings.NewReader("output"))
+		meta, err := blobs.PutSnapshot(j.ID, strings.NewReader("output"))
 		Ok(t, err)
-		a.Size, a.SHA256 = meta.Size, meta.SHA256
-		Ok(t, s.CommitArtifact(a))
-		objects, err := blobs.List()
-		Ok(t, err)
-		Equals(t, 1, len(objects))
+		snapshot.Size, snapshot.SHA256 = meta.Size, meta.SHA256
+		Ok(t, s.CommitSnapshot(snapshot))
+
 		Ok(t, s.FinishJob(j.ID, "succeeded", ""))
 		Ok(t, s.ClosePull(p))
 		job, err := s.Job(j.ID)
 		Ok(t, err)
 		Assert(t, job.FinishedAt != nil, "job did not finish")
-		artifacts, err := s.Artifacts(j.ID)
+		published, err := s.Snapshot(j.ID)
 		Ok(t, err)
-		Equals(t, 1, len(artifacts))
+		Assert(t, published != nil, "snapshot is missing")
 		var closed struct{ ClosedAt time.Time }
 		Ok(t, s.db.Table("pulls").Select("closed_at").Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&closed).Error)
 		after, err := s.Now()
 		Ok(t, err)
 		for name, instant := range map[string]time.Time{
-			"job start": job.StartedAt, "job finish": *job.FinishedAt, "artifact": artifacts[0].CreatedAt,
-			"blob": objects[0].ModifiedAt, "closure": closed.ClosedAt, "lock": projectLock.Time,
+			"job start": job.StartedAt, "job finish": *job.FinishedAt, "snapshot": published.CreatedAt,
+			"closure": closed.ClosedAt, "lock": projectLock.Time,
 		} {
 			Assert(t, !instant.Before(before) && !instant.After(after), "%s timestamp did not come from the database clock", name)
 			Equals(t, 0, instant.Nanosecond()%1000)
@@ -99,9 +98,9 @@ func TestEqualJobTimestampsHaveStableOrder(t *testing.T) {
 			j.Project = models.NewProject(p.BaseRepo.FullName, ".", id)
 			Ok(t, s.StartJob(j))
 			Ok(t, s.StartPlan(j.ID))
-			a := models.Artifact{ID: id + "-plan", JobID: id, Kind: "plan", Location: id + "/plan", RelativePath: "plan.tfplan"}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			Ok(t, s.FinishJob(id, "succeeded", ""))
 		}
 		jobs, err := s.Jobs()

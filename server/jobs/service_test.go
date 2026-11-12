@@ -6,6 +6,7 @@ package jobs_test
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,7 @@ func setup(t *testing.T) (*jobs.Service, string) {
 	blobs, err := artifacts.NewFilesystem(dir)
 	Ok(t, err)
 	t.Cleanup(func() { _ = blobs.Close() })
-	service := &jobs.Service{Store: db, Logs: &logs.Service{Records: db, Mode: "database"}, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+	service := &jobs.Service{Store: db, Logs: &logs.Service{Records: db, Mode: "database"}, Artifacts: &artifacts.Service{Records: db, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 	t.Cleanup(func() { _ = service.Close() })
 	return service, dir
 }
@@ -46,16 +47,15 @@ func projectContext(t *testing.T) command.ProjectContext {
 		ProjectName: "network", RepoRelDir: "env/prod", Workspace: "production", User: models.User{Username: "alice", Teams: []string{"platform"}}, CommentArgs: []string{"-target=module.network"}, Trigger: command.CommentTrigger}
 }
 func TestJobArtifactsAndPendingPlanBinding(t *testing.T) {
-	service, root := setup(t)
+	service, _ := setup(t)
 	ctx := projectContext(t)
 	store := service.Artifacts
 	beginPlan(t, service, &ctx)
 	file := filepath.Join(ctx.ArtifactRoot, "network-production.tfplan")
 	Ok(t, os.WriteFile(file, []byte("saved plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
 	show := filepath.Join(filepath.Dir(file), ctx.GetShowResultFileName())
 	Ok(t, os.WriteFile(show, []byte("{}"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "show", show))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
 	Ok(t, service.AppendLog(ctx.JobID, "planning"))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}}))
 	j, err := service.Store.Job(ctx.JobID)
@@ -67,14 +67,19 @@ func TestJobArtifactsAndPendingPlanBinding(t *testing.T) {
 	Equals(t, "revision", j.Revision)
 	Equals(t, "succeeded", j.State)
 	Assert(t, j.FinishedAt != nil, "job never finished")
-	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
+	snapshot, err := service.Artifacts.Records.Snapshot(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 2, len(records))
-	for _, a := range records {
-		Assert(t, a.Size > 0 && len(a.SHA256) == 64, "missing artifact integrity metadata")
-		_, err := os.Stat(filepath.Join(root, a.Location))
-		Ok(t, err)
+	Equals(t, 2, len(snapshot.Manifest.Files))
+	for _, file := range snapshot.Manifest.Files {
+		Assert(t, file.Size > 0 && len(file.SHA256) == 64, "missing snapshot member integrity metadata")
 	}
+	reader, err := service.Artifacts.Blobs.OpenSnapshot(ctx.JobID)
+	Ok(t, err)
+	size, err := io.Copy(io.Discard, reader)
+	Ok(t, err)
+	Ok(t, reader.Close())
+	Equals(t, snapshot.Size, size)
+	Assert(t, len(snapshot.SHA256) == 64, "missing bundle checksum")
 	apply := ctx
 	apply.CommandName = command.Apply
 	apply.ExpectedPlanHash = fmt.Sprintf("%x", sha256.Sum256([]byte("saved plan")))
@@ -100,16 +105,16 @@ func TestJobArtifactsAndPendingPlanBinding(t *testing.T) {
 	newer := ctx
 	newer.JobID = uuid.NewString()
 	beginPlan(t, service, &newer)
-	Ok(t, service.Artifacts.SaveFile(newer, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(newer, filepath.Dir(file), file))
 	Ok(t, service.Finish(newer, command.ProjectCommandOutput{}))
 	Assert(t, store.Load(apply, file) != nil, "apply switched to a different plan job")
 	Ok(t, service.Artifacts.Records.InvalidatePlans(ctx.BaseRepo, ctx.Pull.Num))
 	jobs, err := service.Store.Jobs()
 	Ok(t, err)
 	Equals(t, 3, len(jobs))
-	records, err = service.Artifacts.Records.Artifacts(ctx.JobID)
+	snapshot, err = service.Artifacts.Records.Snapshot(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 2, len(records))
+	Equals(t, 2, len(snapshot.Manifest.Files))
 	log, err := service.Logs.ReadAll(ctx.JobID)
 	Ok(t, err)
 	Equals(t, "planning\n", string(log))
@@ -122,16 +127,15 @@ func TestCorruptAndInvalidatedArtifactsFailClosed(t *testing.T) {
 	beginPlan(t, service, &ctx)
 	file := filepath.Join(ctx.ArtifactRoot, "plan.tfplan")
 	Ok(t, os.WriteFile(file, []byte("original"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 	apply := ctx
 	apply.JobID = uuid.NewString()
 	apply.CommandName = command.Apply
 	claimContext(t, service, &apply)
 	Ok(t, service.Begin(apply))
-	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
-	Ok(t, err)
-	Ok(t, os.WriteFile(filepath.Join(root, records[0].Location), []byte("corrupt"), 0600))
+	bundle := filepath.Join(root, "snapshots", "v2", ctx.JobID, "plan-snapshot.tar.gz")
+	Ok(t, os.WriteFile(bundle, []byte("corrupt"), 0600))
 	Assert(t, store.Load(apply, file) != nil, "corrupt artifact accepted")
 	data, err := os.ReadFile(file)
 	Ok(t, err)
@@ -149,8 +153,8 @@ func TestSupersededPlanCannotBecomePending(t *testing.T) {
 	beginPlan(t, service, &newer)
 	file := filepath.Join(old.ArtifactRoot, "plan")
 	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(old, "plan", file))
-	Ok(t, service.Artifacts.SaveFile(newer, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(old, filepath.Dir(file), file))
+	Ok(t, service.Artifacts.SnapshotPlan(newer, filepath.Dir(file), file))
 	Ok(t, service.Finish(newer, command.ProjectCommandOutput{}))
 	Assert(t, service.Finish(old, command.ProjectCommandOutput{}) != nil, "stale plan published")
 	pending, err := service.Artifacts.Records.PendingPlans(old.BaseRepo, old.Pull.Num)
@@ -165,7 +169,7 @@ func TestRecoveryKeepsUncertainExecutionHistory(t *testing.T) {
 	beginPlan(t, service, &ctx)
 	file := filepath.Join(ctx.ArtifactRoot, "plan")
 	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 	apply := ctx
 	apply.JobID = uuid.NewString()
@@ -186,9 +190,9 @@ func TestRecoveryKeepsUncertainExecutionHistory(t *testing.T) {
 	log, err := service.Logs.ReadAll(apply.JobID)
 	Ok(t, err)
 	Equals(t, "applying\n", string(log))
-	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
+	snapshot, err := service.Artifacts.Records.Snapshot(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 1, len(records))
+	Equals(t, 1, len(snapshot.Manifest.Files))
 }
 
 func beginPlan(t *testing.T, service *jobs.Service, ctx *command.ProjectContext) {
@@ -204,7 +208,7 @@ func TestRejectedPlanDoesNotInvalidateOwner(t *testing.T) {
 	beginPlan(t, service, &owner)
 	file := filepath.Join(owner.ArtifactRoot, "plan")
 	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(owner, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(owner, filepath.Dir(file), file))
 	Ok(t, service.Finish(owner, command.ProjectCommandOutput{}))
 	contender := owner
 	contender.JobID = uuid.NewString()
@@ -225,12 +229,12 @@ func TestRestorePlansRejectsSymlinkOutsidePull(t *testing.T) {
 	beginPlan(t, service, &ctx)
 	file := filepath.Join(ctx.ArtifactRoot, "plan.tfplan")
 	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 	pullDir, outside := t.TempDir(), t.TempDir()
 	Ok(t, os.Symlink(outside, filepath.Join(pullDir, ctx.Workspace)))
 	scoped := service.Artifacts
-	err := scoped.RestorePlans(pullDir, models.Repo{}, ctx.Pull.Num)
+	err := scoped.RestorePlans(pullDir, ctx.BaseRepo, ctx.Pull.Num)
 	Assert(t, err != nil, "restored a plan outside the assigned pull directory")
 	entries, err := os.ReadDir(outside)
 	Ok(t, err)
@@ -248,7 +252,7 @@ func TestDeclaredWorkflowFilesRestoreWithoutConventionalPlan(t *testing.T) {
 	filename := filepath.Join(project, "reviewed.plan")
 	Ok(t, os.WriteFile(filename, []byte("custom workflow input"), 0600))
 	beginPlan(t, service, &ctx)
-	Ok(t, service.Artifacts.SnapshotWorkflow(ctx, project))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, project, filepath.Join(project, "conventional.tfplan")))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 	Ok(t, os.Remove(filename))
 	apply := ctx
@@ -275,7 +279,8 @@ func TestArtifactSourceSymlinkCannotEscapeWorkingDirectory(t *testing.T) {
 	link := filepath.Join(ctx.ArtifactRoot, "symlink")
 	Ok(t, os.Symlink(outside, link))
 	beginPlan(t, service, &ctx)
-	Assert(t, service.Artifacts.SaveFile(ctx, "workflow", link) != nil, "captured file outside assigned working directory")
+	service.Artifacts.WorkflowFiles = []string{"symlink"}
+	Assert(t, service.Artifacts.SnapshotPlan(ctx, ctx.ArtifactRoot, filepath.Join(ctx.ArtifactRoot, "missing.tfplan")) != nil, "captured file outside assigned working directory")
 }
 
 func claimContext(t *testing.T, service *jobs.Service, ctx *command.ProjectContext) {
@@ -349,9 +354,9 @@ func TestLogWriteFailurePreventsSuccessfulCompletion(t *testing.T) {
 	job, err := service.Store.Job(ctx.JobID)
 	Ok(t, err)
 	Equals(t, "failed", job.State)
-	records, err := service.Artifacts.Records.Artifacts(ctx.JobID)
+	snapshot, err := service.Artifacts.Records.Snapshot(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 0, len(records))
+	Assert(t, snapshot == nil, "log failure published a plan snapshot")
 }
 
 func TestShutdownPreservesLogFailuresUntilCompletion(t *testing.T) {
@@ -406,7 +411,7 @@ func TestHookOutcomeDoesNotChangePendingPlan(t *testing.T) {
 	beginPlan(t, service, &ctx)
 	file := filepath.Join(ctx.ArtifactRoot, "plan.tfplan")
 	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
-	Ok(t, service.Artifacts.SaveFile(ctx, "plan", file))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
 	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
 	handler := &jobs.DurableOutputHandler{Service: service}
 	runner := runtime.DefaultPreWorkflowHookRunner{Jobs: service, OutputHandler: handler}
@@ -446,7 +451,7 @@ func TestConcurrentPlanLogsAndRetention(t *testing.T) {
 			start := make(chan struct{})
 			workers.Go(func() {
 				<-start
-				errors <- service.Artifacts.SaveFile(ctx, "plan", file)
+				errors <- service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file)
 			})
 			workers.Go(func() {
 				<-start

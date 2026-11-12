@@ -19,7 +19,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
-	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	. "github.com/runatlantis/atlantis/testing"
 )
 
@@ -76,12 +75,7 @@ func TestArtifactBackendConformance(t *testing.T) {
 			t.Cleanup(func() { _ = s.Close() })
 			return s
 		},
-		"database": func(t *testing.T) artifacts.Store {
-			s, e := sqlstore.OpenServer(t.TempDir())
-			Ok(t, e)
-			t.Cleanup(func() { _ = s.Close() })
-			return sqlstore.BlobStore{Store: s}
-		},
+
 		"s3 API": func(t *testing.T) artifacts.Store {
 			return artifacts.NewS3WithClient(&objectClient{objects: map[string][]byte{}}, "test-bucket", "configured-prefix")
 		},

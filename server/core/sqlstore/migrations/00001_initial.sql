@@ -16,10 +16,7 @@ CREATE TABLE repositories (
     id TEXT PRIMARY KEY NOT NULL,
     instance_id TEXT NOT NULL REFERENCES vcs_instances(id),
     full_name TEXT NOT NULL,
-    owner TEXT NOT NULL,
-    name TEXT NOT NULL,
     clone_url TEXT NOT NULL,
-    hostname TEXT NOT NULL,
     UNIQUE (instance_id, full_name)
 );
 
@@ -38,7 +35,11 @@ CREATE TABLE pulls (
     closed_at TIMESTAMP,
     cleanup_complete BOOLEAN NOT NULL DEFAULT FALSE,
     reopen_requested BOOLEAN NOT NULL DEFAULT FALSE,
-    closure_generation BIGINT NOT NULL DEFAULT 0,
+    closure_generation BIGINT NOT NULL DEFAULT 0 CHECK (closure_generation >= 0),
+    CHECK (closed = (closed_at IS NOT NULL)),
+    CHECK (NOT cleanup_complete OR closed),
+    CHECK (NOT reopen_requested OR closed),
+    CHECK (NOT closed OR cancelled),
     UNIQUE (repository_id, number),
     UNIQUE (id, repository_id)
 );
@@ -94,7 +95,7 @@ CREATE TABLE command_locks (
 
 CREATE TABLE execution_claims (
     pull_id TEXT PRIMARY KEY NOT NULL REFERENCES pulls(id),
-    owner TEXT NOT NULL UNIQUE,
+    owner TEXT NOT NULL UNIQUE CHECK (owner <> ''),
     state TEXT NOT NULL,
     acquired_at TIMESTAMP NOT NULL
 );
@@ -103,7 +104,7 @@ CREATE TABLE jobs (
     id TEXT PRIMARY KEY NOT NULL,
     repository_id TEXT NOT NULL,
     pull_id TEXT NOT NULL,
-    project_id TEXT NOT NULL,
+    project_id TEXT,
     command TEXT NOT NULL,
     sub_command TEXT NOT NULL,
     arguments TEXT,
@@ -118,10 +119,13 @@ CREATE TABLE jobs (
     private BOOLEAN NOT NULL,
     started_at TIMESTAMP NOT NULL,
     finished_at TIMESTAMP,
-    owner TEXT NOT NULL DEFAULT '',
+    owner TEXT NOT NULL CHECK (owner <> ''),
     managed_plan BOOLEAN NOT NULL DEFAULT TRUE,
     kind TEXT NOT NULL DEFAULT 'command',
     mutation_started BOOLEAN NOT NULL DEFAULT FALSE,
+    CHECK (kind <> 'command' OR project_id IS NOT NULL),
+    CHECK (kind <> 'workflow_hook' OR project_id IS NULL),
+    CHECK (plan_job_id IS NULL OR (project_id IS NOT NULL AND plan_job_id <> id)),
     UNIQUE (id, project_id, pull_id),
     UNIQUE (id, pull_id),
     FOREIGN KEY (plan_job_id, project_id, pull_id) REFERENCES jobs(id, project_id, pull_id),
@@ -131,25 +135,19 @@ CREATE TABLE jobs (
 CREATE INDEX jobs_pull ON jobs(pull_id);
 CREATE INDEX jobs_plan_consumers ON jobs(plan_job_id, state);
 
-CREATE TABLE artifacts (
-    id TEXT PRIMARY KEY NOT NULL,
-    job_id TEXT NOT NULL REFERENCES jobs(id),
-    kind TEXT NOT NULL,
-    location TEXT NOT NULL UNIQUE,
-    size BIGINT NOT NULL CHECK (size >= 0),
-    sha256 TEXT NOT NULL,
+CREATE TABLE plan_snapshots (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id),
+    manifest TEXT NOT NULL,
+    size BIGINT NOT NULL DEFAULT 0 CHECK (size >= 0),
+    sha256 TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMP NOT NULL,
-    deleted BOOLEAN NOT NULL DEFAULT FALSE,
     ready BOOLEAN NOT NULL DEFAULT FALSE,
-    sequence BIGINT NOT NULL DEFAULT 0,
-    relative_path TEXT NOT NULL DEFAULT '',
+    deleted BOOLEAN NOT NULL DEFAULT FALSE,
     purged BOOLEAN NOT NULL DEFAULT FALSE,
     unreferenced_at TIMESTAMP,
+    CHECK (NOT ready OR (size > 0 AND length(sha256) = 64)),
     CHECK (NOT purged OR deleted)
 );
-CREATE INDEX artifacts_job ON artifacts(job_id, kind);
-CREATE UNIQUE INDEX log_sequence ON artifacts(job_id, sequence) WHERE kind = 'log';
-CREATE UNIQUE INDEX artifact_file ON artifacts(job_id, kind, relative_path) WHERE kind <> 'log';
 
 CREATE TABLE pending_plans (
     project_id TEXT NOT NULL,
@@ -162,13 +160,12 @@ CREATE TABLE pending_plans (
 
 CREATE INDEX pending_plans_job ON pending_plans(job_id);
 
-CREATE TABLE artifact_blobs (
-    key TEXT PRIMARY KEY NOT NULL,
-    content BYTEA NOT NULL,
-    modified_at TIMESTAMP NOT NULL
+CREATE TABLE snapshot_blobs (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES plan_snapshots(job_id),
+    content BYTEA NOT NULL
 );
 
 CREATE TABLE pending_pull_lifecycles (
     pull_id TEXT PRIMARY KEY NOT NULL REFERENCES pulls(id),
-    generation BIGINT NOT NULL
+    generation BIGINT NOT NULL CHECK (generation > 0)
 );

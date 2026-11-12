@@ -26,7 +26,7 @@ func TestDurableRunnerRecordsActualExecution(t *testing.T) {
 	blobs, err := artifacts.NewFilesystem(t.TempDir())
 	Ok(t, err)
 	defer blobs.Close()
-	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 	runner := &DefaultProjectCommandRunner{Jobs: service, Artifacts: service.Artifacts, Execution: &ExecutionCoordinator{Store: db}}
 	repo := models.Repo{FullName: "org/repo", VCSHost: models.VCSHost{Hostname: "git.example"}}
 	ctx := command.ProjectContext{ArtifactRoot: t.TempDir(), JobID: uuid.NewString(), BaseRepo: repo, Pull: models.PullRequest{BaseRepo: repo, Num: 1, HeadCommit: "abc"}, RepoRelDir: ".", Workspace: "default", User: models.User{Username: "alice"}}
@@ -40,7 +40,7 @@ func TestDurableRunnerRecordsActualExecution(t *testing.T) {
 		Equals(t, "running", j.State)
 		Equals(t, "alice", j.Issuer.Username)
 		Ok(t, db.StartPlan(actual.JobID))
-		Ok(t, service.Artifacts.SaveFile(actual, "plan", file))
+		Ok(t, service.Artifacts.SnapshotPlan(actual, actual.ArtifactRoot, file))
 		return command.ProjectCommandOutput{PlanSuccess: &models.PlanSuccess{}}
 	})
 	Ok(t, result.Error)
@@ -59,7 +59,7 @@ func TestDurableCancellationLetsActiveJobFinishItsSteps(t *testing.T) {
 	blobs, err := artifacts.NewFilesystem(t.TempDir())
 	Ok(t, err)
 	defer blobs.Close()
-	service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: blobs}}
+	service := &jobs.Service{Store: store, Artifacts: &artifacts.Service{Records: store, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 	defer service.Close()
 	runner := &DefaultProjectCommandRunner{Jobs: service, Execution: &ExecutionCoordinator{Store: store}, WorkingDir: durableRunnerWorkingDir{}, EnvStepRunner: &runtime.EnvStepRunner{}}
 	repo := models.Repo{FullName: "org/repo"}
@@ -110,23 +110,23 @@ func TestDurablePlanDoesNotRepublishOldFiles(t *testing.T) {
 	blobs, err := artifacts.NewFilesystem(t.TempDir())
 	Ok(t, err)
 	defer blobs.Close()
-	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: blobs}}
+	service := &jobs.Service{Store: db, Artifacts: &artifacts.Service{Records: db, Blobs: artifacts.ObjectSnapshots{Store: blobs}}}
 	repo := models.Repo{FullName: "org/repo"}
 	ctx := command.ProjectContext{ArtifactRoot: t.TempDir(), JobID: uuid.NewString(), CommandName: command.Plan, BaseRepo: repo, Pull: models.PullRequest{BaseRepo: repo, Num: 1}, RepoRelDir: ".", Workspace: "default"}
 	ctx.Pull.Execution = &models.Execution{Owner: uuid.NewString()}
 	Ok(t, db.AcquireClaim(ctx.Pull, ctx.Pull.ExecutionOwner()))
 	Ok(t, service.Begin(ctx))
-	dir := t.TempDir()
+	dir := ctx.ArtifactRoot
 	Ok(t, os.WriteFile(filepath.Join(dir, "default.tfplan"), []byte("stale plan"), 0600))
 	Ok(t, os.WriteFile(filepath.Join(dir, "default.json"), []byte("stale show"), 0600))
 	runner := &DefaultProjectCommandRunner{Jobs: service, Artifacts: service.Artifacts, Execution: &ExecutionCoordinator{Store: db}, WorkingDir: durableRunnerWorkingDir{}}
 	_, err = runner.runSteps(nil, ctx, dir)
-	Ok(t, err)
-	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
+	ErrContains(t, "no recoverable output", err)
+	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{Error: err}))
 	pending, err := db.PendingPlans(repo, 1)
 	Ok(t, err)
 	Equals(t, 0, len(pending))
-	records, err := db.Artifacts(ctx.JobID)
+	records, err := db.Snapshot(ctx.JobID)
 	Ok(t, err)
-	Equals(t, 0, len(records))
+	Assert(t, records == nil, "stale files were published")
 }

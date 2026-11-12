@@ -24,8 +24,7 @@ type vcsInstance struct {
 }
 
 type repository struct {
-	ID, InstanceID                            string
-	FullName, Owner, Name, CloneURL, Hostname string
+	ID, InstanceID, FullName, CloneURL string
 }
 
 type pull struct {
@@ -42,23 +41,24 @@ type project struct {
 }
 
 type job struct {
-	ToolDistribution, ToolVersion   string
-	MutationStarted                 bool
-	Kind                            models.JobKind
-	ManagedPlan                     bool
-	ID                              string `gorm:"primaryKey"`
-	Owner                           string
-	RepositoryID, PullID, ProjectID string
-	Command, SubCommand             string
-	Arguments                       []string `gorm:"serializer:json"`
-	Steps, Issuer                   string
-	IssuerTeams                     []string `gorm:"serializer:json"`
-	Trigger, Revision               string
-	PlanJobID                       *string
-	State, Error                    string
-	Private                         bool
-	StartedAt                       time.Time
-	FinishedAt                      *time.Time
+	ToolDistribution, ToolVersion string
+	MutationStarted               bool
+	Kind                          models.JobKind
+	ManagedPlan                   bool
+	ID                            string `gorm:"primaryKey"`
+	Owner                         string
+	RepositoryID, PullID          string
+	ProjectID                     *string
+	Command, SubCommand           string
+	Arguments                     []string `gorm:"serializer:json"`
+	Steps, Issuer                 string
+	IssuerTeams                   []string `gorm:"serializer:json"`
+	Trigger, Revision             string
+	PlanJobID                     *string
+	State, Error                  string
+	Private                       bool
+	StartedAt                     time.Time
+	FinishedAt                    *time.Time
 }
 
 type pendingPlan struct {
@@ -99,9 +99,8 @@ func savePull(tx *gorm.DB, p models.PullRequest) (pull, error) {
 	if err != nil {
 		return pull{}, err
 	}
-	r := repository{ID: uuid.NewString(), InstanceID: instance.ID, FullName: p.BaseRepo.FullName, Owner: p.BaseRepo.Owner, Name: p.BaseRepo.Name,
-		CloneURL: cloneURL, Hostname: p.BaseRepo.VCSHost.Hostname}
-	if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "instance_id"}, {Name: "full_name"}}, DoUpdates: clause.AssignmentColumns([]string{"owner", "name", "clone_url", "hostname"})}).Create(&r).Error; err != nil {
+	r := repository{ID: uuid.NewString(), InstanceID: instance.ID, FullName: p.BaseRepo.FullName, CloneURL: cloneURL}
+	if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "instance_id"}, {Name: "full_name"}}, DoUpdates: clause.AssignmentColumns([]string{"clone_url"})}).Create(&r).Error; err != nil {
 		return pull{}, err
 	}
 	r.ID = ""
@@ -157,9 +156,14 @@ func loadPull(tx *gorm.DB, id string) (models.PullRequest, error) {
 	if err := tx.Where("id = ?", r.InstanceID).Take(&i).Error; err != nil {
 		return models.PullRequest{}, err
 	}
+	owner, name := models.SplitRepoFullName(r.FullName)
+	hostname := i.Host
+	if cloneURL, err := url.Parse(r.CloneURL); err == nil && cloneURL.Host != "" {
+		hostname = cloneURL.Hostname()
+	}
 	return models.PullRequest{ClosureGeneration: p.ClosureGeneration, Num: p.Number, HeadCommit: p.HeadCommit, URL: p.URL, HeadBranch: p.HeadBranch, BaseBranch: p.BaseBranch, Author: p.Author, State: p.State,
-		BaseRepo: models.Repo{FullName: r.FullName, Owner: r.Owner, Name: r.Name, CloneURL: r.CloneURL, SanitizedCloneURL: r.CloneURL,
-			VCSHost: models.VCSHost{Hostname: r.Hostname, Type: i.Provider}}}, nil
+		BaseRepo: models.Repo{FullName: r.FullName, Owner: owner, Name: name, CloneURL: r.CloneURL, SanitizedCloneURL: r.CloneURL,
+			VCSHost: models.VCSHost{Hostname: hostname, Type: i.Provider}}}, nil
 }
 
 // Persist repository locations, never credentials that can expire or rotate.

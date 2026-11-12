@@ -4,6 +4,7 @@
 package sqlstore
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -25,6 +26,9 @@ func claimPull() models.PullRequest {
 }
 func claimJob(p models.PullRequest, id string) models.Job {
 	return models.Job{ID: id, Pull: p, Project: models.NewProject(p.BaseRepo.FullName, ".", ""), Workspace: "default", Command: "plan", State: "running", StartedAt: time.Now().UTC()}
+}
+func validSnapshot(jobID string) models.PlanSnapshot {
+	return models.PlanSnapshot{JobID: jobID, Size: 1, SHA256: strings.Repeat("a", 64), Manifest: models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "plan.tfplan", Size: 1, SHA256: strings.Repeat("b", 64), Mode: 0600}}}}
 }
 func TestExecutionDatabaseConformance(t *testing.T) {
 	t.Run("sqlite", func(t *testing.T) {
@@ -64,9 +68,9 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			Ok(t, s.StartJob(j))
 			Ok(t, s.ClosePull(p))
 			Ok(t, s.StartPlan(j.ID))
-			a := models.Artifact{ID: uuid.NewString(), JobID: j.ID, Kind: "plan", RelativePath: "plan.tfplan", Location: "closed/plan", CreatedAt: time.Now().UTC()}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			idle, err := s.PullIdle(p)
 			Ok(t, err)
 			Assert(t, !idle, "closure discarded execution ownership")
@@ -95,9 +99,9 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			Assert(t, s.StartJob(claimJob(p, uuid.NewString())) != nil, "queued job started after cancellation")
 			Assert(t, s.ReleaseClaim(p) != nil, "cancellation released unfinished work")
 			Ok(t, s.CheckClaim(p))
-			a := models.Artifact{ID: uuid.NewString(), JobID: active.ID, Kind: "plan", RelativePath: "plan.tfplan", Location: "active/plan", CreatedAt: time.Now().UTC()}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
+			a := validSnapshot(active.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			Ok(t, s.FinishJob(active.ID, "succeeded", ""))
 			got, err := s.Job(active.ID)
 			Ok(t, err)
@@ -120,17 +124,43 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			p.Execution = &models.Execution{Owner: "owner"}
 			j := claimJob(p, uuid.NewString())
 			Ok(t, s.StartJob(j))
-			a := models.Artifact{ID: uuid.NewString(), JobID: j.ID, Kind: "plan", Location: "test/plan", RelativePath: "plan.tfplan", CreatedAt: time.Now().UTC()}
-			Assert(t, s.CommitArtifact(a) != nil, "publication without intent accepted")
-			Ok(t, s.BeginArtifact(a))
-			rows, err := s.Artifacts(j.ID)
+			a := validSnapshot(j.ID)
+			Assert(t, s.CommitSnapshot(a) != nil, "publication without intent accepted")
+			Ok(t, s.BeginSnapshot(a))
+			rows, err := s.Snapshot(j.ID)
 			Ok(t, err)
-			Equals(t, 0, len(rows))
+			Assert(t, rows == nil, "unpublished snapshot was visible")
 			Ok(t, s.MarkUncertain(p))
-			Assert(t, s.CommitArtifact(a) != nil, "uncertain owner published artifact")
-			rows, err = s.Artifacts(j.ID)
+			Assert(t, s.CommitSnapshot(a) != nil, "uncertain owner published snapshot")
+			rows, err = s.Snapshot(j.ID)
 			Ok(t, err)
-			Equals(t, 0, len(rows))
+			Assert(t, rows == nil, "unpublished snapshot was visible")
+		})
+		t.Run("snapshot metadata is validated before publication", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			snapshot := validSnapshot(j.ID)
+			invalid := snapshot
+			invalid.Manifest = models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "../plan.tfplan", SHA256: snapshot.SHA256, Mode: 0600}}}
+			Assert(t, s.BeginSnapshot(invalid) != nil, "unsafe snapshot manifest was reserved")
+			Ok(t, s.BeginSnapshot(snapshot))
+			Assert(t, s.BeginSnapshot(snapshot) != nil, "producer reserved a second bundle")
+			for _, hash := range []string{"", "abc", strings.Repeat("z", 64)} {
+				invalid = snapshot
+				invalid.SHA256 = hash
+				Assert(t, s.CommitSnapshot(invalid) != nil, "invalid bundle checksum was published")
+			}
+			invalid = snapshot
+			invalid.Size = 0
+			Assert(t, s.CommitSnapshot(invalid) != nil, "empty bundle was published")
+			unpublished, err := s.Snapshot(j.ID)
+			Ok(t, err)
+			Assert(t, unpublished == nil, "invalid bundle became visible")
+			Ok(t, s.CommitSnapshot(snapshot))
 		})
 		t.Run("cancellation invalidates mutating apply input", func(t *testing.T) {
 			s := conformanceStore(t)
@@ -140,9 +170,9 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			producer := claimJob(p, uuid.NewString())
 			Ok(t, s.StartJob(producer))
 			Ok(t, s.StartPlan(producer.ID))
-			a := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: "plan", RelativePath: "plan.tfplan", Location: "plan/object", CreatedAt: time.Now().UTC()}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
+			a := validSnapshot(producer.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			Ok(t, s.FinishJob(producer.ID, "succeeded", ""))
 			consumer := claimJob(p, uuid.NewString())
 			consumer.Command = "apply"
@@ -163,9 +193,9 @@ func TestExecutionDatabaseConformance(t *testing.T) {
 			j := claimJob(p, uuid.NewString())
 			Ok(t, s.StartJob(j))
 			Ok(t, s.StartPlan(j.ID))
-			a := models.Artifact{ID: uuid.NewString(), JobID: j.ID, Kind: "plan", Location: "api/plan", CreatedAt: time.Now().UTC()}
-			Ok(t, s.BeginArtifact(a))
-			Ok(t, s.CommitArtifact(a))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
 			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
 			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
 			Ok(t, err)

@@ -89,7 +89,11 @@ func TestRestoredInitRejectsUnsafeSetup(t *testing.T) {
 			}
 			executor := &restoredInitExecutor{}
 			runner := &runtime.InitStepRunner{TerraformExecutor: executor, DefaultTFDistribution: terraform.NewDistributionTerraform(), DefaultTFVersion: version.Must(version.NewVersion("1.1.0"))}
-			_, err := runner.Run(command.ProjectContext{Log: logging.NewNoopLogger(t), RestoredDataDirectory: ".terraform"}, tc.args, path, tc.envs)
+			ctx := command.ProjectContext{Log: logging.NewNoopLogger(t), RestoredDataDirectory: ".terraform"}
+			if tc.missing {
+				ctx.RestoredLockHash = fmt.Sprintf("%x", sha256.Sum256([]byte("locked")))
+			}
+			_, err := runner.Run(ctx, tc.args, path, tc.envs)
 			Assert(t, err != nil, "unsafe restored initialization was accepted")
 			Equals(t, 0, executor.calls)
 		})
@@ -122,4 +126,14 @@ func TestRestoredInitRejectsChangedLockAndOldPrerelease(t *testing.T) {
 			Equals(t, 0, executor.calls)
 		})
 	}
+}
+
+func TestRestoredInitWithoutExternalProviders(t *testing.T) {
+	path := t.TempDir()
+	executor := &restoredInitExecutor{}
+	runner := &runtime.InitStepRunner{TerraformExecutor: executor, DefaultTFDistribution: terraform.NewDistributionTerraform(), DefaultTFVersion: version.Must(version.NewVersion("1.1.0"))}
+	_, err := runner.Run(command.ProjectContext{Log: logging.NewNoopLogger(t), RestoredDataDirectory: "data", Workspace: "default"}, nil, path, map[string]string{"TF_DATA_DIR": "data"})
+	Ok(t, err)
+	Equals(t, []string{"init", "-input=false", "-lockfile=readonly"}, executor.args)
+	Equals(t, 1, executor.calls)
 }

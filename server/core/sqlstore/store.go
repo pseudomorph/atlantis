@@ -94,6 +94,22 @@ func openSQLite(dataDir string) (*Store, error) {
 }
 
 func migrate(conn *sql.DB) error {
+	// Draft schemas are deliberately incompatible with the bundled experiment.
+	var oldColumns int
+	if err := conn.QueryRow("SELECT count(*) FROM pragma_table_info('repositories') WHERE name = 'owner'").Scan(&oldColumns); err != nil {
+		return err
+	}
+	var oldTables int
+	if err := conn.QueryRow("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('artifacts','artifact_blobs','execution_scopes')").Scan(&oldTables); err != nil {
+		return err
+	}
+	var oldBlobColumns int
+	if err := conn.QueryRow("SELECT count(*) FROM pragma_table_info('snapshot_blobs') WHERE name = 'modified_at'").Scan(&oldBlobColumns); err != nil {
+		return err
+	}
+	if oldColumns != 0 || oldTables != 0 || oldBlobColumns != 0 {
+		return fmt.Errorf("this draft durable-storage schema is unsupported; drain Atlantis and use a fresh data directory, then regenerate plans")
+	}
 	files, err := fs.Sub(migrationFiles, "migrations")
 	if err != nil {
 		return err

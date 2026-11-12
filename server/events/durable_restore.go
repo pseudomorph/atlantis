@@ -35,19 +35,19 @@ func (p *DefaultProjectCommandRunner) prepareDurableRestore(ctx command.ProjectC
 	if plan.ToolVersion != ctx.TerraformVersion.String() || plan.ToolDistribution != *ctx.TerraformDistribution {
 		return ctx, nil, false, fmt.Errorf("pending plan used %s %s but this command selects %s %s; run plan again", plan.ToolDistribution, plan.ToolVersion, *ctx.TerraformDistribution, ctx.TerraformVersion)
 	}
-	inputs, err := p.Artifacts.Records.InputArtifacts(ctx.JobID)
+	inputs, err := p.Artifacts.Records.InputSnapshot(ctx.JobID)
 	if err != nil {
 		return ctx, nil, false, err
 	}
-	haveLock := false
-	for _, artifact := range inputs {
-		if artifact.Kind == "lockfile" {
-			haveLock = true
-			ctx.RestoredLockHash = artifact.SHA256
+	if inputs != nil {
+		for _, artifact := range inputs.Manifest.Files {
+			if artifact.Kind == "lockfile" {
+				ctx.RestoredLockHash = artifact.SHA256
+			}
 		}
 	}
 	// Old Terraform ignores lock files even when a repository happens to contain one.
-	if !haveLock || (plan.ToolDistribution == "terraform" && runtime.MustConstraint("< 0.14.0").Check(ctx.TerraformVersion.Core())) {
+	if plan.ToolDistribution == "terraform" && runtime.MustConstraint("< 0.14.0").Check(ctx.TerraformVersion.Core()) {
 		return ctx, nil, false, nil
 	}
 	manifest, err := p.Artifacts.InputRuntime(ctx.JobID)

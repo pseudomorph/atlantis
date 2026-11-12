@@ -20,27 +20,17 @@ func TestDerivedInputsKeepSelectedProducer(t *testing.T) {
 	producer := claimJob(p, uuid.NewString())
 	Ok(t, s.StartJob(producer))
 	Ok(t, s.StartPlan(producer.ID))
-	var expected []string
-	var unfinished models.Artifact
-	for _, kind := range []string{"plan", "lockfile", "workflow", "log", "unfinished"} {
-		a := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: kind, Location: "test/" + uuid.NewString()}
-		if kind == "unfinished" {
-			a.Kind, a.RelativePath = "workflow", "unfinished"
-		}
-		Ok(t, s.BeginArtifact(a))
-		if kind == "unfinished" {
-			unfinished = a
-			continue
-		}
-		Ok(t, s.CommitArtifact(a))
-		if kind != "log" {
-			expected = append(expected, a.ID)
-		}
-	}
+	snapshot := validSnapshot(producer.ID)
+	snapshot.Manifest.Files = append(snapshot.Manifest.Files,
+		models.SnapshotFile{Kind: "lockfile", Path: ".terraform.lock.hcl", Size: 1, SHA256: snapshot.SHA256, Mode: 0600},
+		models.SnapshotFile{Kind: "workflow", Path: "config.json", Size: 1, SHA256: snapshot.SHA256, Mode: 0600})
+	Ok(t, s.BeginSnapshot(snapshot))
+	Ok(t, s.CommitSnapshot(snapshot))
+	changed := snapshot
+	changed.SHA256 = validSnapshot(producer.ID).Manifest.Files[0].SHA256
+	Assert(t, s.CommitSnapshot(changed) != nil, "published bundle was replaced")
 	Ok(t, s.FinishJob(producer.ID, "succeeded", ""))
-	Assert(t, s.CommitArtifact(unfinished) != nil, "completed producer published an unfinished artifact")
-	late := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: "workflow", Location: "test/late"}
-	Assert(t, s.BeginArtifact(late) != nil, "completed producer admitted a new artifact")
+	Assert(t, s.BeginSnapshot(snapshot) != nil, "completed producer admitted a snapshot")
 
 	consumer := claimJob(p, uuid.NewString())
 	consumer.Command = "apply"
@@ -50,15 +40,13 @@ func TestDerivedInputsKeepSelectedProducer(t *testing.T) {
 	stored, err := s.Job(consumer.ID)
 	Ok(t, err)
 	Equals(t, producer.ID, stored.PlanJobID)
-	inputs, err := s.InputArtifacts(consumer.ID)
+	input, err := s.InputSnapshot(consumer.ID)
 	Ok(t, err)
-	var actual []string
-	for _, a := range inputs {
-		Equals(t, producer.ID, a.JobID)
-		actual = append(actual, a.ID)
-	}
-	Equals(t, expected, actual)
-	ErrContains(t, "CHECK constraint failed", s.db.Exec("UPDATE artifacts SET purged = TRUE WHERE id = ?", expected[0]).Error)
+	Assert(t, input != nil, "selected snapshot is missing")
+	Equals(t, snapshot.JobID, input.JobID)
+	Equals(t, snapshot.Manifest, input.Manifest)
+	Equals(t, snapshot.SHA256, input.SHA256)
+	ErrContains(t, "CHECK constraint failed", s.db.Exec("UPDATE plan_snapshots SET purged = TRUE WHERE job_id = ?", producer.ID).Error)
 	Ok(t, s.FinishJob(consumer.ID, "succeeded", ""))
 	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
 	Ok(t, err)
@@ -69,27 +57,30 @@ func TestDerivedInputsKeepSelectedProducer(t *testing.T) {
 	Equals(t, producer.ID, stored.PlanJobID)
 }
 
+func TestSnapshotPublicationEndsWithProducer(t *testing.T) {
+	s := conformanceStore(t)
+	p := claimPull()
+	p.Execution = &models.Execution{Owner: "owner"}
+	Ok(t, s.AcquireClaim(p, p.ExecutionOwner()))
+	producer := claimJob(p, uuid.NewString())
+	Ok(t, s.StartJob(producer))
+	Ok(t, s.StartPlan(producer.ID))
+	snapshot := validSnapshot(producer.ID)
+	Ok(t, s.BeginSnapshot(snapshot))
+	Ok(t, s.FinishJob(producer.ID, "failed", "interrupted publication"))
+	Assert(t, s.CommitSnapshot(snapshot) != nil, "completed producer published an unfinished snapshot")
+	got, err := s.Snapshot(producer.ID)
+	Ok(t, err)
+	Assert(t, got == nil, "unfinished snapshot became visible")
+}
+
 func TestDerivedInputsProtectRunningConsumerRetention(t *testing.T) {
 	s := conformanceStore(t)
 	p := claimPull()
 	p.Execution = &models.Execution{Owner: "owner"}
 	Ok(t, s.AcquireClaim(p, p.ExecutionOwner()))
 	unselected := readyLifecyclePlan(t, s, p)
-	unselectedArtifacts, err := s.Artifacts(unselected.ID)
-	Ok(t, err)
-	Equals(t, 1, len(unselectedArtifacts))
-	producer := claimJob(p, uuid.NewString())
-	Ok(t, s.StartJob(producer))
-	Ok(t, s.StartPlan(producer.ID))
-	plan := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: "plan", Location: "test/plan"}
-	log := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: "log", Location: "test/log"}
-	for _, a := range []models.Artifact{plan, log} {
-		Ok(t, s.BeginArtifact(a))
-		Ok(t, s.CommitArtifact(a))
-	}
-	unpublished := models.Artifact{ID: uuid.NewString(), JobID: producer.ID, Kind: "workflow", Location: "test/unpublished"}
-	Ok(t, s.BeginArtifact(unpublished))
-	Ok(t, s.FinishJob(producer.ID, "succeeded", ""))
+	producer := readyLifecyclePlan(t, s, p)
 	consumer := claimJob(p, uuid.NewString())
 	consumer.Command = "apply"
 	Ok(t, s.StartJob(consumer))
@@ -100,23 +91,27 @@ func TestDerivedInputsProtectRunningConsumerRetention(t *testing.T) {
 	Ok(t, s.db.Where("owner = ?", p.ExecutionOwner()).Take(&claim).Error)
 	Ok(t, s.db.Delete(&claim).Error)
 	now := time.Now().Add(2 * time.Hour)
-	expired, err := s.ExpiredArtifacts(now, time.Hour, 0)
+	expired, err := s.ExpiredSnapshots(now, time.Hour)
 	Ok(t, err)
-	Equals(t, 3, len(expired))
-	for _, a := range expired {
-		Assert(t, a.ID == log.ID || a.ID == unpublished.ID || a.ID == unselectedArtifacts[0].ID, "running consumer lost its plan")
-		Ok(t, s.MarkPurged(a.ID))
-	}
-	inputs, err := s.InputArtifacts(consumer.ID)
+	Equals(t, 0, len(expired))
+	expired, err = s.ExpiredSnapshots(now.Add(time.Hour), time.Hour)
 	Ok(t, err)
-	Equals(t, 1, len(inputs))
-	Equals(t, plan.ID, inputs[0].ID)
+	Equals(t, 1, len(expired))
+	Equals(t, unselected.ID, expired[0].JobID)
+	Ok(t, s.MarkSnapshotPurged(unselected.ID))
+	input, err := s.InputSnapshot(consumer.ID)
+	Ok(t, err)
+	Assert(t, input != nil, "running consumer lost its snapshot")
+	Equals(t, producer.ID, input.JobID)
 
 	Ok(t, s.db.Create(&claim).Error)
 	Ok(t, s.FinishJob(consumer.ID, "succeeded", ""))
 	Ok(t, s.ReleaseClaim(p))
-	expired, err = s.ExpiredArtifacts(now, time.Hour, 0)
+	expired, err = s.ExpiredSnapshots(now.Add(time.Hour), time.Hour)
+	Ok(t, err)
+	Equals(t, 0, len(expired))
+	expired, err = s.ExpiredSnapshots(now.Add(2*time.Hour), time.Hour)
 	Ok(t, err)
 	Equals(t, 1, len(expired))
-	Equals(t, plan.ID, expired[0].ID)
+	Equals(t, producer.ID, expired[0].JobID)
 }
