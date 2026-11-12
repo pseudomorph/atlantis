@@ -67,7 +67,7 @@ func TestDurableStorageCrashDuringApplyAndUnlockRecovery(t *testing.T) {
 	executable, err := os.Executable()
 	Ok(t, err)
 	child := exec.Command(executable, "-test.run=^TestDurableStorageCrashProcessHelper$", "-test.timeout=90s")
-	child.Env = append(os.Environ(), "ATLANTIS_DURABLE_CRASH_HELPER=1", "ATLANTIS_DURABLE_REPO="+repoDir, "ATLANTIS_DURABLE_SHA="+headSHA, "ATLANTIS_DURABLE_DATA="+dataDir)
+	child.Env = append(os.Environ(), "ATLANTIS_DURABLE_CRASH_HELPER=1", "ATLANTIS_DURABLE_REPO="+repoDir, "ATLANTIS_DURABLE_SHA="+headSHA, "ATLANTIS_DURABLE_DATA="+dataDir, "ATLANTIS_DURABLE_DSN="+durableDSN(t, dataDir))
 	output, err := os.Create(filepath.Join(signals, "helper.log"))
 	Ok(t, err)
 	defer output.Close()

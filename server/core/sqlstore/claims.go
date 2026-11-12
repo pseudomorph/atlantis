@@ -33,6 +33,9 @@ func (s *Store) AcquireClaim(p models.PullRequest, owner string) error {
 	if owner == "" {
 		return fmt.Errorf("invalid execution claim")
 	}
+	if err := s.checkServerLock(); err != nil {
+		return err
+	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		row, err := savePull(tx, p)
 		if err != nil {
@@ -73,9 +76,9 @@ func (s *Store) AcquireClaim(p models.PullRequest, owner string) error {
 // so the lock also fences inserts that a missing-row check cannot. Writes that do
 // not run under that lock are single conditional statements whose RowsAffected is
 // checked. SQLite serializes writers with _txlock=immediate and the glebarez
-// dialector omits FOR UPDATE; a backend with row locking under READ COMMITTED
-// relies on this rule instead. Transactions locking several pulls take them in a
-// deterministic order.
+// dialector omits FOR UPDATE; PostgreSQL runs transactions concurrently under
+// READ COMMITTED and relies on this rule and the FOR UPDATE it emits.
+// Transactions locking several pulls take them in a deterministic order.
 var rowLock = clause.Locking{Strength: clause.LockingStrengthUpdate}
 
 // lockPull locks and returns the pull row selected by an ID or an ID subquery.
@@ -319,8 +322,9 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 }
 
 // MarkPreviousExecutionsUncertain blocks work left by earlier server instances
-// without waiting for their claims to expire. The SQLite process lock proves the
-// earlier server exited, not that Terraform children stopped.
+// without waiting for their claims to expire. The server lock (the SQLite file
+// lock or the PostgreSQL advisory lock) proves the earlier server exited or lost
+// its lock, not that Terraform children stopped.
 func (s *Store) MarkPreviousExecutionsUncertain() error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&executionClaim{}).Where("state = ? AND server_instance_id <> ?", "active", s.instance).Update("state", "uncertain").Error; err != nil {
@@ -336,6 +340,9 @@ func (s *Store) MarkPreviousExecutionsUncertain() error {
 
 // ClaimCleanup serializes destructive cleanup with other cleaners and commands.
 func (s *Store) ClaimCleanup(p models.PullRequest, owner string) (models.PullRequest, bool, error) {
+	if err := s.checkServerLock(); err != nil {
+		return p, false, err
+	}
 	claimed := false
 	err := s.db.Transaction(func(tx *gorm.DB) error {
 		var row struct {
