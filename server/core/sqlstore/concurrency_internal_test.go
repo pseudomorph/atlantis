@@ -112,38 +112,3 @@ func TestRowLockWaitSeesCommittedClosure(t *testing.T) {
 		Assert(t, idle, "claim was acquired from state read before the lock wait")
 	})
 }
-
-// When the session holding the PostgreSQL advisory lock ends, the server admits
-// no new claims and stops refreshing heartbeats, so its claims expire. Another
-// server can then start and must recover them with an attestation.
-func TestLostPostgresServerLockStopsAdmission(t *testing.T) {
-	d := PostgresDatabase(t)
-	s := d.Store(t)
-	Ok(t, s.VerifyServerLock())
-	p := claimed(t, s, claimPull())
-	var terminated bool
-	Ok(t, s.db.Raw("SELECT pg_terminate_backend(?)", s.session.PgConn().PID()).Scan(&terminated).Error)
-	Assert(t, terminated, "lock session was not terminated")
-	var err error
-	for range 50 {
-		if err = s.VerifyServerLock(); err != nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	Assert(t, errors.Is(err, ErrServerLockLost), "lost lock not detected: %v", err)
-	other := claimPull()
-	other.Num++
-	Assert(t, errors.Is(s.AcquireClaim(other, "after-loss"), ErrServerLockLost), "claim admitted after the server lock was lost")
-	_, _, err = s.ClaimCleanup(other, "cleanup-after-loss")
-	Assert(t, errors.Is(err, ErrServerLockLost), "cleanup admitted after the server lock was lost")
-	_, err = s.RefreshClaimHeartbeats()
-	Assert(t, errors.Is(err, ErrServerLockLost), "heartbeat refreshed after the server lock was lost")
-
-	next := d.Store(t)
-	Ok(t, next.MarkPreviousExecutionsUncertain())
-	Equals(t, "uncertain", storedClaim(t, next, p.ExecutionOwner()).State)
-	Assert(t, s.CheckClaim(p) != nil, "first server kept its claim after another server started")
-	ErrContains(t, "--confirm-stopped", next.AcquireUnlockClaim(p, "recovery", "operator", false))
-	Ok(t, next.AcquireUnlockClaim(p, "recovery", "operator", true))
-}

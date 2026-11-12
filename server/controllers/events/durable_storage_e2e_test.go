@@ -19,6 +19,7 @@ import (
 	"github.com/runatlantis/atlantis/server"
 	events_controllers "github.com/runatlantis/atlantis/server/controllers/events"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/core/sqlstore/sqlstoretest"
 	"github.com/runatlantis/atlantis/server/events"
@@ -31,14 +32,19 @@ import (
 
 // durableE2E holds one server's durable-storage runtime. Reusing DataDir in a
 // second setup restarts the server against the same database and artifacts.
+// Setting DSN instead starts another server, with its own data directory,
+// sharing that PostgreSQL database.
 type durableE2E struct {
 	DataDir   string
+	DSN       string
 	Store     *sqlstore.Store
 	Artifacts *artifacts.Service
 	Jobs      *jobs.Service
 	Execution *events.ExecutionCoordinator
 	Cleaner   *events.PullClosedExecutor
 	closed    bool
+	// restarted is set when setup reuses DataDir.
+	restarted bool
 }
 
 // durableDatabaseEnv selects the database for the durable e2e tests: unset for
@@ -71,7 +77,12 @@ func (d *durableE2E) open(t *testing.T) {
 	t.Helper()
 	var store *sqlstore.Store
 	var err error
-	if dsn := durableDSN(t, d.DataDir); dsn != "" {
+	dsn := d.DSN
+	if dsn == "" {
+		dsn = durableDSN(t, d.DataDir)
+	}
+	if dsn != "" {
+		d.DSN = dsn
 		store, err = sqlstore.OpenPostgresServer(dsn, d.DataDir)
 	} else {
 		store, err = sqlstore.OpenServer(d.DataDir)
@@ -79,6 +90,13 @@ func (d *durableE2E) open(t *testing.T) {
 	Ok(t, err)
 	// Startup marks work left by a previous process uncertain, as the server does.
 	Ok(t, store.MarkPreviousExecutionsUncertain())
+	if dsn != "" && d.restarted {
+		// On PostgreSQL the previous process's claims stay active until their
+		// heartbeat expires. Restart after the expiry, once the sweep has run.
+		sqlstoretest.AgeHeartbeats(t, dsn, "server_instance_id <> $1", store.InstanceID())
+		_, err := store.ExpireClaims()
+		Ok(t, err)
+	}
 	blobs := sqlstore.BlobStore{Store: store}
 	d.Store = store
 	d.Artifacts = &artifacts.Service{Records: store, Blobs: blobs}
@@ -114,6 +132,9 @@ type durableServer struct {
 	vcs       *vcsmocks.MockClient
 	workspace *events.FileWorkspace
 	storage   *durableE2E
+	// hooks is this server's pre-workflow hook runner. Setup replaces the
+	// package-level mock, so a test running two servers stubs this one.
+	hooks *runtimemocks.MockPreWorkflowHookRunner
 }
 
 func startDurableServer(t *testing.T, repoDir, headSHA string, storage *durableE2E) durableServer {
@@ -123,7 +144,7 @@ func startDurableServer(t *testing.T, repoDir, headSHA string, storage *durableE
 	workspace.TestingOverrideHeadCloneURL = fmt.Sprintf("file://%s", repoDir)
 	When(githubGetter.GetPullRequest(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int]())).ThenReturn(GitHubPullRequestParsed(headSHA), nil)
 	When(vcsClient.GetModifiedFiles(Any[logging.SimpleLogging](), Any[models.Repo](), Any[models.PullRequest]())).ThenReturn([]string{"main.tf"}, nil)
-	return durableServer{ctrl: ctrl, vcs: vcsClient, workspace: workspace, storage: storage}
+	return durableServer{ctrl: ctrl, vcs: vcsClient, workspace: workspace, storage: storage, hooks: mockPreWorkflowHookRunner}
 }
 
 func (s durableServer) comment(t *testing.T, body string) {

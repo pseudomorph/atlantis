@@ -195,6 +195,48 @@ func TestFilesystemArchiveStreamsThroughJournal(t *testing.T) {
 	Assert(t, info.PurgedAt != nil, "expired log was not purged")
 }
 
+// expiringArchive runs retention on another server while an archive write is
+// in flight: it reads the journal, runs expire, and only then stores the
+// object.
+type expiringArchive struct {
+	artifacts.Store
+	expire func() error
+}
+
+func (a expiringArchive) Put(key string, data io.Reader) (artifacts.Metadata, error) {
+	content, err := io.ReadAll(data)
+	if err != nil {
+		return artifacts.Metadata{}, err
+	}
+	if err := a.expire(); err != nil {
+		return artifacts.Metadata{}, err
+	}
+	return a.Store.Put(key, bytes.NewReader(content))
+}
+
+func TestArchiveLandingAfterRetentionIsDeleted(t *testing.T) {
+	store, journal, job := setup(t)
+	directory := t.TempDir()
+	archive, err := artifacts.NewFilesystem(directory)
+	Ok(t, err)
+	defer archive.Close()
+	Ok(t, journal.Append(job.ID, []byte("secret output\n")))
+	Ok(t, store.FinishJob(job.ID, "succeeded", ""))
+	Ok(t, store.ClosePull(job.Pull))
+	Ok(t, store.ReleaseClaim(job.Pull))
+	later := time.Now().Add(24 * time.Hour)
+	other := &logs.Service{Records: store, Archive: archive}
+	journal.Archive = expiringArchive{Store: archive, expire: func() error { return other.Collect(later, time.Hour) }}
+	Ok(t, journal.ArchiveSealed())
+	info, err := store.Log(job.ID)
+	Ok(t, err)
+	Assert(t, info.PurgedAt != nil && info.ArchivedAt == nil, "retention did not purge the log")
+	_, err = os.Stat(filepath.Join(directory, filepath.FromSlash(logs.Key(job.ID))))
+	Assert(t, os.IsNotExist(err), "archive written after retention was left in the store")
+	Ok(t, other.Collect(later, time.Hour))
+	Ok(t, journal.ArchiveSealed())
+}
+
 func TestFilesystemArchiveRejectsEscapingSymlink(t *testing.T) {
 	store, journal, job := setup(t)
 	directory, outside := t.TempDir(), t.TempDir()

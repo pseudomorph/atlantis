@@ -106,17 +106,19 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 ## Durable storage
 
 ::: warning Incomplete implementation
-This experiment implements the single-instance portion of ADR 0005 on SQLite
-or PostgreSQL: project locks, global command locks, PR status, job history, job
-logs, execution claims, cancellation, and pending plans. Multiple instances,
-distributed recovery, comprehensive webhook deduplication, and multi-instance
-acceptance tests remain incomplete. Use it only for development and testing.
+This experiment implements ADR 0005 on SQLite for one server and on PostgreSQL
+for one or more servers: project locks, global command locks, PR status, job
+history, job logs, execution claims, cancellation, pending plans, and webhook
+deduplication. Object storage for artifacts (S3-compatible) is not available
+yet; it arrives in a later change. Use the experiment only for development and
+testing.
 :::
 
 SQLite and PostgreSQL run the same versioned Goose SQL migrations, and both
 work in CGO-disabled builds.
 The database owns project locks, global command locks, PR status, job records,
-live job logs, pending-plan relationships, execution claims, and cancellation requests.
+live job logs, pending-plan relationships, execution claims, cancellation
+requests, and recent webhook delivery IDs.
 Artifacts can use the database or a filesystem directory.
 
 ### Enable
@@ -136,7 +138,8 @@ storage:
 
 For PostgreSQL, set `storage.database.type: postgres` and supply the connection
 string through `connection_string_env` or `connection_string_file`. Start with an
-empty schema and a fresh data directory.
+empty schema and a fresh data directory for each server. See
+[Supported topologies](#supported-topologies) before running more than one server.
 
 Supply the usual VCS credentials and repository allowlist. See
 [storage configuration](server-configuration.md#durable-storage-configuration)
@@ -146,6 +149,87 @@ or `enable-external-stores`.
 Experiment permission alone leaves the selected backend unchanged. Configuring
 `storage` without permission rejects startup. Database open or migration errors
 stop startup.
+
+### Supported topologies
+
+| Topology | Database | Artifacts | Data directory |
+| --- | --- | --- | --- |
+| One server | SQLite | `database` or `filesystem` | Local or block-backed disk |
+| One server | PostgreSQL | `database` or `filesystem` | Its own `data-dir` |
+| Several servers | PostgreSQL, one shared schema | `database`, or `filesystem` on a shared disk | Its own `data-dir` per server |
+
+- SQLite supports one server. The database file lives in `data-dir`.
+- Several servers can share one PostgreSQL schema. All of them use the same
+  `storage` configuration. Each server needs its own `data-dir`; a file lock in
+  `data-dir` stops a second process from using it. With PostgreSQL, `data-dir`
+  holds only working directories and Terraform caches, so a server can start
+  with an empty one.
+- Artifacts must be readable by every server. The `database` backend works with
+  any number of servers. A `filesystem` directory works only when every server
+  mounts the same shared disk at the configured `storage.artifacts.directory`
+  and that filesystem renames files atomically, because Atlantis writes each
+  artifact to a temporary file and renames it into place. With PostgreSQL,
+  Atlantis logs a warning at startup when filesystem artifacts are inside
+  `data-dir`, which belongs to one server. Object storage is not available yet.
+- Webhooks can go to any server, for example through a load balancer. Each
+  server records the delivery ID that the VCS provider sends, so a delivery
+  that reaches two servers, or arrives twice, runs once; the duplicate gets
+  HTTP 200 and has no other effect. Atlantis reads `X-GitHub-Delivery` (GitHub),
+  `X-Gitlab-Event-UUID` (GitLab), `X-Request-UUID` (Bitbucket Cloud),
+  `X-Request-Id` (Bitbucket Server), and `X-Gitea-Delivery` (Gitea). Azure DevOps
+  sends no delivery ID, so its deliveries are not deduplicated. A delivery is
+  recorded only after its signature or credentials are verified, and forgotten
+  again when Atlantis answers with an error, so the provider's retry runs.
+  Delivery IDs are kept for 7 days.
+- A pull request's commands can run on different servers. One execution claim
+  per pull request decides which server runs; a command sent to another server
+  meanwhile is refused with a comment. A server that runs apply on a plan made
+  elsewhere restores the plan from artifact storage. `atlantis cancel`, PR
+  closure, unlock, and job log pages work from any server.
+- Each maintenance pass (closure verification, deferred cleanup, and log
+  archiving with retention) runs on one server at a time under a PostgreSQL
+  advisory lock.
+- Each server keeps its own working directories. Deferred cleanup of a closed
+  pull request removes the working directory on the server that runs it; other
+  servers keep their copies until you remove them. Apply and policy checks on
+  Atlantis-managed plan files use the plan selected in the database and
+  restored from artifact storage, never a plan file left in such a copy.
+
+The multi-server tests start two servers on one PostgreSQL database and cover
+competing commands on one pull request, duplicate webhook deliveries,
+cancellation from the other server, PR closure while the other server runs a
+command, recovery after a server stops, and following a job's log from the
+other server.
+
+### Roll out
+
+1. Drain the legacy installation and keep its data. Durable storage starts
+   with an empty schema; locks, PR status, and plans are not imported.
+2. Start the servers with the same `storage` configuration and a fresh
+   `data-dir` each. Servers that start together against an empty or older schema
+   run each migration once; the others wait for up to 5 minutes.
+3. Point the VCS webhook at a load balancer in front of the servers, and
+   replan open pull requests before applying.
+
+To add a server, start it with the same configuration and a new `data-dir`.
+To remove one, stop it after it drains; a server shutting down finishes its
+running commands and keeps their claims alive until then. On Kubernetes, give
+each pod its own volume for `data-dir`, for example with a StatefulSet; with
+PostgreSQL, rolling updates are allowed.
+
+If a server stops without draining, its claims stay active until their
+heartbeat expires, up to 2 minutes after the server stopped. Another server then
+marks them uncertain, and the pull requests they cover need the
+[stopped-work recovery](#unfinished-execution-after-a-crash). A server
+restarted with the same `data-dir` gets a new instance ID, so it treats its
+earlier claims the same way.
+
+To upgrade, restart the servers one at a time with the new release. The first
+server on the new release migrates the schema while the others keep running.
+Every migration so far only adds tables, columns, and indexes, so servers on
+the previous release keep working during the rollout. A server refuses to start
+against a schema newer than it supports, so roll back a release only with a
+database backup taken before the upgrade.
 
 ### BoltDB deprecation
 
@@ -164,22 +248,39 @@ BoltDB locking (`--locking-db-type=boltdb`, the current default) is deprecated.
 - **Earliest removal:** no sooner than 2 minor releases and 60 days after durable
   storage graduates. Removal is a separate reviewed PR.
 
-Redis and `--enable-external-stores` are not deprecated yet. Their replacements,
-multi-instance PostgreSQL deployments and object storage for artifacts, are not
-part of this experiment.
+### Redis deprecation
+
+::: warning Deprecated
+Redis locking (`--locking-db-type=redis`) is deprecated.
+:::
+
+- **Why:** [ADR 0005](/contributing/adr/0005-use-durable-storage-with-one-data-model.md)
+  replaces Redis with one relational data model. This experiment covers what
+  Redis does for installs with several servers.
+- **Replacement:** the `durable-storage` experiment with `storage.database.type: postgres`.
+- **Migration:** follow [Enable](#enable) and [Roll out](#roll-out). Drain
+  commands on every server, start the servers on an empty PostgreSQL schema with a
+  fresh `data-dir` each, and replan open PRs. Redis locks and PR status are not
+  imported.
+- **Deprecated in:** the first release that includes this notice. From that
+  release, Atlantis logs a warning at startup when Redis is the locking backend.
+- **Earliest removal:** no sooner than 2 minor releases and 60 days after durable
+  storage graduates. Removal is a separate reviewed PR.
+
+`--enable-external-stores` is not deprecated yet. Its replacement, object
+storage for artifacts, is not part of this experiment yet.
 
 ### Behavior and limits
 
 - SQLite requires a 64-bit server and one Atlantis process on local or block-backed storage. NFS/EFS
   and multiple instances are unsupported. Kubernetes deployments must stop the old
   pod before starting its replacement, for example with `strategy: Recreate`.
-- PostgreSQL also allows one Atlantis process per schema. A session-level advisory
-  lock taken at startup enforces this: a second server fails to start until the
-  first stops. Use `strategy: Recreate` on Kubernetes as well. If the session that
-  holds the lock ends while the server runs, for example after a database
-  restart or a network failure, the server logs an error, refuses new commands
-  and stops refreshing claim heartbeats, so its claims expire and need the
-  stopped-work recovery below. Restart the server to take the lock again.
+- PostgreSQL also requires a 64-bit server. Several servers can share a schema;
+  see [Supported topologies](#supported-topologies). If a server loses its
+  database connection, its commands fail their next storage write and its claims
+  stop receiving heartbeats, so they expire and need the stopped-work recovery
+  below. A heartbeat that arrives after another server marked the claim
+  uncertain does not revive it.
 - VCS instances, repositories, PRs, projects, and jobs share foreign-key relationships.
   Locks and status are keyed by VCS instance, so same-named repositories on
   different instances never share them. Working directories and their in-process
@@ -240,9 +341,10 @@ part of this experiment.
   drains for shutdown. A sweep marks an active claim whose heartbeat is older than
   2 minutes uncertain and seals its open logs as interrupted. An expired claim is
   never transferred to another command; it needs the stopped-work recovery below.
-  The server lock (the SQLite file lock or the PostgreSQL advisory lock) already
-  makes every earlier claim uncertain at startup, so the sweep only finds claims
-  whose own refresh stopped. These
+  With SQLite, the data directory lock proves the earlier server exited, so
+  startup makes every earlier claim uncertain and the sweep only finds claims
+  whose own refresh stopped. With PostgreSQL, startup leaves other claims alone,
+  because another server may still hold them; every server runs the sweep. These
   intervals are fixed and not configurable.
 - Closing a PR cancels queued work and defers cleanup until active work stops.
   Reopening it accepts commands again once that cleanup finishes.
@@ -265,6 +367,8 @@ part of this experiment.
 `atlantis unlock` clears plans and project reservations only after acquiring
 execution ownership. It refuses active work. After a restart, unfinished claims
 are uncertain: Atlantis cannot prove that Terraform or workflow children stopped.
+With PostgreSQL, the claims of a server that stopped become uncertain once their
+heartbeat expires, and recovery can run from any server.
 
 Independently verify that those processes have stopped, including remote work
 started by custom steps, then have an authorized operator comment:
@@ -310,7 +414,7 @@ history or migrate existing plans.
 
 ### Disable, upgrade, and roll back
 
-Stop Atlantis before backing up the database and artifact storage. For SQLite,
+Stop every Atlantis server before backing up the database and artifact storage. For SQLite,
 include WAL sidecars or use a consistent SQLite backup. For PostgreSQL, back up
 the schema with `pg_dump` or a snapshot of the database. A dump restores only
 into PostgreSQL; there is no conversion between SQLite and PostgreSQL. Preserve filesystem
@@ -327,9 +431,9 @@ does not migrate state.
 ### Durable storage graduation checklist
 
 - [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: the `server/core/sqlstore` tests run against SQLite and, when `ATLANTIS_TEST_POSTGRES_DSN` is set, PostgreSQL 17. They cover persistence, concurrency, row locking under `READ COMMITTED`, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
-- [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
+- [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances. Initial evidence: with `ATLANTIS_TEST_POSTGRES_DSN` set, `server/controllers/events/durable_multiinstance_e2e_test.go` and `durable_log_viewer_e2e_test.go` run two servers on one PostgreSQL database through these cases, and `server/core/sqlstore` tests concurrent startup migrations, maintenance pass locks, and duplicate deliveries racing between servers.
 - [ ] Verify artifact retention, durable logs, and restoring pending plans across restarts and PR cleanup.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.
 
-Graduation, changing defaults, and removing BoltDB are separate reviewed changes. The experiment implements only the single-instance part of ADR 0005 and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).
+Graduation, changing defaults, and removing BoltDB and Redis are separate reviewed changes. The experiment does not yet store artifacts in object storage and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).

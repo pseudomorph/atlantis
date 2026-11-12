@@ -34,8 +34,10 @@ func TestDurableStorageCrashProcessHelper(t *testing.T) {
 	s.comment(t, "atlantis apply")
 }
 
-func TestDurableStorageCrashDuringApplyAndUnlockRecovery(t *testing.T) {
-	skipUnlessDurableE2E(t)
+// skipUnlessTerraformData skips process tests that use terraform_data, which
+// requires Terraform >= 1.4.
+func skipUnlessTerraformData(t *testing.T) {
+	t.Helper()
 	versionOutput, err := exec.Command("terraform", "version").Output()
 	Ok(t, err)
 	match := versionRegex.FindStringSubmatch(string(versionOutput))
@@ -46,6 +48,11 @@ func TestDurableStorageCrashDuringApplyAndUnlockRecovery(t *testing.T) {
 	if installed.LessThan(version.Must(version.NewVersion("1.4.0"))) {
 		t.Skip("terraform_data process test requires Terraform >= 1.4")
 	}
+}
+
+func TestDurableStorageCrashDuringApplyAndUnlockRecovery(t *testing.T) {
+	skipUnlessDurableE2E(t)
+	skipUnlessTerraformData(t)
 	repoDir, headSHA := initializeRepo(t, "simple")
 	signals := t.TempDir()
 	ready, done := filepath.Join(signals, "entered"), filepath.Join(signals, "finished")

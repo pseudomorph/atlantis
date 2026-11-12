@@ -101,6 +101,8 @@ type VCSEventsController struct {
 	AzureDevopsWebhookBasicPassword []byte
 	AzureDevopsRequestValidator     AzureDevopsRequestValidator `validate:"required"`
 	GiteaWebhookSecret              []byte
+	// Deliveries, set with durable storage, ignores redelivered webhooks.
+	Deliveries WebhookDeliveries
 }
 
 // Post handles POST webhook requests.
@@ -179,6 +181,10 @@ func (e *VCSEventsController) handleGithubPost(w http.ResponseWriter, r *http.Re
 		e.respond(w, logging.Warn, http.StatusBadRequest, "%s", err.Error())
 		return
 	}
+	w, accepted := e.acceptDelivery(w, r, models.Github)
+	if !accepted {
+		return
+	}
 
 	githubReqID := "X-Github-Delivery=" + html.EscapeString(r.Header.Get("X-Github-Delivery"))
 	logger := e.Logger.With("gh-request-id", githubReqID)
@@ -236,6 +242,10 @@ func (e *VCSEventsController) handleBitbucketCloudPost(w http.ResponseWriter, r 
 			return
 		}
 	}
+	w, accepted := e.acceptDelivery(w, r, models.BitbucketCloud)
+	if !accepted {
+		return
+	}
 	switch eventType {
 	case bitbucketcloud.PullCreatedHeader, bitbucketcloud.PullUpdatedHeader, bitbucketcloud.PullFulfilledHeader, bitbucketcloud.PullRejectedHeader:
 		e.Logger.Debug("handling as pull request state changed event")
@@ -271,6 +281,10 @@ func (e *VCSEventsController) handleBitbucketServerPost(w http.ResponseWriter, r
 			e.respond(w, logging.Warn, http.StatusBadRequest, "%s", fmt.Errorf("request did not pass validation: %w", err).Error())
 			return
 		}
+	}
+	w, accepted := e.acceptDelivery(w, r, models.BitbucketServer)
+	if !accepted {
+		return
 	}
 	switch eventType {
 	case bitbucketserver.PullCreatedHeader, bitbucketserver.PullFromRefUpdatedHeader, bitbucketserver.PullMergedHeader, bitbucketserver.PullDeclinedHeader, bitbucketserver.PullDeletedHeader:
@@ -337,6 +351,10 @@ func (e *VCSEventsController) handleGiteaPost(w http.ResponseWriter, r *http.Req
 			e.respond(w, logging.Warn, http.StatusBadRequest, "%s", fmt.Errorf("request did not pass validation: %w", err).Error())
 			return
 		}
+	}
+	w, accepted := e.acceptDelivery(w, r, models.Gitea)
+	if !accepted {
+		return
 	}
 
 	logger := e.Logger.With("gitea-request-id", reqID)
@@ -673,6 +691,10 @@ func (e *VCSEventsController) handleGitlabPost(w http.ResponseWriter, r *http.Re
 		return
 	}
 	e.Logger.Debug("request valid")
+	w, accepted := e.acceptDelivery(w, r, models.Gitlab)
+	if !accepted {
+		return
+	}
 
 	switch event := event.(type) {
 	case gitlab.MergeCommentEvent:

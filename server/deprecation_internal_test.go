@@ -8,16 +8,18 @@ import (
 	"testing"
 )
 
-func TestBoltDBDeprecationWarningFollowsLogStyle(t *testing.T) {
-	if strings.Contains(boltDBDeprecationWarning, ":") {
-		t.Fatalf("log message must not contain colons: %q", boltDBDeprecationWarning)
-	}
-	if boltDBDeprecationWarning != strings.ToLower(boltDBDeprecationWarning) {
-		t.Fatalf("log message must be lowercase: %q", boltDBDeprecationWarning)
-	}
-	for _, want := range []string{"deprecated", "durable-storage", "sqlite", "migration"} {
-		if !strings.Contains(boltDBDeprecationWarning, want) {
-			t.Fatalf("warning %q does not mention %q", boltDBDeprecationWarning, want)
+func TestDeprecationWarningsFollowLogStyle(t *testing.T) {
+	for warning, replacement := range map[string]string{boltDBDeprecationWarning: "sqlite", redisDeprecationWarning: "postgres"} {
+		if strings.Contains(warning, ":") {
+			t.Fatalf("log message must not contain colons: %q", warning)
+		}
+		if warning != strings.ToLower(warning) {
+			t.Fatalf("log message must be lowercase: %q", warning)
+		}
+		for _, want := range []string{"deprecated", "durable-storage", replacement, "migration"} {
+			if !strings.Contains(warning, want) {
+				t.Fatalf("warning %q does not mention %q", warning, want)
+			}
 		}
 	}
 }

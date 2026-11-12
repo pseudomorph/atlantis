@@ -188,7 +188,7 @@ func TestCutoverRequiresFreshState(t *testing.T) {
 				Assert(t, err != nil, "accepted legacy state")
 				_, err = os.Stat(filepath.Join(d.DataDir, "atlantis.sqlite"))
 				Assert(t, os.IsNotExist(err), "created database before rejecting cutover")
-				// The rejected server released its server lock.
+				// The rejected server released its data directory lock.
 				Ok(t, os.Remove(filepath.Join(d.DataDir, name)))
 				d.Store(t)
 			})
@@ -196,7 +196,7 @@ func TestCutoverRequiresFreshState(t *testing.T) {
 	}
 }
 
-// A second server cannot open the same database until the first closes it.
+// A second server cannot use the same data directory until the first closes it.
 func TestServerOwnership(t *testing.T) {
 	sqlstore.ForEachDatabase(t, func(t *testing.T, d sqlstore.TestDatabase) {
 		first, err := d.Open()

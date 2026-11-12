@@ -192,3 +192,26 @@ func TestDurableHeartbeatRefreshesAndSweeps(t *testing.T) {
 	// A refreshed claim is live, so the sweep in the same round leaves it active.
 	Ok(t, store.CheckClaim(pull))
 }
+
+func TestSharedArtifactsWarning(t *testing.T) {
+	dataDir := t.TempDir()
+	shared := t.TempDir()
+	for _, c := range []struct {
+		name      string
+		database  string
+		artifacts StorageArtifactsConfig
+		warn      bool
+	}{
+		{"sqlite filesystem", "sqlite", StorageArtifactsConfig{Type: "filesystem"}, false},
+		{"postgres database", "postgres", StorageArtifactsConfig{Type: "database"}, false},
+		{"postgres default directory", "postgres", StorageArtifactsConfig{Type: "filesystem"}, true},
+		{"postgres directory inside data-dir", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: filepath.Join(dataDir, "shared")}, true},
+		{"postgres shared directory", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: shared}, false},
+		{"postgres sibling directory", "postgres", StorageArtifactsConfig{Type: "filesystem", Directory: dataDir + "-artifacts"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			config := UserConfig{DataDir: dataDir, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: c.database}, Artifacts: c.artifacts}}
+			Equals(t, c.warn, sharedArtifactsWarning(config) != "")
+		})
+	}
+}
