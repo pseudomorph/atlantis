@@ -19,10 +19,12 @@ import (
 	"github.com/runatlantis/atlantis/server/core/config/valid"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/logs"
+	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/jobs"
+	"github.com/runatlantis/atlantis/server/logging"
 	. "github.com/runatlantis/atlantis/testing"
 )
 
@@ -401,6 +403,33 @@ func TestClosedServiceRejectsNewJobs(t *testing.T) {
 	job, err := service.Store.Job(ctx.JobID)
 	Ok(t, err)
 	Assert(t, job == nil, "closed service created a job")
+}
+
+func TestHookOutcomeDoesNotChangePendingPlan(t *testing.T) {
+	service, _ := setup(t)
+	ctx := projectContext(t)
+	beginPlan(t, service, &ctx)
+	file := filepath.Join(ctx.ArtifactRoot, "plan.tfplan")
+	Ok(t, os.WriteFile(file, []byte("plan"), 0600))
+	Ok(t, service.Artifacts.SnapshotPlan(ctx, filepath.Dir(file), file))
+	Ok(t, service.Finish(ctx, command.ProjectCommandOutput{}))
+	handler := &jobs.DurableOutputHandler{Service: service}
+	runner := runtime.DefaultPreWorkflowHookRunner{Jobs: service, OutputHandler: handler}
+	for _, label := range []string{"plan", "apply"} {
+		hook := models.WorkflowHookCommandContext{HookID: uuid.NewString(), HookStepName: label, Pull: ctx.Pull, BaseRepo: ctx.BaseRepo, RepoRelDir: ctx.RepoRelDir, Workspace: ctx.Workspace, Log: logging.NewNoopLogger(t)}
+		_, _, err := runner.Run(hook, "printf never-retain-this-output; exit 7", "sh", "-c", ctx.ArtifactRoot)
+		Assert(t, err != nil, "hook failure was ignored")
+		job, err := service.Store.Job(hook.HookID)
+		Ok(t, err)
+		Equals(t, models.WorkflowHookJob, job.Kind)
+		Equals(t, "failed", job.State)
+		Assert(t, !strings.Contains(job.Error, "never-retain-this-output"), "hook output escaped log retention")
+		Equals(t, "", job.PlanJobID)
+		pending, err := service.Artifacts.Records.PendingPlans(ctx.BaseRepo, ctx.Pull.Num)
+		Ok(t, err)
+		Equals(t, 1, len(pending))
+		Equals(t, ctx.JobID, pending[0].ID)
+	}
 }
 
 func TestConcurrentPlanLogsAndRetention(t *testing.T) {
