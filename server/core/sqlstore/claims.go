@@ -18,6 +18,14 @@ type executionClaim struct {
 	PullID       string `gorm:"primaryKey;autoIncrement:false"`
 	Owner, State string
 	AcquiredAt   time.Time
+	// ServerInstanceID is the process holding the claim; HeartbeatAt is its last refresh.
+	ServerInstanceID string
+	HeartbeatAt      time.Time
+}
+
+// newClaim is an active claim held by this server instance.
+func (s *Store) newClaim(pullID, owner string, now time.Time) executionClaim {
+	return executionClaim{PullID: pullID, Owner: owner, State: "active", AcquiredAt: now, ServerInstanceID: s.instance, HeartbeatAt: now}
 }
 
 // AcquireClaim rejects existing ownership, including unfinished work from a prior server.
@@ -47,7 +55,7 @@ func (s *Store) AcquireClaim(p models.PullRequest, owner string) error {
 		if err != nil {
 			return err
 		}
-		claim := executionClaim{PullID: row.ID, Owner: owner, State: "active", AcquiredAt: now}
+		claim := s.newClaim(row.ID, owner, now)
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim)
 		if result.Error != nil {
 			return result.Error
@@ -310,11 +318,12 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 	})
 }
 
-// MarkPreviousExecutionsUncertain blocks work left by the prior server.
-// The SQLite process lock proves the server exited, not that Terraform children stopped.
+// MarkPreviousExecutionsUncertain blocks work left by earlier server instances
+// without waiting for their claims to expire. The SQLite process lock proves the
+// earlier server exited, not that Terraform children stopped.
 func (s *Store) MarkPreviousExecutionsUncertain() error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Model(&executionClaim{}).Where("state = ?", "active").Update("state", "uncertain").Error; err != nil {
+		if err := tx.Model(&executionClaim{}).Where("state = ? AND server_instance_id <> ?", "active", s.instance).Update("state", "uncertain").Error; err != nil {
 			return err
 		}
 		now, err := databaseNow(tx)
@@ -344,7 +353,7 @@ func (s *Store) ClaimCleanup(p models.PullRequest, owner string) (models.PullReq
 		if err != nil {
 			return err
 		}
-		claim := executionClaim{PullID: row.ID, Owner: owner, State: "active", AcquiredAt: now}
+		claim := s.newClaim(row.ID, owner, now)
 		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim)
 		if result.Error != nil {
 			return result.Error

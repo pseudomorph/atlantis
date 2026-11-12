@@ -60,7 +60,7 @@ func (s *Store) StartJob(want models.Job) error {
 				return err
 			}
 		}
-		row := job{ToolDistribution: want.ToolDistribution, ToolVersion: want.ToolVersion, Kind: want.Kind, ManagedPlan: want.ManagedPlan, Owner: want.Pull.ExecutionOwner(), ID: want.ID, RepositoryID: p.RepositoryID, PullID: p.ID, ProjectID: projectID, Command: want.Command, SubCommand: want.SubCommand,
+		row := job{ToolDistribution: want.ToolDistribution, ToolVersion: want.ToolVersion, Kind: want.Kind, ManagedPlan: want.ManagedPlan, Owner: want.Pull.ExecutionOwner(), ServerInstanceID: s.instance, ID: want.ID, RepositoryID: p.RepositoryID, PullID: p.ID, ProjectID: projectID, Command: want.Command, SubCommand: want.SubCommand,
 			Arguments: want.Arguments, Steps: want.Steps, Issuer: want.Issuer.Username, IssuerTeams: want.Issuer.Teams, Trigger: want.Trigger, Revision: want.Revision,
 			State: "running", Private: want.Private, StartedAt: startedAt}
 		var binding *planBinding
@@ -196,7 +196,7 @@ func loadJob(tx *gorm.DB, row job) (models.Job, error) {
 		selectedProject = models.NewProject(p.BaseRepo.FullName, project.Directory, project.Name)
 		workspace = project.Workspace
 	}
-	result := models.Job{ToolDistribution: row.ToolDistribution, ToolVersion: row.ToolVersion, Kind: row.Kind, ManagedPlan: row.ManagedPlan, ID: row.ID, Owner: row.Owner, Pull: p, Project: selectedProject, Workspace: workspace,
+	result := models.Job{ToolDistribution: row.ToolDistribution, ToolVersion: row.ToolVersion, Kind: row.Kind, ManagedPlan: row.ManagedPlan, ID: row.ID, Owner: row.Owner, ServerInstance: row.ServerInstanceID, Pull: p, Project: selectedProject, Workspace: workspace,
 		Command: row.Command, SubCommand: row.SubCommand, Arguments: row.Arguments, Steps: row.Steps, Issuer: models.User{Username: row.Issuer, Teams: row.IssuerTeams},
 		Trigger: row.Trigger, Revision: row.Revision, State: row.State, Error: row.Error, Private: row.Private, StartedAt: row.StartedAt, FinishedAt: row.FinishedAt}
 	result.PlanJobID, err = boundPlan(tx, row.ID)

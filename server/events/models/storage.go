@@ -19,6 +19,7 @@ type Job struct {
 	ManagedPlan      bool
 	ID               string
 	Owner            string `json:"-"`
+	ServerInstance   string `json:"-"`
 	Pull             PullRequest
 	Project          Project
 	Workspace        string
