@@ -18,6 +18,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/metrics/metricstest"
@@ -147,7 +148,7 @@ func setup(t *testing.T, options ...func(testConfig *TestConfig)) *vcsmocks.Mock
 	// Tests that need specific return values should set applyLockCheckerReturn/applyLockCheckerErr in TestConfig.
 	applyLockChecker.EXPECT().CheckApplyLock().Return(testConfig.applyLockCheckerReturn, testConfig.applyLockCheckerErr).AnyTimes()
 	// Plan cleanup only deletes selected on_plan locks through owner-scoped cleanup.
-	lockingLocker.EXPECT().UnlockIfOwnedByPull(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	lockingLocker.EXPECT().UnlockIfOwnedByPull(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 	dbUpdater = &events.DBUpdater{
 		Database: testConfig.database,
@@ -1887,16 +1888,20 @@ func (l failUnlockByPullLocker) Unlock(string) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
+func (l failUnlockByPullLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
+}
+
 func (l failUnlockByPullLocker) List() (map[string]models.ProjectLock, error) {
 	return nil, nil
 }
 
-func (l failUnlockByPullLocker) UnlockByPull(string, int) ([]models.ProjectLock, error) {
+func (l failUnlockByPullLocker) UnlockByPull(models.Repo, int) ([]models.ProjectLock, error) {
 	l.t.Fatalf("no-project cleanup must not call UnlockByPull")
 	return nil, nil
 }
 
-func (l failUnlockByPullLocker) UnlockIfOwnedByPull(models.Project, string, int) (*models.ProjectLock, error) {
+func (l failUnlockByPullLocker) UnlockIfOwnedByPull(models.Repo, models.Project, string, int) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
@@ -2106,7 +2111,7 @@ func TestRunUnlockCommand_VCSComment(t *testing.T) {
 				&events.CommentCommand{Name: command.Unlock})
 
 			deleteLockCommand.VerifyWasCalledOnce().DeleteLocksByPull(Any[logging.SimpleLogging](),
-				Eq(testdata.GithubRepo.FullName), Eq(testdata.Pull.Num))
+				Eq(testdata.GithubRepo), Eq(testdata.Pull.Num))
 			vcsClient.VerifyWasCalledOnce().CreateComment(
 				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(testdata.Pull.Num),
 				Eq("All Atlantis locks for this PR have been unlocked and plans discarded"), Eq("unlock"))
@@ -2127,7 +2132,7 @@ func TestRunUnlockCommandFail_VCSComment(t *testing.T) {
 		Eq(testdata.Pull.Num))).ThenReturn(pull, nil)
 	When(eventParsing.ParseGithubPull(Any[logging.SimpleLogging](), Eq(pull))).ThenReturn(modelPull, modelPull.BaseRepo,
 		testdata.GithubRepo, nil)
-	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo.FullName),
+	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(testdata.Pull.Num))).ThenReturn(0, errors.New("err"))
 
 	ch.RunCommentCommand(testdata.GithubRepo, &testdata.GithubRepo, nil, testdata.User, testdata.Pull.Num,
@@ -2151,7 +2156,7 @@ func TestRunUnlockCommandFail_DisableUnlockLabel(t *testing.T) {
 		Eq(testdata.Pull.Num))).ThenReturn(pull, nil)
 	When(eventParsing.ParseGithubPull(Any[logging.SimpleLogging](), Eq(pull))).ThenReturn(modelPull, modelPull.BaseRepo,
 		testdata.GithubRepo, nil)
-	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo.FullName),
+	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(testdata.Pull.Num))).ThenReturn(0, errors.New("err"))
 	When(ch.VCSClient.GetPullLabels(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(modelPull))).ThenReturn([]string{doNotUnlock, "need-help"}, nil)
@@ -2175,7 +2180,7 @@ func TestRunUnlockCommandFail_GetLabelsFail(t *testing.T) {
 		Eq(testdata.Pull.Num))).ThenReturn(pull, nil)
 	When(eventParsing.ParseGithubPull(Any[logging.SimpleLogging](), Eq(pull))).ThenReturn(modelPull, modelPull.BaseRepo,
 		testdata.GithubRepo, nil)
-	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo.FullName),
+	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(testdata.Pull.Num))).ThenReturn(0, errors.New("err"))
 	When(ch.VCSClient.GetPullLabels(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(modelPull))).ThenReturn(nil, errors.New("err"))
@@ -2201,7 +2206,7 @@ func TestRunUnlockCommandDoesntRetrieveLabelsIfDisableUnlockLabelNotSet(t *testi
 		Eq(testdata.Pull.Num))).ThenReturn(pull, nil)
 	When(eventParsing.ParseGithubPull(Any[logging.SimpleLogging](), Eq(pull))).ThenReturn(modelPull, modelPull.BaseRepo,
 		testdata.GithubRepo, nil)
-	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo.FullName),
+	When(deleteLockCommand.DeleteLocksByPull(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(testdata.Pull.Num))).ThenReturn(0, errors.New("err"))
 	When(ch.VCSClient.GetPullLabels(Any[logging.SimpleLogging](), Eq(testdata.GithubRepo),
 		Eq(modelPull))).ThenReturn([]string{doNotUnlock, "need-help"}, nil)
@@ -2984,6 +2989,43 @@ func TestRunCommentCommand_VarFileOutsideAllowlistRejectedForEveryCommand(t *tes
 			vcsClient.VerifyWasCalledOnce().CreateComment(
 				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(modelPull.Num),
 				Eq("```\nvar file path /etc/passwd is not allowed by the current allowlist: []\n```"), Eq(""))
+		})
+	}
+}
+
+// A durable execution claim that autoplan cannot take is reported like a busy
+// working-directory pull lock in legacy autoplan: failed plan status and a PR
+// comment, with no retry.
+func TestRunAutoplanCommand_DurableClaimRejectionFailsPlan(t *testing.T) {
+	for name, prepare := range map[string]func(*testing.T, *sqlstore.Store, models.PullRequest){
+		"claim held": func(t *testing.T, store *sqlstore.Store, pull models.PullRequest) {
+			pull.Execution = &models.Execution{Owner: "running-command"}
+			Ok(t, store.AcquireClaim(pull, "running-command"))
+		},
+		"reopened before closure cleanup": func(t *testing.T, store *sqlstore.Store, pull models.PullRequest) {
+			Ok(t, store.ClosePull(pull))
+			Ok(t, store.RequestReopen(pull))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			vcsClient := setup(t)
+			store, err := sqlstore.OpenServer(t.TempDir())
+			Ok(t, err)
+			t.Cleanup(func() { _ = store.Close() })
+			ch.Execution = &events.ExecutionCoordinator{Store: store}
+			pull := testdata.Pull
+			pull.BaseRepo = testdata.GithubRepo
+			prepare(t, store, pull)
+
+			ch.RunAutoplanCommand(testdata.GithubRepo, testdata.GithubRepo, pull, testdata.User)
+
+			projectCommandBuilder.VerifyWasCalled(Never()).BuildAutoplanCommands(Any[*command.Context]())
+			commitUpdater.VerifyWasCalledOnce().UpdateCombined(
+				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Any[models.PullRequest](), Eq(models.FailedCommitStatus), Eq(command.Plan))
+			_, _, _, comment, _ := vcsClient.VerifyWasCalledOnce().CreateComment(
+				Any[logging.SimpleLogging](), Eq(testdata.GithubRepo), Eq(pull.Num), Any[string](), Eq("plan")).GetCapturedArguments()
+			Assert(t, strings.Contains(comment, "Plan Error"), "got: %s", comment)
+			Assert(t, strings.Contains(comment, "starting autoplan"), "got: %s", comment)
 		})
 	}
 }

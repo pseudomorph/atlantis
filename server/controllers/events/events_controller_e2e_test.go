@@ -26,6 +26,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/boltdb"
 	"github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
@@ -41,6 +42,7 @@ import (
 	"github.com/runatlantis/atlantis/server/events/vcs"
 	vcsmocks "github.com/runatlantis/atlantis/server/events/vcs/mocks"
 	"github.com/runatlantis/atlantis/server/events/webhooks"
+	"github.com/runatlantis/atlantis/server/jobs"
 	jobmocks "github.com/runatlantis/atlantis/server/jobs/mocks"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/metrics/metricstest"
@@ -1341,18 +1343,35 @@ type setupOption struct {
 	disableAutoplan         bool
 	disablePreWorkflowHooks bool
 	userConfig              server.UserConfig
+	// durable, when set, wires the durable-storage experiment instead of BoltDB.
+	durable *durableE2E
 }
 
 func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers.VCSEventsController, *vcsmocks.MockClient, *mocks.MockGithubPullGetter, *events.FileWorkspace) {
 	allowForkPRs := false
 	discardApprovalOnPlan := true
 	dataDir, binDir, cacheDir := mkSubDirs(t)
+	if opt.durable != nil {
+		// Reusing a data directory restarts the server against the same storage.
+		opt.durable.restarted = opt.durable.DataDir != ""
+		if opt.durable.DataDir == "" {
+			opt.durable.DataDir = dataDir
+		} else {
+			dataDir = opt.durable.DataDir
+			binDir, cacheDir = filepath.Join(dataDir, "bin"), filepath.Join(dataDir, "plugin-cache")
+		}
+	}
 	// Mocks.
 	e2eVCSClient := vcsmocks.NewMockClient()
 	e2eStatusUpdater := &events.DefaultCommitStatusUpdater{Client: e2eVCSClient}
 	e2eGithubGetter := mocks.NewMockGithubPullGetter()
 	e2eGitlabGetter := mocks.NewMockGitlabMergeRequestGetter()
-	projectCmdOutputHandler := jobmocks.NewMockProjectCommandOutputHandler()
+	var projectCmdOutputHandler jobs.ProjectCommandOutputHandler = jobmocks.NewMockProjectCommandOutputHandler()
+	if opt.durable != nil {
+		// Durable storage journals job output, as the server does.
+		opt.durable.open(t)
+		projectCmdOutputHandler = &jobs.DurableOutputHandler{Service: opt.durable.Jobs}
+	}
 
 	// Real dependencies.
 	logging.SuppressDefaultLogging()
@@ -1374,10 +1393,11 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		disableApply = false
 	}
 	commentParser := &events.CommentParser{
-		GithubUser:     "github-user",
-		GitlabUser:     "gitlab-user",
-		ExecutableName: "atlantis",
-		AllowCommands:  allowCommands,
+		UnlockRecoveryEnabled: opt.durable != nil,
+		GithubUser:            "github-user",
+		GitlabUser:            "gitlab-user",
+		ExecutableName:        "atlantis",
+		AllowCommands:         allowCommands,
 	}
 
 	mockDownloader := terraform_mocks.NewMockDownloader()
@@ -1385,12 +1405,19 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 
 	terraformClient, err := tfclient.NewClient(logger, distribution, binDir, cacheDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", true, false, projectCmdOutputHandler)
 	Ok(t, err)
-	b, err := boltdb.New(dataDir)
-	Ok(t, err)
-	database := b
-	lockingClient := locking.NewClient(b)
+	var database db.Database
+	var planStore runtime.PlanStore = &runtime.LocalPlanStore{}
+	if opt.durable != nil {
+		database = opt.durable.Store
+		planStore = opt.durable.Artifacts
+	} else {
+		b, err := boltdb.New(dataDir)
+		Ok(t, err)
+		database = b
+	}
+	lockingClient := locking.NewClient(database)
 	noOpLocker := locking.NewNoOpLocker()
-	applyLocker = locking.NewApplyClient(b, disableApply, disableGlobalApplyLock)
+	applyLocker = locking.NewApplyClient(database, disableApply, disableGlobalApplyLock)
 	projectLocker := &events.DefaultProjectLocker{
 		Locker:         lockingClient,
 		NoOpLocker:     noOpLocker,
@@ -1400,6 +1427,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 	workingDir := &events.FileWorkspace{
 		DataDir:                     dataDir,
 		TestingOverrideHeadCloneURL: "override-me",
+		InstanceScoped:              opt.durable != nil,
 	}
 	var preWorkflowHooks []*valid.WorkflowHook
 	if !opt.disablePreWorkflowHooks {
@@ -1495,7 +1523,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		"auto",
 		statsScope,
 		terraformClient,
-		&runtime.LocalPlanStore{},
+		planStore,
 	)
 
 	showStepRunner, err := runtime.NewShowStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion)
@@ -1516,7 +1544,10 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 
 	Ok(t, err)
 
-	cancellationTracker := events.NewCancellationTracker()
+	var cancellationTracker events.CancellationTracker = events.NewCancellationTracker()
+	if opt.durable != nil {
+		cancellationTracker = &events.DurableCancellationTracker{Store: opt.durable.Store}
+	}
 
 	projectCommandRunner := &events.DefaultProjectCommandRunner{
 		VcsClient:        e2eVCSClient,
@@ -1533,16 +1564,16 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 			defaultTFVersion,
 			statusUpdater,
 			asyncTfExec,
-			&runtime.LocalPlanStore{},
+			planStore,
 		),
 		ShowStepRunner:        showStepRunner,
 		PolicyCheckStepRunner: policyCheckRunner,
 		ApplyStepRunner: &runtime.ApplyStepRunner{
 			TerraformExecutor: terraformClient,
-			PlanStore:         &runtime.LocalPlanStore{},
+			PlanStore:         planStore,
 		},
-		ImportStepRunner:  runtime.NewImportStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion, &runtime.LocalPlanStore{}),
-		StateRmStepRunner: runtime.NewStateRmStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion, &runtime.LocalPlanStore{}),
+		ImportStepRunner:  runtime.NewImportStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion, planStore),
+		StateRmStepRunner: runtime.NewStateRmStepRunner(terraformClient, defaultTFDistribution, defaultTFVersion, planStore),
 		RunStepRunner: &runtime.RunStepRunner{
 			TerraformExecutor:       terraformClient,
 			DefaultTFDistribution:   defaultTFDistribution,
@@ -1559,7 +1590,13 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		ApplyPlanValidator: &events.DefaultApplyPlanValidator{
 			PullStatusFetcher: database,
 		},
-		PlanStore: &runtime.LocalPlanStore{},
+		PlanStore: planStore,
+	}
+	projectCommandRunner.EnvStepRunner = &runtime.EnvStepRunner{RunStepRunner: projectCommandRunner.RunStepRunner.(*runtime.RunStepRunner)}
+	if opt.durable != nil {
+		projectCommandRunner.Jobs = opt.durable.Jobs
+		projectCommandRunner.Artifacts = opt.durable.Artifacts
+		projectCommandRunner.Execution = opt.durable.Execution
 	}
 
 	dbUpdater := &events.DBUpdater{
@@ -1581,6 +1618,10 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 			false,                            // hideUnchangedPlanComments
 			opt.userConfig.QuietPolicyChecks, // quietPolicyChecks
 		),
+	}
+
+	if opt.durable != nil {
+		pullUpdater.ClaimCheck = opt.durable.Store.CheckClaim
 	}
 
 	autoMerger := &events.AutoMerger{
@@ -1656,8 +1697,12 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		e2eVCSClient,
 	)
 
+	var deleteLockCommand events.DeleteLockCommand = mocks.NewMockDeleteLockCommand()
+	if opt.durable != nil {
+		deleteLockCommand = &events.DefaultDeleteLockCommand{Execution: opt.durable.Execution, Locker: lockingClient, WorkingDir: workingDir, WorkingDirLocker: locker, Database: database, PlanStore: planStore}
+	}
 	unlockCommandRunner := events.NewUnlockCommandRunner(
-		mocks.NewMockDeleteLockCommand(),
+		deleteLockCommand,
 		e2eVCSClient,
 		silenceNoProjects,
 		disableUnlockLabel,
@@ -1688,11 +1733,16 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		projectCommandRunner,
 	)
 
+	if opt.durable != nil {
+		unlockCommandRunner.Execution = opt.durable.Execution
+	}
+
 	commentCommandRunnerByCmd := map[command.Name]events.CommentCommandRunner{
 		command.Plan:            planCommandRunner,
 		command.Apply:           applyCommandRunner,
 		command.ApprovePolicies: approvePoliciesCommandRunner,
 		command.Unlock:          unlockCommandRunner,
+		command.Cancel:          events.NewCancelCommandRunner(e2eVCSClient, projectCommandRunner, pullUpdater, locker, silenceNoProjects),
 		command.Version:         versionCommandRunner,
 		command.Import:          importCommandRunner,
 		command.State:           stateCommandRunner,
@@ -1716,21 +1766,34 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		DisableAutoplan:                opt.disableAutoplan,
 		CommitStatusUpdater:            commitStatusUpdater,
 	}
+	if opt.durable != nil {
+		opt.durable.Execution.Drainer = drainer
+		commandRunner.Execution = opt.durable.Execution
+	}
 
 	repoAllowlistChecker, err := events.NewRepoAllowlistChecker("*")
 	Ok(t, err)
 
+	pullCleaner := &events.PullClosedExecutor{
+		Locker:                   lockingClient,
+		VCSClient:                e2eVCSClient,
+		WorkingDir:               workingDir,
+		Database:                 database,
+		PullClosedTemplate:       &events.PullClosedEventTemplate{},
+		LogStreamResourceCleaner: projectCmdOutputHandler,
+	}
+	var pullReopener events_controllers.PullReopener
+	if opt.durable != nil {
+		pullCleaner.Executions = opt.durable.Store
+		pullCleaner.PlanStore = planStore
+		opt.durable.Cleaner = pullCleaner
+		pullReopener = opt.durable.Store
+	}
 	ctrl := events_controllers.VCSEventsController{
-		TestingMode:   true,
-		CommandRunner: commandRunner,
-		PullCleaner: &events.PullClosedExecutor{
-			Locker:                   lockingClient,
-			VCSClient:                e2eVCSClient,
-			WorkingDir:               workingDir,
-			Database:                 database,
-			PullClosedTemplate:       &events.PullClosedEventTemplate{},
-			LogStreamResourceCleaner: projectCmdOutputHandler,
-		},
+		TestingMode:                  true,
+		CommandRunner:                commandRunner,
+		PullCleaner:                  pullCleaner,
+		PullReopener:                 pullReopener,
 		Logger:                       logger,
 		Scope:                        statsScope,
 		Parser:                       eventParser,
@@ -1742,6 +1805,9 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 		RepoAllowlistChecker:         repoAllowlistChecker,
 		SupportedVCSHosts:            []models.VCSHostType{models.Gitlab, models.Github, models.BitbucketCloud},
 		VCSClient:                    e2eVCSClient,
+	}
+	if opt.durable != nil {
+		ctrl.Deliveries = opt.durable.Store
 	}
 	return ctrl, e2eVCSClient, e2eGithubGetter, workingDir
 }

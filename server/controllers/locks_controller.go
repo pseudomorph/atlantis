@@ -21,6 +21,7 @@ import (
 
 // LocksController handles all requests relating to Atlantis locks.
 type LocksController struct {
+	Durable            bool
 	AtlantisVersion    string                       `validate:"required"`
 	AtlantisURL        *url.URL                     `validate:"required"`
 	Locker             locking.Locker               `validate:"required"`
@@ -130,8 +131,10 @@ func (l *LocksController) DeleteLock(w http.ResponseWriter, r *http.Request) {
 	// installations of Atlantis will have locks in their DB that do not have
 	// this field on PullRequest. We skip commenting in this case.
 	if lock.Pull.BaseRepo != (models.Repo{}) {
-		if err := l.Database.UpdateProjectStatus(lock.Pull, lock.Workspace, lock.Project.Path, models.DiscardedPlanStatus); err != nil {
-			l.Logger.Err("unable to update project status: %s", err)
+		if !l.Durable {
+			if err := l.Database.UpdateProjectStatus(lock.Pull, lock.Workspace, lock.Project.Path, models.DiscardedPlanStatus); err != nil {
+				l.Logger.Err("unable to update project status: %s", err)
+			}
 		}
 
 		// Once the lock has been deleted, comment back on the pull request.

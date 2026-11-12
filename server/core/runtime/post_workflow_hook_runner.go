@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,10 +21,18 @@ type PostWorkflowHookRunner interface {
 }
 
 type DefaultPostWorkflowHookRunner struct {
+	Jobs          *jobs.Service
 	OutputHandler jobs.ProjectCommandOutputHandler
 }
 
-func (wh DefaultPostWorkflowHookRunner) Run(ctx models.WorkflowHookCommandContext, command string, shell string, shellArgs string, path string) (string, string, error) {
+func (wh DefaultPostWorkflowHookRunner) Run(ctx models.WorkflowHookCommandContext, command string, shell string, shellArgs string, path string) (output, status string, err error) {
+	if wh.Jobs != nil {
+		if err = wh.Jobs.BeginHook(ctx); err != nil {
+			return "", "", err
+		}
+		defer func() { err = errors.Join(err, wh.Jobs.FinishHook(ctx.HookID, err)) }()
+	}
+
 	outputFilePath := filepath.Join(path, "OUTPUT_STATUS_FILE")
 
 	shellArgsSlice := append(strings.Split(shellArgs, " "), command)

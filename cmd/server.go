@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/runatlantis/atlantis/server"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
@@ -946,6 +947,15 @@ func (s *ServerCmd) run() error {
 	if err := s.Viper.Unmarshal(&userConfig); err != nil {
 		return err
 	}
+	if userConfig.Storage != nil {
+		if err := s.Viper.UnmarshalKey("storage", userConfig.Storage, func(c *mapstructure.DecoderConfig) { c.ErrorUnused = true }); err != nil {
+			return fmt.Errorf("invalid storage configuration: %w", err)
+		}
+		if s.Viper.IsSet(LockingDBType) || s.Viper.IsSet(SharePlanDirFlag) || userConfig.EnableExternalStores {
+			return fmt.Errorf("storage cannot be combined with legacy locking-db-type, share-plan-dir, or enable-external-stores settings")
+		}
+	}
+
 	s.setDefaults(&userConfig, s.Viper)
 
 	// Now that we've parsed the config we can set our local logger to the
