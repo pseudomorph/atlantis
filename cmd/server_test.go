@@ -1520,6 +1520,9 @@ func TestDurableStorageExperiments(t *testing.T) {
 		{name: "default"},
 		{name: "unknown storage key", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite, typoo: x}}", err: "invalid storage configuration"},
 		{name: "invalid database", config: "experiments: [durable-storage]\nstorage: {database: {type: redis}}", err: "storage.database.type"},
+		{name: "inline connection string", config: "experiments: [durable-storage]\nstorage: {database: {type: postgres, connection_string: postgres://user:secret@db/atlantis}}", err: "invalid storage configuration"},
+		{name: "postgres without connection string", config: "experiments: [durable-storage]\nstorage: {database: {type: postgres}}", err: "connection_string_env or connection_string_file"},
+		{name: "postgres", config: "experiments: [durable-storage]\nstorage: {database: {type: postgres, connection_string_env: ATLANTIS_STORAGE_DSN}}", want: []string{"durable-storage"}},
 		{name: "legacy share-plan-dir", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite}}", args: []string{"--share-plan-dir=/tmp/old-plans"}, err: "storage cannot be combined"},
 		{name: "explicit legacy default", config: "experiments: [durable-storage]\nlocking-db-type: boltdb\nstorage: {database: {type: sqlite}}", err: "storage cannot be combined"},
 
