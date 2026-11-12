@@ -18,7 +18,7 @@ import (
 // DeleteLockCommand is the first step after a command request has been parsed.
 type DeleteLockCommand interface {
 	DeleteLock(logger logging.SimpleLogging, id string) (*models.ProjectLock, error)
-	DeleteLocksByPull(logger logging.SimpleLogging, repoFullName string, pullNum int) (int, error)
+	DeleteLocksByPull(logger logging.SimpleLogging, repo models.Repo, pullNum int) (int, error)
 }
 
 // DefaultDeleteLockCommand deletes a specific lock after a request from the LocksController.
@@ -47,14 +47,7 @@ func (l *DefaultDeleteLockCommand) DeleteLock(logger logging.SimpleLogging, id s
 	}
 
 	if l.PlanStore != nil {
-		if err := l.PlanStore.DeletePlanForProject(
-			lock.Pull.BaseRepo.Owner,
-			lock.Pull.BaseRepo.Name,
-			lock.Pull.Num,
-			lock.Workspace,
-			lock.Project.Path,
-			lock.Project.ProjectName,
-		); err != nil {
+		if err := planstore.DeletePlanForProjectInRepo(l.PlanStore, lock.Pull.BaseRepo, lock.Pull.Num, lock.Workspace, lock.Project.Path, lock.Project.ProjectName); err != nil {
 			logger.Warn("Failed to delete plan from external store: %s", err)
 		}
 	}
@@ -63,8 +56,8 @@ func (l *DefaultDeleteLockCommand) DeleteLock(logger logging.SimpleLogging, id s
 }
 
 // DeleteLocksByPull handles deleting all locks for the pull request
-func (l *DefaultDeleteLockCommand) DeleteLocksByPull(logger logging.SimpleLogging, repoFullName string, pullNum int) (int, error) {
-	locks, err := l.Locker.UnlockByPull(repoFullName, pullNum)
+func (l *DefaultDeleteLockCommand) DeleteLocksByPull(logger logging.SimpleLogging, repo models.Repo, pullNum int) (int, error) {
+	locks, err := l.Locker.UnlockByPull(repo, pullNum)
 	numLocks := len(locks)
 	if err != nil {
 		return numLocks, err
@@ -84,16 +77,19 @@ func (l *DefaultDeleteLockCommand) DeleteLocksByPull(logger logging.SimpleLoggin
 	// locks were found locally. Locks can be cleaned via other paths (manual
 	// unlock, partial failure) which would otherwise leave orphaned S3 plans.
 	if l.PlanStore != nil {
-		owner, repo, ok := strings.Cut(repoFullName, "/")
-		if !ok {
-			logger.Warn("cannot parse owner/repo from %q; skipping external plan store cleanup", repoFullName)
-		} else if err := l.PlanStore.DeleteForPull(owner, repo, pullNum); err != nil {
+		if scoped, ok := l.PlanStore.(planstore.RepoScopedPlanStore); ok {
+			if err := scoped.DeleteForPullInRepo(repo, pullNum); err != nil {
+				logger.Warn("Failed to delete plans from external store: %s", err)
+			}
+		} else if owner, name, ok := strings.Cut(repo.FullName, "/"); !ok {
+			logger.Warn("cannot parse owner/repo from %q; skipping external plan store cleanup", repo.FullName)
+		} else if err := l.PlanStore.DeleteForPull(owner, name, pullNum); err != nil {
 			logger.Warn("Failed to delete plans from external store: %s", err)
 		}
 	}
 
 	if numLocks == 0 {
-		logger.Debug("No locks found for repo '%v', pull request: %v", repoFullName, pullNum)
+		logger.Debug("No locks found for repo '%v', pull request: %v", repo.FullName, pullNum)
 	}
 
 	return numLocks, nil

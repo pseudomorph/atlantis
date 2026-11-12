@@ -38,8 +38,32 @@ log-level: ...
 
 ::: warning
 The config file you pass to `--config` is different from the `--repo-config` file.
-The `--config` config file is only used as an alternate way of setting `atlantis server` flags.
+The `--config` config file sets server options, including the experimental structured `storage` section below.
 :::
+
+## Durable storage configuration
+
+The unreleased `durable-storage` experiment uses a structured YAML section with
+no corresponding storage flags. Other server configuration remains unchanged.
+
+```yaml
+experiments: [durable-storage]
+data-dir: /var/lib/atlantis-durable
+storage:
+  database:
+    type: sqlite
+```
+
+`storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
+under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks and
+PR status. Run one Atlantis 64-bit process on local or block-backed storage;
+network filesystems such as NFS/EFS are unsupported. PostgreSQL and shared
+operation are deferred.
+
+Unknown storage keys and conflicting backend settings reject startup. Do not
+combine `storage` with `locking-db-type`, `share-plan-dir`, or
+`enable-external-stores`. See [Durable storage](experiments.md#durable-storage)
+for cutover instructions and current limitations.
 
 ## Precedence
 
@@ -1212,10 +1236,19 @@ ATLANTIS_LOCKING_DB_TYPE="<boltdb|redis>"
 
 The locking database type to use for storing plan and apply locks. Defaults to `boltdb`.
 
+::: warning Deprecated
+`boltdb` is deprecated. Single-instance installs should move to the
+[durable storage](experiments.md#durable-storage) experiment with SQLite. See the
+[BoltDB deprecation notice](experiments.md#boltdb-deprecation) for the timeline and
+migration steps. `redis` is not deprecated.
+:::
+
 Notes:
 
 - If set to `boltdb`, only one process may have access to the boltdb instance.
 - If set to `redis`, use `--redis-host` and `--redis-port` for single-node mode, or `--redis-cluster-addresses` for Redis Cluster mode. Use `--redis-password` and (optionally) `--redis-username` only if your Redis deployment requires authentication.
+
+The durable-storage experiment uses the structured `storage.database` setting instead. Do not combine `storage` with an explicit `locking-db-type`. See [Durable storage](experiments.md#durable-storage).
 
 ### `--log-level`
 

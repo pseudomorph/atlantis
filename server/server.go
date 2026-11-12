@@ -40,6 +40,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/drift"
 	"github.com/runatlantis/atlantis/server/core/redis"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/jobs"
 	"github.com/runatlantis/atlantis/server/metrics"
@@ -167,6 +168,12 @@ type WebhookConfig struct {
 //go:embed static
 var staticAssets embed.FS
 
+// ignoredDurableDataWarning is logged when storage is not configured but the
+// data directory holds a durable-storage database. The server starts on its
+// legacy backend and never reads that database.
+const ignoredDurableDataWarning = "data directory contains durable-storage data that this server ignores because storage is not configured, " +
+	"locks and plans recorded there are not used"
+
 // NewServer returns a new server. If there are issues starting the server or
 // its dependencies an error will be returned. This is like the main() function
 // for the server CLI command because it injects all the dependencies.
@@ -174,11 +181,20 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if err := userConfig.ValidateExperiments(); err != nil {
 		return nil, err
 	}
+	ignoredDurableData := false
+	if userConfig.Storage != nil {
+		userConfig.SharePlanDir = ""
+	} else if _, err := os.Stat(filepath.Join(userConfig.DataDir, "atlantis.sqlite")); err == nil {
+		ignoredDurableData = true
+	}
 	logging.SuppressDefaultLogging()
 	logger, err := logging.NewStructuredLoggerFromLevel(userConfig.ToLogLevel())
 
 	if err != nil {
 		return nil, err
+	}
+	if ignoredDurableData {
+		logger.Warn(ignoredDurableDataWarning)
 	}
 
 	var supportedVCSHosts []models.VCSHostType
@@ -222,6 +238,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		}
 	}
 
+	if globalCfg.ExternalStores.PlanStore.Type != "" && userConfig.Storage != nil {
+		return nil, fmt.Errorf("storage cannot be combined with external_stores.plan_store")
+	}
 	statsScope, statsReporter, closer, err := metrics.NewScope(globalCfg.Metrics, logger, userConfig.StatsNamespace)
 
 	if err != nil {
@@ -494,7 +513,11 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	var applyLockingClient locking.ApplyLocker
 	var database db.Database
 
-	switch dbtype := userConfig.LockingDBType; dbtype {
+	dbtype := userConfig.LockingDBType
+	if userConfig.Storage != nil {
+		dbtype = "durable"
+	}
+	switch dbtype {
 	case "redis":
 		var clusterAddrs []string
 		if userConfig.RedisClusterAddresses != "" {
@@ -525,8 +548,15 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
-	case "boltdb":
+	case "durable":
+		logger.Warn("using experimental durable storage")
+		database, err = sqlstore.OpenServer(userConfig.DataDir)
+		if err != nil {
+			return nil, err
+		}
+	case "", "boltdb":
 		logger.Info("Utilizing BoltDB")
+		logger.Warn(boltDBDeprecationWarning)
 		database, err = boltdb.New(userConfig.DataDir)
 		if err != nil {
 			return nil, err
@@ -545,7 +575,9 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	applyLockingClient = locking.NewApplyClient(database, disableApply, disableGlobalApplyLock)
 	workingDirLocker := events.NewDefaultWorkingDirLocker()
 
+	_, durable := database.(*sqlstore.Store)
 	var workingDir events.WorkingDir = &events.FileWorkspace{
+		InstanceScoped:    durable,
 		DataDir:           userConfig.DataDir,
 		LocalSharePlanDir: userConfig.SharePlanDir,
 		CheckoutMerge:     userConfig.CheckoutStrategy == "merge",
@@ -1049,6 +1081,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 		return nil, err
 	}
 	locksController := &controllers.LocksController{
+		Durable:            durable,
 		AtlantisVersion:    config.AtlantisVersion,
 		AtlantisURL:        parsedURL,
 		Locker:             lockingClient,

@@ -18,6 +18,7 @@ import (
 
 	"github.com/runatlantis/atlantis/server/core/config/raw"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/planstore"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/core/terraform/tfclient"
 	"github.com/runatlantis/atlantis/server/logging"
@@ -1255,7 +1256,7 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		if errors.Is(p.PlanStore.RestorePlans("", "", "", 0), runtime.ErrRestoreNotSupported) {
 			return nil, os.ErrNotExist
 		}
-		workspaces, listErr := p.PlanStore.ListWorkspaces(ctx.Pull.BaseRepo.Owner, ctx.Pull.BaseRepo.Name, ctx.Pull.Num)
+		workspaces, listErr := planstore.ListWorkspacesInRepo(p.PlanStore, ctx.Pull.BaseRepo, ctx.Pull.Num)
 		if listErr != nil {
 			return nil, fmt.Errorf("listing workspaces from external store: %w", listErr)
 		}
@@ -1280,7 +1281,7 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		if err != nil {
 			return nil, err
 		}
-		if restoreErr := p.PlanStore.RestorePlans(restoreDir, ctx.Pull.BaseRepo.Owner, ctx.Pull.BaseRepo.Name, ctx.Pull.Num); restoreErr != nil {
+		if restoreErr := planstore.RestorePlansInRepo(p.PlanStore, restoreDir, ctx.Pull.BaseRepo, ctx.Pull.Num); restoreErr != nil {
 			return nil, fmt.Errorf("restoring plans from external store: %w", restoreErr)
 		}
 	}

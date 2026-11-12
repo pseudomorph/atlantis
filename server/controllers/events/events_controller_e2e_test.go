@@ -26,6 +26,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/boltdb"
 	"github.com/runatlantis/atlantis/server/core/config"
 	"github.com/runatlantis/atlantis/server/core/config/valid"
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
@@ -1341,12 +1342,23 @@ type setupOption struct {
 	disableAutoplan         bool
 	disablePreWorkflowHooks bool
 	userConfig              server.UserConfig
+	// durable, when set, wires the durable-storage experiment instead of BoltDB.
+	durable *durableE2E
 }
 
 func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers.VCSEventsController, *vcsmocks.MockClient, *mocks.MockGithubPullGetter, *events.FileWorkspace) {
 	allowForkPRs := false
 	discardApprovalOnPlan := true
 	dataDir, binDir, cacheDir := mkSubDirs(t)
+	if opt.durable != nil {
+		// Reusing a data directory restarts the server against the same storage.
+		if opt.durable.DataDir == "" {
+			opt.durable.DataDir = dataDir
+		} else {
+			dataDir = opt.durable.DataDir
+			binDir, cacheDir = filepath.Join(dataDir, "bin"), filepath.Join(dataDir, "plugin-cache")
+		}
+	}
 	// Mocks.
 	e2eVCSClient := vcsmocks.NewMockClient()
 	e2eStatusUpdater := &events.DefaultCommitStatusUpdater{Client: e2eVCSClient}
@@ -1385,12 +1397,18 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 
 	terraformClient, err := tfclient.NewClient(logger, distribution, binDir, cacheDir, "", "", "", "default-tf-version", "https://releases.hashicorp.com", true, false, projectCmdOutputHandler)
 	Ok(t, err)
-	b, err := boltdb.New(dataDir)
-	Ok(t, err)
-	database := b
-	lockingClient := locking.NewClient(b)
+	var database db.Database
+	if opt.durable != nil {
+		opt.durable.open(t)
+		database = opt.durable.Store
+	} else {
+		b, err := boltdb.New(dataDir)
+		Ok(t, err)
+		database = b
+	}
+	lockingClient := locking.NewClient(database)
 	noOpLocker := locking.NewNoOpLocker()
-	applyLocker = locking.NewApplyClient(b, disableApply, disableGlobalApplyLock)
+	applyLocker = locking.NewApplyClient(database, disableApply, disableGlobalApplyLock)
 	projectLocker := &events.DefaultProjectLocker{
 		Locker:         lockingClient,
 		NoOpLocker:     noOpLocker,
@@ -1400,6 +1418,7 @@ func setupE2E(t *testing.T, repoDir string, opt setupOption) (events_controllers
 	workingDir := &events.FileWorkspace{
 		DataDir:                     dataDir,
 		TestingOverrideHeadCloneURL: "override-me",
+		InstanceScoped:              opt.durable != nil,
 	}
 	var preWorkflowHooks []*valid.WorkflowHook
 	if !opt.disablePreWorkflowHooks {
