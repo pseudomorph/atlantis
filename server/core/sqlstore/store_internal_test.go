@@ -4,9 +4,13 @@
 package sqlstore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"io"
 	"io/fs"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -31,110 +35,331 @@ func claimPull() models.PullRequest {
 	return models.PullRequest{Num: 17, BaseRepo: repo, HeadCommit: "revision", HeadBranch: "feature", BaseBranch: "main"}
 }
 
-func seedClaimJob(t *testing.T, s *Store, p models.PullRequest, state string) job {
-	t.Helper()
-	project := models.NewProject(p.BaseRepo.FullName, ".", "")
-	acquired, _, err := s.TryLock(models.ProjectLock{Pull: p, Project: project, Workspace: "default"})
-	Ok(t, err)
-	Assert(t, acquired, "project lock unavailable")
-	var pr pull
-	Ok(t, s.db.Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&pr).Error)
-	var projectID string
-	Ok(t, projectIDs(s.db, p.BaseRepo, project, "default").Scan(&projectID).Error)
-	started, err := s.Now()
-	Ok(t, err)
-	row := job{ID: uuid.NewString(), RepositoryID: pr.RepositoryID, PullID: pr.ID, ProjectID: &projectID,
-		Owner: p.ExecutionOwner(), Kind: models.CommandJob, ManagedPlan: true,
-		State: state, StartedAt: started}
-	Ok(t, s.db.Create(&row).Error)
-	return row
+func claimJob(p models.PullRequest, id string) models.Job {
+	return models.Job{ID: id, Pull: p, Project: models.NewProject(p.BaseRepo.FullName, ".", ""), Workspace: "default", Command: "plan", State: "running", StartedAt: time.Now().UTC()}
+}
+
+func validSnapshot(jobID string) models.PlanSnapshot {
+	return models.PlanSnapshot{JobID: jobID, Size: 1, SHA256: strings.Repeat("a", 64), Manifest: models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "plan.tfplan", Size: 1, SHA256: strings.Repeat("b", 64), Mode: 0600}}}}
 }
 
 func TestExecutionDatabaseConformance(t *testing.T) {
-	t.Run("unfinished ownership blocks reuse", func(t *testing.T) {
-		dir := t.TempDir()
-		s, err := OpenServer(dir)
-		Ok(t, err)
-		t.Cleanup(func() { _ = s.Close() })
-		p := claimPull()
-		Ok(t, s.AcquireClaim(p, "owner-a"))
-		p.Execution = &models.Execution{Owner: "owner-a"}
-		p.BaseRepo.Execution = p.Execution
-		Assert(t, s.AcquireClaim(p, "owner-b") != nil, "duplicate claim acquired")
-		seedClaimJob(t, s, p, "running")
-		Assert(t, s.ReleaseClaim(p) != nil, "unfinished jobs released execution ownership")
-		Ok(t, s.Close())
-		s, err = OpenServer(dir)
-		Ok(t, err)
-		Ok(t, s.MarkPreviousExecutionsUncertain())
-		Assert(t, s.CheckClaim(p) != nil, "uncertain owner remained active")
-		Assert(t, s.AcquireClaim(p, "owner-b") != nil, "unfinished work allowed takeover")
-		locked, err := s.GetLock(p.BaseRepo, models.NewProject(p.BaseRepo.FullName, ".", ""), "default")
-		Ok(t, err)
-		Assert(t, locked != nil, "startup removed user project lock")
+	t.Run("sqlite", func(t *testing.T) {
+		t.Run("unfinished ownership blocks reuse", func(t *testing.T) {
+			dir := t.TempDir()
+			s, err := OpenServer(dir)
+			Ok(t, err)
+			t.Cleanup(func() { _ = s.Close() })
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner-a"))
+			p.Execution = &models.Execution{Owner: "owner-a"}
+			p.BaseRepo.Execution = p.Execution
+			Assert(t, s.AcquireClaim(p, "owner-b") != nil, "duplicate claim acquired")
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			Ok(t, s.StartPlan(j.ID))
+			projectLock := models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace, Time: time.Now().UTC()}
+			acquired, _, err := s.TryLock(projectLock)
+			Ok(t, err)
+			Assert(t, acquired, "project lock unavailable")
+			Ok(t, s.Close())
+			s, err = OpenServer(dir)
+			Ok(t, err)
+			Ok(t, s.MarkPreviousExecutionsUncertain())
+			Assert(t, s.FinishJob(j.ID, "succeeded", "") != nil, "uncertain owner published completion")
+			Assert(t, s.AcquireClaim(p, "owner-b") != nil, "unfinished work allowed takeover")
+			locked, err := s.GetLock(p.BaseRepo, j.Project, j.Workspace)
+			Ok(t, err)
+			Assert(t, locked != nil, "startup removed user project lock")
+		})
+		t.Run("closure and cancellation do not release execution", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			Ok(t, s.ClosePull(p))
+			Ok(t, s.StartPlan(j.ID))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
+			idle, err := s.PullIdle(p)
+			Ok(t, err)
+			Assert(t, !idle, "closure discarded execution ownership")
+			Assert(t, s.AcquireClaim(p, "contender") != nil, "closed pull accepted execution")
+			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
+			got, err := s.Job(j.ID)
+			Ok(t, err)
+			Equals(t, "succeeded", got.State)
+			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 0, len(pending))
+			Ok(t, s.ReleaseClaim(p))
+			idle, err = s.PullIdle(p)
+			Ok(t, err)
+			Assert(t, idle, "stopped execution remained active")
+		})
+		t.Run("cancellation preserves active outcomes and blocks queued jobs", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			active := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(active))
+			Ok(t, s.StartPlan(active.ID))
+			Ok(t, s.CancelPull(p))
+			Assert(t, s.StartJob(claimJob(p, uuid.NewString())) != nil, "queued job started after cancellation")
+			Assert(t, s.ReleaseClaim(p) != nil, "cancellation released unfinished work")
+			Ok(t, s.CheckClaim(p))
+			a := validSnapshot(active.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
+			Ok(t, s.FinishJob(active.ID, "succeeded", ""))
+			got, err := s.Job(active.ID)
+			Ok(t, err)
+			Equals(t, "succeeded", got.State)
+			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 1, len(pending))
+			Ok(t, s.ReleaseClaim(p))
+			Ok(t, s.AcquireClaim(p, "next-owner"))
+			p.Execution = &models.Execution{Owner: "next-owner"}
+			cancelled, err := s.IsCancelled(p)
+			Ok(t, err)
+			Assert(t, !cancelled, "new execution inherited prior cancellation")
+		})
+		t.Run("publication requires intent and live ownership", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Assert(t, s.StartJob(claimJob(p, uuid.NewString())) != nil, "unclaimed job accepted")
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			a := validSnapshot(j.ID)
+			Assert(t, s.CommitSnapshot(a) != nil, "publication without intent accepted")
+			Ok(t, s.BeginSnapshot(a))
+			rows, err := s.Snapshot(j.ID)
+			Ok(t, err)
+			Assert(t, rows == nil, "unpublished snapshot was visible")
+			Ok(t, s.MarkUncertain(p))
+			Assert(t, s.CommitSnapshot(a) != nil, "uncertain owner published snapshot")
+			rows, err = s.Snapshot(j.ID)
+			Ok(t, err)
+			Assert(t, rows == nil, "unpublished snapshot was visible")
+		})
+		t.Run("snapshot metadata is validated before publication", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			snapshot := validSnapshot(j.ID)
+			invalid := snapshot
+			invalid.Manifest = models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "../plan.tfplan", SHA256: snapshot.SHA256, Mode: 0600}}}
+			Assert(t, s.BeginSnapshot(invalid) != nil, "unsafe snapshot manifest was reserved")
+			Ok(t, s.BeginSnapshot(snapshot))
+			Assert(t, s.BeginSnapshot(snapshot) != nil, "producer reserved a second bundle")
+			for _, hash := range []string{"", "abc", strings.Repeat("z", 64)} {
+				invalid = snapshot
+				invalid.SHA256 = hash
+				Assert(t, s.CommitSnapshot(invalid) != nil, "invalid bundle checksum was published")
+			}
+			invalid = snapshot
+			invalid.Size = 0
+			Assert(t, s.CommitSnapshot(invalid) != nil, "empty bundle was published")
+			unpublished, err := s.Snapshot(j.ID)
+			Ok(t, err)
+			Assert(t, unpublished == nil, "invalid bundle became visible")
+			Ok(t, s.CommitSnapshot(snapshot))
+		})
+		t.Run("cancellation invalidates mutating apply input", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			producer := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(producer))
+			Ok(t, s.StartPlan(producer.ID))
+			a := validSnapshot(producer.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
+			Ok(t, s.FinishJob(producer.ID, "succeeded", ""))
+			consumer := claimJob(p, uuid.NewString())
+			consumer.Command = "apply"
+			Ok(t, s.StartJob(consumer))
+			Ok(t, s.MarkJobMutating(consumer.ID))
+			Ok(t, s.CancelPull(p))
+			Ok(t, s.FinishJob(consumer.ID, "failed", "process cancelled"))
+			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 0, len(pending))
+		})
+		t.Run("API plan inputs end with their invocation", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			p.Num = -42
+			p.Execution = &models.Execution{Owner: "api-owner"}
+			Ok(t, s.AcquireClaim(p, p.ExecutionOwner()))
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			Ok(t, s.StartPlan(j.ID))
+			a := validSnapshot(j.ID)
+			Ok(t, s.BeginSnapshot(a))
+			Ok(t, s.CommitSnapshot(a))
+			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
+			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 1, len(pending))
+			Ok(t, s.ReleaseClaim(p))
+			pending, err = s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 0, len(pending))
+			history, err := s.Job(j.ID)
+			Ok(t, err)
+			Equals(t, "succeeded", history.State)
+		})
+		t.Run("pull identity and foreign keys", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			other := p
+			other.BaseRepo.CloneURL = "https://other.example/gitlab/team/infra.git"
+			Assert(t, s.CheckClaim(other) != nil, "claim crossed VCS instances")
+			other = p
+			other.Num++
+			Assert(t, s.CheckClaim(other) != nil, "claim crossed pull requests")
+			Assert(t, s.db.Exec("INSERT INTO projects(id,repository_id,directory,name,workspace) VALUES ('project','missing','.','','default')").Error != nil, "missing foreign key accepted")
+			var claim executionClaim
+			Ok(t, s.db.First(&claim).Error)
+			var stored pull
+			Ok(t, s.db.First(&stored).Error)
+			Equals(t, stored.ID, claim.PullID)
+			Ok(t, s.ReleaseClaim(p))
+		})
 	})
-	t.Run("closure invalidates pending plans without releasing ownership", func(t *testing.T) {
-		s := conformanceStore(t)
-		p := claimPull()
-		Ok(t, s.AcquireClaim(p, "owner"))
-		p.Execution = &models.Execution{Owner: "owner"}
-		row := seedClaimJob(t, s, p, "succeeded")
-		Ok(t, s.db.Create(&pendingPlan{ProjectID: *row.ProjectID, PullID: row.PullID, JobID: row.ID, Ready: true}).Error)
-		Ok(t, s.ClosePull(p))
-		var pending int64
-		Ok(t, s.db.Model(&pendingPlan{}).Count(&pending).Error)
-		Equals(t, int64(0), pending)
-		idle, err := s.PullIdle(p)
-		Ok(t, err)
-		Assert(t, !idle, "closure discarded execution ownership")
-		Assert(t, s.AcquireClaim(p, "contender") != nil, "closed pull accepted execution")
-		Ok(t, s.ReleaseClaim(p))
-		idle, err = s.PullIdle(p)
-		Ok(t, err)
-		Assert(t, idle, "stopped execution remained owned")
-	})
-	t.Run("cancellation preserves active ownership", func(t *testing.T) {
-		s := conformanceStore(t)
-		p := claimPull()
-		Ok(t, s.AcquireClaim(p, "owner"))
-		p.Execution = &models.Execution{Owner: "owner"}
-		row := seedClaimJob(t, s, p, "running")
-		Ok(t, s.CancelPull(p))
-		cancelled, err := s.IsCancelled(p)
-		Ok(t, err)
-		Assert(t, cancelled, "cancellation was not recorded")
-		Ok(t, s.CheckClaim(p))
-		Assert(t, s.ReleaseClaim(p) != nil, "cancellation released unfinished work")
-		Ok(t, s.db.Model(&job{}).Where("id = ?", row.ID).Update("state", "succeeded").Error)
-		Ok(t, s.ReleaseClaim(p))
-		Ok(t, s.AcquireClaim(p, "next-owner"))
-		cancelled, err = s.IsCancelled(p)
-		Ok(t, err)
-		Assert(t, !cancelled, "new execution inherited prior cancellation")
-	})
-	t.Run("pull identity and foreign keys", func(t *testing.T) {
-		s := conformanceStore(t)
-		p := claimPull()
-		Ok(t, s.AcquireClaim(p, "owner"))
-		p.Execution = &models.Execution{Owner: "owner"}
-		other := p
-		other.BaseRepo.CloneURL = "https://other.example/gitlab/team/infra.git"
-		Assert(t, s.CheckClaim(other) != nil, "claim crossed VCS instances")
-		other = p
-		other.Num++
-		Assert(t, s.CheckClaim(other) != nil, "claim crossed pull requests")
-		Assert(t, s.db.Exec("INSERT INTO projects(id,repository_id,directory,name,workspace) VALUES ('project','missing','.','','default')").Error != nil, "missing foreign key accepted")
-		var claim executionClaim
-		Ok(t, s.db.First(&claim).Error)
-		var stored pull
-		Ok(t, s.db.First(&stored).Error)
-		Equals(t, stored.ID, claim.PullID)
-		Ok(t, s.ReleaseClaim(p))
-	})
+}
+
+func TestSchemaRejectsCrossPullRelationships(t *testing.T) {
+	s := conformanceStore(t)
+	p := claimPull()
+	p.Execution = &models.Execution{Owner: "first"}
+	Ok(t, s.AcquireClaim(p, "first"))
+	j := claimJob(p, uuid.NewString())
+	Ok(t, s.StartJob(j))
+	var first job
+	Ok(t, s.db.Where("id = ?", j.ID).Take(&first).Error)
+	other := p
+	other.BaseRepo.FullName = "team/other"
+	other.Execution = &models.Execution{Owner: "second"}
+	Ok(t, s.AcquireClaim(other, "second"))
+	otherJob := claimJob(other, uuid.NewString())
+	Ok(t, s.StartJob(otherJob))
+	var second job
+	Ok(t, s.db.Where("id = ?", otherJob.ID).Take(&second).Error)
+	Assert(t, s.db.Exec("UPDATE jobs SET repository_id = ? WHERE id = ?", second.RepositoryID, first.ID).Error != nil, "job accepted another repository")
+	Assert(t, s.db.Exec("UPDATE execution_claims SET pull_id = ? WHERE pull_id = ?", "missing", first.PullID).Error != nil, "claim accepted a missing pull")
+	Assert(t, s.db.Exec("UPDATE jobs SET pull_id = ? WHERE id = ?", second.PullID, first.ID).Error != nil, "job accepted another repository's pull")
+	Assert(t, s.db.Exec("UPDATE jobs SET plan_job_id = ? WHERE id = ?", second.ID, first.ID).Error != nil, "job accepted another project's plan")
+	Assert(t, s.FinishJob(first.ID, "running", "") != nil, "running accepted as a terminal state")
+	Assert(t, s.FinishJob(first.ID, "typo", "") != nil, "unknown terminal state accepted")
 }
 
 func TestPortableSchemaConformance(t *testing.T) {
 	t.Run("sqlite", func(t *testing.T) {
+		t.Run("stable UUID relationships", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			first := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(first))
+			Ok(t, s.StartJob(claimJob(p, uuid.NewString())))
+			for _, table := range []string{"vcs_instances", "repositories", "pulls", "projects"} {
+				var ids []string
+				Ok(t, s.db.Table(table).Pluck("id", &ids).Error)
+				Equals(t, 1, len(ids))
+				_, err := uuid.Parse(ids[0])
+				Ok(t, err)
+			}
+			var stored job
+			Ok(t, s.db.Where("id = ?", first.ID).Take(&stored).Error)
+			other := p
+			other.BaseRepo.FullName = "team/other"
+			other.Execution = &models.Execution{Owner: "other-owner"}
+			Ok(t, s.AcquireClaim(other, other.ExecutionOwner()))
+			otherJob := claimJob(other, uuid.NewString())
+			Ok(t, s.StartJob(otherJob))
+			var otherStored job
+			Ok(t, s.db.Where("id = ?", otherJob.ID).Take(&otherStored).Error)
+			Assert(t, s.db.Exec("INSERT INTO locks(project_id,repository_id,pull_id,revision,username,created_at) VALUES (?,?,?,?,?,?)", stored.ProjectID, otherStored.RepositoryID, otherStored.PullID, "revision", "user", time.Now().UTC()).Error != nil, "cross-repository foreign key accepted")
+		})
+		t.Run("UTC timestamps and nullable completion", func(t *testing.T) {
+			s := conformanceStore(t)
+			previousLocation := time.Local
+			time.Local = time.FixedZone("local-test", -7*60*60)
+			t.Cleanup(func() { time.Local = previousLocation })
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			Ok(t, s.CheckClaim(p))
+			j := claimJob(p, uuid.NewString())
+			j.StartedAt = time.Date(2026, 11, 5, 12, 30, 0, 123456789, time.FixedZone("offset", -7*60*60))
+			Ok(t, s.StartJob(j))
+			got, err := s.Job(j.ID)
+			Ok(t, err)
+			Assert(t, got.StartedAt.Equal(j.StartedAt.Truncate(time.Microsecond)), "job timestamp changed instant")
+			Assert(t, got.FinishedAt == nil, "unfinished job has a completion timestamp")
+			var matching int64
+			Ok(t, s.db.Model(&job{}).Where("id = ? AND started_at = ?", j.ID, j.StartedAt.UTC().Truncate(time.Microsecond)).Count(&matching).Error)
+			Equals(t, int64(1), matching)
+			lock := models.ProjectLock{Pull: p, Project: j.Project, Workspace: j.Workspace, Time: j.StartedAt}
+			acquired, _, err := s.TryLock(lock)
+			Ok(t, err)
+			Assert(t, acquired, "project lock unavailable")
+			stored, err := s.GetLock(p.BaseRepo, j.Project, j.Workspace)
+			Ok(t, err)
+			Assert(t, stored.Time.Equal(j.StartedAt.Truncate(time.Microsecond)), "lock timestamp changed instant")
+			Ok(t, s.StartPlan(j.ID))
+			snapshot := validSnapshot(j.ID)
+			snapshot.CreatedAt = j.StartedAt
+			Ok(t, s.BeginSnapshot(snapshot))
+			Ok(t, s.CommitSnapshot(snapshot))
+			published, err := s.Snapshot(j.ID)
+			Ok(t, err)
+			Assert(t, published != nil, "snapshot is missing")
+			Assert(t, published.CreatedAt.Equal(j.StartedAt.Truncate(time.Microsecond)), "snapshot timestamp changed instant")
+			autoJob := claimJob(p, uuid.NewString())
+			autoJob.Project = models.NewProject(p.BaseRepo.FullName, "another", "")
+			Ok(t, s.StartJob(autoJob))
+			Ok(t, s.StartPlan(autoJob.ID))
+			automatic := validSnapshot(autoJob.ID)
+			Ok(t, s.BeginSnapshot(automatic))
+			Ok(t, s.CommitSnapshot(automatic))
+			var generated struct{ CreatedAt time.Time }
+			Ok(t, s.db.Table("plan_snapshots").Where("job_id = ?", autoJob.ID).Take(&generated).Error)
+			Assert(t, time.Since(generated.CreatedAt).Abs() < time.Minute, "automatic timestamp changed instant")
+			Assert(t, generated.CreatedAt.Location() == time.UTC && generated.CreatedAt.Nanosecond()%1000 == 0, "automatic time is not UTC microseconds")
+			Ok(t, s.db.Table("plan_snapshots").Where("job_id = ? AND created_at = ?", autoJob.ID, generated.CreatedAt.UTC().Truncate(time.Microsecond)).Count(&matching).Error)
+			Equals(t, int64(1), matching)
+			Ok(t, s.FinishJob(autoJob.ID, "succeeded", ""))
+			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
+			got, err = s.Job(j.ID)
+			Ok(t, err)
+			Assert(t, got.FinishedAt != nil && time.Since(*got.FinishedAt).Abs() < time.Minute, "completion timestamp changed instant")
+			Ok(t, s.ClosePull(p))
+			Ok(t, s.ReleaseClaim(p))
+			now := time.Now().Add(2 * time.Hour)
+			rows, err := s.ExpiredSnapshots(now, time.Hour)
+			Ok(t, err)
+			Equals(t, 0, len(rows))
+			rows, err = s.ExpiredSnapshots(now.Add(time.Hour), time.Hour)
+			Ok(t, err)
+			Equals(t, 2, len(rows))
+		})
 		t.Run("lock listing follows creation time", func(t *testing.T) {
 			s := conformanceStore(t)
 			p := claimPull()
@@ -152,6 +377,70 @@ func TestPortableSchemaConformance(t *testing.T) {
 			Equals(t, 2, len(locks))
 			Equals(t, "first", locks[0].Project.Path)
 			Equals(t, "second", locks[1].Project.Path)
+		})
+		t.Run("snapshot identity and retention comparisons", func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "live"))
+			p.Execution = &models.Execution{Owner: "live"}
+			j := claimJob(p, uuid.NewString())
+			Ok(t, s.StartJob(j))
+			Ok(t, s.StartPlan(j.ID))
+			at := time.Date(2026, 11, 5, 12, 0, 0, 987654321, time.UTC)
+			snapshot := validSnapshot(j.ID)
+			snapshot.CreatedAt = at
+			Ok(t, s.BeginSnapshot(snapshot))
+			Ok(t, s.CommitSnapshot(snapshot))
+			duplicate := snapshot
+			duplicate.Manifest = models.SnapshotManifest{Version: 1, Files: []models.SnapshotFile{{Kind: "plan", Path: "other.tfplan", Size: 1, SHA256: snapshot.SHA256, Mode: 0600}}}
+			Assert(t, s.CommitSnapshot(duplicate) != nil, "published snapshot manifest changed")
+
+			Ok(t, s.FinishJob(j.ID, "succeeded", ""))
+			consumer := claimJob(p, uuid.NewString())
+			consumer.Command = "apply"
+			Ok(t, s.StartJob(consumer))
+			input, err := s.InputSnapshot(consumer.ID)
+			Ok(t, err)
+			Assert(t, input != nil, "selected snapshot is missing")
+			Equals(t, j.ID, input.JobID)
+			Equals(t, snapshot.Manifest, input.Manifest)
+			Assert(t, input.CreatedAt.Equal(at.Truncate(time.Microsecond)), "snapshot timestamp precision differs")
+		})
+		t.Run("binary values and booleans", func(t *testing.T) {
+			s := conformanceStore(t)
+			store := BlobStore{Store: s}
+			allBytes := make([]byte, 256)
+			for i := range allBytes {
+				allBytes[i] = byte(i)
+			}
+			p := claimPull()
+			Ok(t, s.AcquireClaim(p, "owner"))
+			p.Execution = &models.Execution{Owner: "owner"}
+			for _, payload := range [][]byte{{}, []byte("123.0"), allBytes} {
+				j := claimJob(p, uuid.NewString())
+				Ok(t, s.StartJob(j))
+				snapshot := validSnapshot(j.ID)
+				Ok(t, s.BeginSnapshot(snapshot))
+				meta, err := store.PutSnapshot(j.ID, bytes.NewReader(payload))
+				Ok(t, err)
+				Equals(t, fmt.Sprintf("%x", sha256.Sum256(payload)), meta.SHA256)
+				r, err := store.OpenSnapshot(j.ID)
+				Ok(t, err)
+				got, err := io.ReadAll(r)
+				Ok(t, err)
+				Ok(t, r.Close())
+				Assert(t, bytes.Equal(payload, got), "binary payload changed")
+
+			}
+			j := claimJob(p, uuid.NewString())
+			j.Private = true
+			Ok(t, s.StartJob(j))
+			got, err := s.Job(j.ID)
+			Ok(t, err)
+			Assert(t, got.Private, "boolean true did not round trip")
+			var cancelled struct{ Closed, Cancelled bool }
+			Ok(t, s.db.Table("pulls").Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&cancelled).Error)
+			Assert(t, !cancelled.Closed && !cancelled.Cancelled, "false defaults did not round trip")
 		})
 	})
 }
@@ -246,6 +535,29 @@ func TestIncompleteDraftSchemaRejected(t *testing.T) {
 				_ = reopened.Close()
 			}
 			ErrContains(t, "unsupported; drain Atlantis and use a fresh data directory", err)
+		})
+	}
+}
+
+func TestOldDraftDatabaseFailsBeforeMigration(t *testing.T) {
+	for _, shape := range []string{"repository column", "old artifact tables", "obsolete blob columns"} {
+		t.Run(shape, func(t *testing.T) {
+			directory := t.TempDir()
+			s, err := OpenServer(directory)
+			Ok(t, err)
+			if shape == "repository column" {
+				Ok(t, s.db.Exec("ALTER TABLE repositories ADD COLUMN owner TEXT").Error)
+			} else if shape == "obsolete blob columns" {
+				Ok(t, s.db.Exec("ALTER TABLE snapshot_blobs ADD COLUMN modified_at TIMESTAMP").Error)
+			} else {
+				Ok(t, s.db.Exec("CREATE TABLE artifacts(id TEXT PRIMARY KEY)").Error)
+			}
+			Ok(t, s.Close())
+			reopened, err := OpenServer(directory)
+			if reopened != nil {
+				_ = reopened.Close()
+			}
+			ErrContains(t, "fresh data directory", err)
 		})
 	}
 }

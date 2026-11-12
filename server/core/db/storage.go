@@ -27,3 +27,16 @@ type ExecutionStore interface {
 	PullIdle(models.PullRequest) (bool, error)
 	MarkClosedClean(models.PullRequest) error
 }
+
+type JobReader interface {
+	Job(string) (*models.Job, error)
+	Jobs() ([]models.Job, error)
+}
+
+type JobStore interface {
+	JobReader
+	StartJob(models.Job) error
+	StartPlan(string) error
+	MarkJobMutating(string) error
+	FinishJob(id, state, message string) error
+}

@@ -74,6 +74,13 @@ func checkExecutionClaim(claim executionClaim, owner string, err error) error {
 	return nil
 }
 
+// Jobs retain the pull and owner that admitted them, fencing writes after recovery.
+func (s *Store) guardJob(tx *gorm.DB, row job) error {
+	var claim executionClaim
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("pull_id = ?", row.PullID).Take(&claim).Error
+	return checkExecutionClaim(claim, row.Owner, err)
+}
+
 func (s *Store) CheckClaim(p models.PullRequest) error {
 	return s.db.Transaction(func(tx *gorm.DB) error { return s.guard(tx, p) })
 }
@@ -132,6 +139,9 @@ func (s *Store) ClosePull(p models.PullRequest) error {
 			return err
 		}
 		if err = tx.Model(&pull{}).Where("id = ?", row.ID).Updates(map[string]any{"closed": true, "cancelled": true, "reopen_requested": false, "closed_at": gorm.Expr("COALESCE(closed_at, ?)", now), "closure_generation": gorm.Expr("CASE WHEN closed THEN closure_generation ELSE closure_generation + 1 END"), "cleanup_complete": gorm.Expr("CASE WHEN closed THEN cleanup_complete ELSE ? END", false)}).Error; err != nil {
+			return err
+		}
+		if err := anchorClosedLogs(tx, row.ID); err != nil {
 			return err
 		}
 		return tx.Where("pull_id = ?", row.ID).Delete(&pendingPlan{}).Error
@@ -229,6 +239,9 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 			if err := tx.Where("id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Take(&closed).Error; err != nil {
 				return err
 			}
+			if err := anchorClosedLogs(tx, closed.ID); err != nil {
+				return err
+			}
 			result := tx.Model(&pull{}).Where("id IN (?) AND closed = ? AND closure_generation = ?", pullIDs(tx, p.BaseRepo, p.Num), true, p.ClosureGeneration).Update("cleanup_complete", true)
 			if result.Error != nil {
 				return result.Error
@@ -245,7 +258,16 @@ func (s *Store) MarkClosedClean(p models.PullRequest) error {
 // MarkPreviousExecutionsUncertain blocks work left by the prior server.
 // The SQLite process lock proves the server exited, not that Terraform children stopped.
 func (s *Store) MarkPreviousExecutionsUncertain() error {
-	return s.db.Model(&executionClaim{}).Where("state = ?", "active").Update("state", "uncertain").Error
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&executionClaim{}).Where("state = ?", "active").Update("state", "uncertain").Error; err != nil {
+			return err
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&logStream{}).Where("sealed_at IS NULL").Updates(map[string]any{"sealed_at": now, "interrupted": true}).Error
+	})
 }
 
 // ClaimCleanup serializes destructive cleanup with other cleaners and commands.
@@ -299,4 +321,10 @@ func (s *Store) CheckExecutionStopped(p models.PullRequest) error {
 		}
 		return nil
 	})
+}
+
+// Each log's retention clock belongs to the closure after its job, not to a later
+// reopen/close cycle of the same PR. Final cleanup also anchors late log chunks.
+func anchorClosedLogs(tx *gorm.DB, pullID string) error {
+	return anchorLogRetention(tx, pullID)
 }

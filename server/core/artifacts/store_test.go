@@ -79,6 +79,7 @@ func TestArtifactBackendConformance(t *testing.T) {
 			t.Cleanup(func() { _ = s.Close() })
 			return s
 		},
+
 		"s3 API": func(t *testing.T) artifacts.Store {
 			return artifacts.NewS3WithClient(&objectClient{objects: map[string][]byte{}}, "test-bucket", "configured-prefix")
 		},
