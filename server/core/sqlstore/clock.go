@@ -20,6 +20,9 @@ func databaseNow(tx *gorm.DB) (time.Time, error) {
 	switch tx.Dialector.Name() {
 	case "sqlite":
 		query = "SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')"
+	case "postgres":
+		// now() is fixed at transaction start; clock_timestamp() follows lock waits.
+		query = "SELECT clock_timestamp()"
 	default:
 		return time.Time{}, fmt.Errorf("unsupported database clock %q", tx.Dialector.Name())
 	}

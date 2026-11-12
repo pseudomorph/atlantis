@@ -106,14 +106,15 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 ## Durable storage
 
 ::: warning Incomplete implementation
-This experiment implements the SQLite portion of ADR 0005: project locks,
-global command locks, PR status, job history, job logs, execution claims,
-cancellation, and pending plans. PostgreSQL, distributed recovery, comprehensive
-webhook deduplication, and multi-instance acceptance tests remain incomplete.
-Use it only for development and testing.
+This experiment implements the single-instance portion of ADR 0005 on SQLite
+or PostgreSQL: project locks, global command locks, PR status, job history, job
+logs, execution claims, cancellation, and pending plans. Multiple instances,
+distributed recovery, comprehensive webhook deduplication, and multi-instance
+acceptance tests remain incomplete. Use it only for development and testing.
 :::
 
-SQLite uses versioned Goose SQL migrations and works in CGO-disabled builds.
+SQLite and PostgreSQL run the same versioned Goose SQL migrations, and both
+work in CGO-disabled builds.
 The database owns project locks, global command locks, PR status, job records,
 live job logs, pending-plan relationships, execution claims, and cancellation requests.
 Artifacts can use the database or a filesystem directory.
@@ -132,6 +133,10 @@ storage:
   artifacts:
     type: database
 ```
+
+For PostgreSQL, set `storage.database.type: postgres` and supply the connection
+string through `connection_string_env` or `connection_string_file`. Start with an
+empty schema and a fresh data directory.
 
 Supply the usual VCS credentials and repository allowlist. See
 [storage configuration](server-configuration.md#durable-storage-configuration)
@@ -160,21 +165,30 @@ BoltDB locking (`--locking-db-type=boltdb`, the current default) is deprecated.
   storage graduates. Removal is a separate reviewed PR.
 
 Redis and `--enable-external-stores` are not deprecated yet. Their replacements,
-PostgreSQL for shared deployments and object storage for artifacts, are not part
-of this experiment.
+multi-instance PostgreSQL deployments and object storage for artifacts, are not
+part of this experiment.
 
 ### Behavior and limits
 
 - SQLite requires a 64-bit server and one Atlantis process on local or block-backed storage. NFS/EFS
   and multiple instances are unsupported. Kubernetes deployments must stop the old
   pod before starting its replacement, for example with `strategy: Recreate`.
+- PostgreSQL also allows one Atlantis process per schema. A session-level advisory
+  lock taken at startup enforces this: a second server fails to start until the
+  first stops. Use `strategy: Recreate` on Kubernetes as well. If the session that
+  holds the lock ends while the server runs, for example after a database
+  restart or a network failure, the server logs an error, refuses new commands
+  and stops refreshing claim heartbeats, so its claims expire and need the
+  stopped-work recovery below. Restart the server to take the lock again.
 - VCS instances, repositories, PRs, projects, and jobs share foreign-key relationships.
   Locks and status are keyed by VCS instance, so same-named repositories on
   different instances never share them. Working directories and their in-process
   locks include the VCS instance to prevent same-named repo collisions.
-- Keep `data-dir` on persistent storage. It holds the database; losing it loses
-  locks, PR status, job history, job logs, execution claims, pending plans, and the
-  records that locate artifacts in any backend.
+- Keep `data-dir` on persistent storage. With SQLite it holds the database; losing
+  it loses locks, PR status, job history, job logs, execution claims, pending plans,
+  and the records that locate artifacts in any backend. With PostgreSQL those
+  records live in the database, and `data-dir` keeps working directories and
+  filesystem artifacts.
 - Each producing plan job owns one immutable snapshot bundle on the database
   or filesystem backend. Its manifest binds plan, lock-file, initialization,
   and declared workflow files to their paths and checksums. Apply and policy checks
@@ -226,8 +240,9 @@ of this experiment.
   drains for shutdown. A sweep marks an active claim whose heartbeat is older than
   2 minutes uncertain and seals its open logs as interrupted. An expired claim is
   never transferred to another command; it needs the stopped-work recovery below.
-  With SQLite the process lock already makes every earlier claim uncertain at
-  startup, so the sweep only finds claims whose own refresh stopped. These
+  The server lock (the SQLite file lock or the PostgreSQL advisory lock) already
+  makes every earlier claim uncertain at startup, so the sweep only finds claims
+  whose own refresh stopped. These
   intervals are fixed and not configurable.
 - Closing a PR cancels queued work and defers cleanup until active work stops.
   Reopening it accepts commands again once that cleanup finishes.
@@ -296,7 +311,9 @@ history or migrate existing plans.
 ### Disable, upgrade, and roll back
 
 Stop Atlantis before backing up the database and artifact storage. For SQLite,
-include WAL sidecars or use a consistent SQLite backup. Preserve filesystem
+include WAL sidecars or use a consistent SQLite backup. For PostgreSQL, back up
+the schema with `pg_dump` or a snapshot of the database. A dump restores only
+into PostgreSQL; there is no conversion between SQLite and PostgreSQL. Preserve filesystem
 artifacts with the matching database backup.
 
 To disable or roll back, drain commands, independently verify Terraform has stopped,
@@ -309,10 +326,10 @@ does not migrate state.
 
 ### Durable storage graduation checklist
 
-- [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
+- [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: the `server/core/sqlstore` tests run against SQLite and, when `ATLANTIS_TEST_POSTGRES_DSN` is set, PostgreSQL 17. They cover persistence, concurrency, row locking under `READ COMMITTED`, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
 - [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
 - [ ] Verify artifact retention, durable logs, and restoring pending plans across restarts and PR cleanup.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.
 
-Graduation, changing defaults, and removing BoltDB are separate reviewed changes. The experiment implements only the SQLite part of ADR 0005 and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).
+Graduation, changing defaults, and removing BoltDB are separate reviewed changes. The experiment implements only the single-instance part of ADR 0005 and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).

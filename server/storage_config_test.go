@@ -4,6 +4,8 @@
 package server_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -34,6 +36,9 @@ func TestStorageConfig(t *testing.T) {
 	for _, bad := range []server.StorageConfig{
 		{}, {Database: server.StorageDatabaseConfig{Type: "redis"}},
 		{Database: server.StorageDatabaseConfig{Type: "postgres"}},
+		{Database: server.StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "DSN", ConnectionStringFile: "/run/secrets/dsn"}},
+		{Database: server.StorageDatabaseConfig{Type: "sqlite", ConnectionStringEnv: "DSN"}},
+		{Database: server.StorageDatabaseConfig{Type: "sqlite", ConnectionStringFile: "/run/secrets/dsn"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Directory: "/var/lib/atlantis"}},
 		{Database: valid.Database, Retention: server.StorageRetentionConfig{Logs: "0s"}},
@@ -42,4 +47,32 @@ func TestStorageConfig(t *testing.T) {
 	} {
 		Assert(t, bad.Validate() != nil, "invalid storage configuration accepted")
 	}
+}
+
+func TestPostgresConnectionString(t *testing.T) {
+	for _, valid := range []server.StorageDatabaseConfig{
+		{Type: "postgres", ConnectionStringEnv: "ATLANTIS_STORAGE_TEST_DSN"},
+		{Type: "postgres", ConnectionStringFile: "/run/secrets/dsn"},
+	} {
+		Ok(t, server.StorageConfig{Database: valid}.Validate())
+	}
+
+	t.Setenv("ATLANTIS_STORAGE_TEST_DSN", " postgres://atlantis@db/atlantis\n")
+	dsn, err := server.StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "ATLANTIS_STORAGE_TEST_DSN"}.ConnectionString()
+	Ok(t, err)
+	Equals(t, "postgres://atlantis@db/atlantis", dsn)
+	t.Setenv("ATLANTIS_STORAGE_TEST_DSN", "")
+	_, err = server.StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "ATLANTIS_STORAGE_TEST_DSN"}.ConnectionString()
+	ErrContains(t, "is empty", err)
+
+	file := filepath.Join(t.TempDir(), "dsn")
+	Ok(t, os.WriteFile(file, []byte("host=db user=atlantis\n"), 0600))
+	dsn, err = server.StorageDatabaseConfig{Type: "postgres", ConnectionStringFile: file}.ConnectionString()
+	Ok(t, err)
+	Equals(t, "host=db user=atlantis", dsn)
+	Ok(t, os.WriteFile(file, []byte("\n"), 0600))
+	_, err = server.StorageDatabaseConfig{Type: "postgres", ConnectionStringFile: file}.ConnectionString()
+	ErrContains(t, "is empty", err)
+	_, err = server.StorageDatabaseConfig{Type: "postgres", ConnectionStringFile: filepath.Join(t.TempDir(), "missing")}.ConnectionString()
+	ErrContains(t, "reading storage.database.connection_string_file", err)
 }

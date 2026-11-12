@@ -14,8 +14,8 @@ import (
 )
 
 func TestDatabaseClock(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		s := conformanceStore(t)
+	ForEachDatabase(t, func(t *testing.T, d TestDatabase) {
+		s := d.Store(t)
 		Ok(t, s.db.Transaction(func(tx *gorm.DB) error {
 			before := time.Now()
 			first, err := databaseNow(tx)
@@ -39,8 +39,8 @@ func TestDatabaseClock(t *testing.T) {
 }
 
 func TestGeneratedStorageTimestamps(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		s := conformanceStore(t)
+	ForEachDatabase(t, func(t *testing.T, d TestDatabase) {
+		s := d.Store(t)
 		// Missing timestamps must not fall through to GORM's application clock.
 		s.db.NowFunc = func() time.Time { return time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC) }
 		before, err := s.Now()
@@ -87,8 +87,8 @@ func TestGeneratedStorageTimestamps(t *testing.T) {
 }
 
 func TestEqualJobTimestampsHaveStableOrder(t *testing.T) {
-	t.Run("sqlite", func(t *testing.T) {
-		s := conformanceStore(t)
+	ForEachDatabase(t, func(t *testing.T, d TestDatabase) {
+		s := d.Store(t)
 		p := claimPull()
 		Ok(t, s.AcquireClaim(p, "owner"))
 		p.Execution = &models.Execution{Owner: "owner"}
