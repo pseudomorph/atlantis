@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/runatlantis/atlantis/server/core/artifacts"
+
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/utils"
@@ -167,3 +169,11 @@ func (s *LocalPlanStore) DeleteForPull(_ models.Repo, _ int) error {
 func (s *LocalPlanStore) DeletePlanForProject(_ models.Repo, _ int, _, _, _ string) error {
 	return nil // no-op: local plan deleted by WorkingDir.DeletePlan
 }
+
+// Inventory supplies authoritative pending plans when working directories are disposable.
+type Inventory interface {
+	PendingPlans(models.Repo, int) ([]models.Job, error)
+}
+
+var _ PlanStore = (*artifacts.Service)(nil)
+var _ Inventory = (*artifacts.Service)(nil)
