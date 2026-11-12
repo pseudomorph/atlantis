@@ -5,7 +5,9 @@ package server
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -18,8 +20,39 @@ type StorageConfig struct {
 }
 
 // StorageDatabaseConfig selects the database that owns application records.
+// The PostgreSQL connection string never appears in the config file: it is read
+// from the named environment variable or file.
 type StorageDatabaseConfig struct {
 	Type string `mapstructure:"type"`
+	// ConnectionStringEnv names the environment variable holding the PostgreSQL connection string.
+	ConnectionStringEnv string `mapstructure:"connection_string_env"`
+	// ConnectionStringFile is a file whose contents are the PostgreSQL connection string.
+	ConnectionStringFile string `mapstructure:"connection_string_file"`
+}
+
+// ConnectionString reads the PostgreSQL connection string from its environment
+// variable or file.
+func (c StorageDatabaseConfig) ConnectionString() (string, error) {
+	var value string
+	switch {
+	case c.ConnectionStringEnv != "":
+		value = os.Getenv(c.ConnectionStringEnv)
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("storage.database.connection_string_env: environment variable %q is empty", c.ConnectionStringEnv)
+		}
+	case c.ConnectionStringFile != "":
+		contents, err := os.ReadFile(c.ConnectionStringFile)
+		if err != nil {
+			return "", fmt.Errorf("reading storage.database.connection_string_file: %w", err)
+		}
+		value = string(contents)
+		if strings.TrimSpace(value) == "" {
+			return "", fmt.Errorf("storage.database.connection_string_file %q is empty", c.ConnectionStringFile)
+		}
+	default:
+		return "", fmt.Errorf("storage.database: postgres requires connection_string_env or connection_string_file")
+	}
+	return strings.TrimSpace(value), nil
 }
 
 // StorageArtifactsConfig selects where artifact bytes are stored.
@@ -43,8 +76,18 @@ func (c StorageConfig) Validate() error {
 			return fmt.Errorf("storage.workflow_files must contain relative file paths")
 		}
 	}
-	if c.Database.Type != "sqlite" {
-		return fmt.Errorf("storage.database.type must be sqlite")
+	hasEnv, hasFile := c.Database.ConnectionStringEnv != "", c.Database.ConnectionStringFile != ""
+	switch c.Database.Type {
+	case "sqlite":
+		if hasEnv || hasFile {
+			return fmt.Errorf("storage.database: sqlite does not accept a connection string")
+		}
+	case "postgres":
+		if hasEnv == hasFile {
+			return fmt.Errorf("storage.database: postgres requires exactly one of connection_string_env or connection_string_file")
+		}
+	default:
+		return fmt.Errorf("storage.database.type must be sqlite or postgres")
 	}
 	switch c.Artifacts.Type {
 	case "", "database":

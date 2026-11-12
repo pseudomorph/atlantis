@@ -15,11 +15,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/gofrs/flock"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"gorm.io/gorm"
@@ -33,10 +36,17 @@ var migrationFiles embed.FS
 func databaseTime(t time.Time) time.Time { return t.UTC().Truncate(time.Microsecond) }
 
 // Store owns the database shared by locks and status. Its schema is managed by Goose.
+// It runs on SQLite or PostgreSQL.
 type Store struct {
 	db    *gorm.DB
 	conn  *sql.DB
 	owner *flock.Flock
+	// session holds the PostgreSQL advisory lock that makes this the only server.
+	session   *pgx.Conn
+	sessionMu sync.Mutex
+	// serverLockLost is set when the PostgreSQL session holding the advisory lock
+	// ends. The store then admits no new claims and stops refreshing heartbeats.
+	serverLockLost atomic.Bool
 	// instance identifies this server process in the claims and jobs it writes.
 	instance string
 	// claimExpiry is how long a claim may go without a heartbeat before it is uncertain.
@@ -55,22 +65,11 @@ func openSQLite(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, "atlantis.db")); err == nil {
-		return nil, fmt.Errorf("durable-storage requires a fresh data directory without atlantis.db; drain the old installation and regenerate plans")
-	} else if !errors.Is(err, os.ErrNotExist) {
+	_, err = os.Stat(filename)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	if _, err := os.Stat(filename); errors.Is(err, os.ErrNotExist) {
-		entries, err := os.ReadDir(dataDir)
-		if err != nil {
-			return nil, err
-		}
-		for _, entry := range entries {
-			if entry.Name() != "bin" && entry.Name() != "plugin-cache" && entry.Name() != ".durable-storage.lock" {
-				return nil, fmt.Errorf("durable-storage requires a fresh data directory on first use; drain the old installation and regenerate plans")
-			}
-		}
-	} else if err != nil {
+	if err := checkDataDir(dataDir, err == nil); err != nil {
 		return nil, err
 	}
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0600)
@@ -82,7 +81,7 @@ func openSQLite(dataDir string) (*Store, error) {
 	}
 	u := url.URL{Scheme: "file", Path: filename}
 	u.RawQuery = url.Values{"_pragma": {"foreign_keys(1)", "busy_timeout(5000)", "journal_mode(WAL)"}, "_txlock": {"immediate"}}.Encode()
-	orm, err := gorm.Open(sqlite.Open(u.String()), &gorm.Config{NowFunc: func() time.Time { return databaseTime(time.Now()) }, Logger: logger.Default.LogMode(logger.Silent)})
+	orm, err := gorm.Open(sqlite.Open(u.String()), gormConfig())
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite: %w", err)
 	}
@@ -92,19 +91,46 @@ func openSQLite(dataDir string) (*Store, error) {
 	}
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
-	if err := migrate(conn); err != nil {
+	if err := migrate(conn, goose.DialectSQLite3); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("migrating sqlite: %w", err)
 	}
 	return &Store{db: orm, conn: conn, instance: uuid.NewString(), claimExpiry: ClaimExpiry}, nil
 }
 
-func migrate(conn *sql.DB) error {
+func gormConfig() *gorm.Config {
+	return &gorm.Config{NowFunc: func() time.Time { return databaseTime(time.Now()) }, Logger: logger.Default.LogMode(logger.Silent)}
+}
+
+// checkDataDir rejects a data directory left by legacy storage. A store that is
+// not yet initialized also requires a directory without earlier working state.
+func checkDataDir(dataDir string, initialized bool) error {
+	if _, err := os.Stat(filepath.Join(dataDir, "atlantis.db")); err == nil {
+		return fmt.Errorf("durable-storage requires a fresh data directory without atlantis.db; drain the old installation and regenerate plans")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if initialized {
+		return nil
+	}
+	entries, err := os.ReadDir(dataDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() != "bin" && entry.Name() != "plugin-cache" && entry.Name() != ".durable-storage.lock" {
+			return fmt.Errorf("durable-storage requires a fresh data directory on first use; drain the old installation and regenerate plans")
+		}
+	}
+	return nil
+}
+
+func migrate(conn *sql.DB, dialect goose.Dialect) error {
 	files, err := fs.Sub(migrationFiles, "migrations")
 	if err != nil {
 		return err
 	}
-	migrator, err := goose.NewProvider(goose.DialectSQLite3, conn, files)
+	migrator, err := goose.NewProvider(dialect, conn, files)
 	if err != nil {
 		return err
 	}
@@ -124,11 +150,17 @@ func (s *Store) Close() error {
 	if s.owner != nil {
 		err = errors.Join(err, s.owner.Unlock())
 	}
+	if s.session != nil {
+		s.sessionMu.Lock()
+		err = errors.Join(err, s.session.Close(context.Background()))
+		s.sessionMu.Unlock()
+	}
 	return err
 }
 func (s *Store) Ping() error { return s.conn.Ping() }
 
-// OpenServer prevents two Atlantis processes from recovering or executing against one SQLite store.
+// OpenServer opens SQLite storage under dataDir. A file lock prevents two Atlantis
+// processes from recovering or executing against one SQLite store.
 func OpenServer(dataDir string) (*Store, error) {
 	if strconv.IntSize < 64 {
 		return nil, fmt.Errorf("durable-storage requires a 64-bit server; legacy storage remains supported")

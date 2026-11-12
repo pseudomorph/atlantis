@@ -19,6 +19,18 @@ import (
 	"github.com/runatlantis/atlantis/server/logging"
 )
 
+// openDurableStore opens the configured durable-storage database.
+func openDurableStore(config StorageDatabaseConfig, dataDir string) (*sqlstore.Store, error) {
+	if config.Type != "postgres" {
+		return sqlstore.OpenServer(dataDir)
+	}
+	connString, err := config.ConnectionString()
+	if err != nil {
+		return nil, err
+	}
+	return sqlstore.OpenPostgresServer(connString, dataDir)
+}
+
 type storageRuntime struct {
 	Store               *sqlstore.Store
 	Claims              db.ExecutionStore
@@ -74,13 +86,16 @@ func newStorageRuntime(store *sqlstore.Store, config UserConfig) (*storageRuntim
 	}, nil
 }
 
-// Heartbeat refreshes the claims this server instance holds, then marks claims
-// whose heartbeat has expired uncertain. With SQLite the process lock already
-// made earlier claims uncertain at startup, so the sweep only finds claims whose
-// own refresh stopped.
+// Heartbeat checks the server lock, refreshes the claims this server instance
+// holds, then marks claims whose heartbeat has expired uncertain. The server lock
+// already made earlier claims uncertain at startup, so the sweep only finds
+// claims whose own refresh stopped. After the PostgreSQL server lock is lost the
+// refresh stops, so this server's claims expire.
 func (s *storageRuntime) Heartbeat(logger logging.SimpleLogging) func() {
 	return func() {
-		if _, err := s.Store.RefreshClaimHeartbeats(); err != nil {
+		if err := s.Store.VerifyServerLock(); err != nil {
+			logger.Err("verifying durable storage server lock: %v", err)
+		} else if _, err := s.Store.RefreshClaimHeartbeats(); err != nil {
 			logger.Err("refreshing execution claim heartbeats: %v", err)
 		}
 		expired, err := s.Store.ExpireClaims()

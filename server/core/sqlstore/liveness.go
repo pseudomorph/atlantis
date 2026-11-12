@@ -33,6 +33,9 @@ func claimExpired(claim executionClaim, now time.Time, expiry time.Duration) boo
 // instance holds. It is one conditional update; a claim that the sweep or a
 // recovery has already changed no longer matches and is not revived.
 func (s *Store) RefreshClaimHeartbeats() (int64, error) {
+	if err := s.checkServerLock(); err != nil {
+		return 0, err
+	}
 	now, err := databaseNow(s.db)
 	if err != nil {
 		return 0, err

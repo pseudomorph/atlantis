@@ -20,6 +20,7 @@ import (
 	events_controllers "github.com/runatlantis/atlantis/server/controllers/events"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
+	"github.com/runatlantis/atlantis/server/core/sqlstore/sqlstoretest"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/models"
 	vcsmocks "github.com/runatlantis/atlantis/server/events/vcs/mocks"
@@ -40,9 +41,41 @@ type durableE2E struct {
 	closed    bool
 }
 
+// durableDatabaseEnv selects the database for the durable e2e tests: unset for
+// SQLite, or "postgres" for the database in sqlstoretest.PostgresDSNEnv.
+const durableDatabaseEnv = "ATLANTIS_TEST_DURABLE_DATABASE"
+
+// durableDSNs maps a data directory to its PostgreSQL schema, so a restart
+// against the same data directory reopens the same database.
+var durableDSNs sync.Map
+
+// durableDSN returns the PostgreSQL connection string for dataDir, creating a
+// schema on first use, or "" when the tests run on SQLite.
+func durableDSN(t *testing.T, dataDir string) string {
+	t.Helper()
+	if os.Getenv(durableDatabaseEnv) != "postgres" {
+		return ""
+	}
+	if dsn := os.Getenv("ATLANTIS_DURABLE_DSN"); dsn != "" {
+		return dsn
+	}
+	if dsn, ok := durableDSNs.Load(dataDir); ok {
+		return dsn.(string)
+	}
+	dsn := sqlstoretest.PostgresDSN(t)
+	durableDSNs.Store(dataDir, dsn)
+	return dsn
+}
+
 func (d *durableE2E) open(t *testing.T) {
 	t.Helper()
-	store, err := sqlstore.OpenServer(d.DataDir)
+	var store *sqlstore.Store
+	var err error
+	if dsn := durableDSN(t, d.DataDir); dsn != "" {
+		store, err = sqlstore.OpenPostgresServer(dsn, d.DataDir)
+	} else {
+		store, err = sqlstore.OpenServer(d.DataDir)
+	}
 	Ok(t, err)
 	// Startup marks work left by a previous process uncertain, as the server does.
 	Ok(t, store.MarkPreviousExecutionsUncertain())
