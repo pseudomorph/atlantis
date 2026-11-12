@@ -52,7 +52,7 @@ func (p *Service) Load(ctx command.ProjectContext, filename string) error {
 		if plan.ManagedPlan && !havePlan {
 			return fmt.Errorf("plan snapshot has no managed plan")
 		}
-		return p.restoreSnapshot(*snapshot, filename, filepath.Join(filepath.Dir(filename), ctx.GetShowResultFileName()), ctx.ArtifactRoot, ctx.ArtifactRoot, false)
+		return p.restoreSnapshot(*snapshot, filename, filepath.Join(filepath.Dir(filename), ctx.GetShowResultFileName()), ctx.ArtifactRoot, ctx.ArtifactRoot, ctx.RestoredDataDirectory != "")
 	}
 	return fmt.Errorf("pending plan was invalidated or replaced; run plan again")
 }
