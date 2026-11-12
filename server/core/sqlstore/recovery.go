@@ -23,7 +23,7 @@ func (s *Store) AcquireUnlockClaim(p models.PullRequest, owner, actor string, co
 		if err != nil {
 			return err
 		}
-		return acquireRecovery(tx, row.ID, owner, actor, confirmedStopped, nil)
+		return acquireRecovery(tx, p, row.ID, owner, actor, confirmedStopped, nil)
 	})
 }
 
@@ -49,12 +49,12 @@ func (s *Store) AcquireAPIJobUnlock(id, owner, actor string, confirmedStopped bo
 		}
 		p.Execution = &models.Execution{Owner: owner}
 		p.BaseRepo.Execution = p.Execution
-		return acquireRecovery(tx, source.PullID, owner, actor, confirmedStopped, &source)
+		return acquireRecovery(tx, p, source.PullID, owner, actor, confirmedStopped, &source)
 	})
 	return p, err
 }
 
-func acquireRecovery(tx *gorm.DB, pullID, owner, actor string, confirmed bool, source *job) error {
+func acquireRecovery(tx *gorm.DB, p models.PullRequest, pullID, owner, actor string, confirmed bool, source *job) error {
 	// The pull lock also fences the missing-claim case, where no claim row exists to lock.
 	if _, err := lockPull(tx, pullID); err != nil {
 		return err
@@ -100,6 +100,14 @@ func acquireRecovery(tx *gorm.DB, pullID, owner, actor string, confirmed bool, s
 		}
 		if err := tx.Table("jobs").Where("pull_id = ? AND state = ?", pullID, "running").Updates(map[string]any{"state": "interrupted", "error": "operator reconciled stopped execution", "finished_at": now}).Error; err != nil {
 			return err
+		}
+		if err := tx.Model(&logStream{}).Where("job_id IN (?) AND sealed_at IS NULL", tx.Model(&job{}).Select("id").Where("pull_id = ?", pullID)).Updates(map[string]any{"sealed_at": now, "interrupted": true}).Error; err != nil {
+			return err
+		}
+		if p.Num < 0 {
+			if err := tx.Model(&logStream{}).Where("job_id IN (?) AND retention_started_at IS NULL", tx.Model(&job{}).Select("id").Where("pull_id = ?", pullID)).Update("retention_started_at", now).Error; err != nil {
+				return err
+			}
 		}
 		if err := tx.Where("pull_id = ?", pullID).Delete(&pendingPlan{}).Error; err != nil {
 			return err
