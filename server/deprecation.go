@@ -20,3 +20,12 @@ const boltDBDeprecationWarning = "boltdb locking is deprecated and will be remov
 const redisDeprecationWarning = "redis locking is deprecated and will be removed in a future release; " +
 	"installs should move to the durable-storage experiment with postgres, " +
 	"see runatlantis.io/docs/experiments#durable-storage for the replacement and migration steps"
+
+// externalStoresDeprecationWarning is logged at startup when
+// --enable-external-stores is set. The durable-storage experiment stores plans
+// in its artifact store, including S3-compatible object storage. The removal
+// rule and migration steps are in the deprecation notice in
+// runatlantis.io/docs/experiments.md.
+const externalStoresDeprecationWarning = "enable-external-stores is deprecated and will be removed in a future release; " +
+	"move plan storage to the durable-storage experiment with storage.artifacts.type s3, " +
+	"see runatlantis.io/docs/experiments#durable-storage for the replacement and migration steps"
