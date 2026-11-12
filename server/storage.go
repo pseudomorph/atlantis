@@ -66,6 +66,9 @@ type storageRuntime struct {
 	logs, planArtifacts time.Duration
 }
 
+// newS3Client is replaced in tests with a fake object service.
+var newS3Client = artifacts.NewS3Client
+
 func newStorageRuntime(store *sqlstore.Store, config UserConfig) (*storageRuntime, error) {
 	var raw artifacts.Store
 	var blobs artifacts.SnapshotBackend
@@ -75,13 +78,21 @@ func newStorageRuntime(store *sqlstore.Store, config UserConfig) (*storageRuntim
 		blobs = sqlstore.BlobStore{Store: store}
 	case "filesystem":
 		raw, err = artifacts.NewFilesystem(config.Storage.ArtifactDirectory(config.DataDir))
+	case "s3":
+		options := artifacts.S3Config(config.Storage.Artifacts.S3)
+		var client artifacts.S3Client
+		client, err = newS3Client(options)
+		if err == nil {
+			raw, err = artifacts.NewS3(client, options.Bucket, options.Prefix, config.Storage.S3UploadDirectory(config.DataDir))
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("opening artifact storage: %w", err)
 	}
-	// Running output always goes to the database journal. An object store, when
-	// configured, receives one write-once archive per sealed log under logs/v1,
-	// outside the snapshot namespace that orphan collection sweeps.
+	// Running output always goes to the database journal. An object store
+	// (filesystem or S3), when configured, receives one write-once archive per
+	// sealed log under logs/v1, outside the snapshot namespace that orphan
+	// collection sweeps.
 	journal := &logs.Service{Records: store, Archive: raw}
 	if raw != nil {
 		blobs = artifacts.ObjectSnapshots{Store: raw}

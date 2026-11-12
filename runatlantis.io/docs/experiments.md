@@ -109,8 +109,8 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 This experiment implements ADR 0005 on SQLite for one server and on PostgreSQL
 for one or more servers: project locks, global command locks, PR status, job
 history, job logs, execution claims, cancellation, pending plans, and webhook
-deduplication. Object storage for artifacts (S3-compatible) is not available
-yet; it arrives in a later change. Use the experiment only for development and
+deduplication, with artifacts in the database, a filesystem directory, or
+S3-compatible object storage. Use the experiment only for development and
 testing.
 :::
 
@@ -119,7 +119,7 @@ work in CGO-disabled builds.
 The database owns project locks, global command locks, PR status, job records,
 live job logs, pending-plan relationships, execution claims, cancellation
 requests, and recent webhook delivery IDs.
-Artifacts can use the database or a filesystem directory.
+Artifacts can use the database, a filesystem directory, or an S3-compatible bucket.
 
 ### Enable
 
@@ -154,9 +154,9 @@ stop startup.
 
 | Topology | Database | Artifacts | Data directory |
 | --- | --- | --- | --- |
-| One server | SQLite | `database` or `filesystem` | Local or block-backed disk |
-| One server | PostgreSQL | `database` or `filesystem` | Its own `data-dir` |
-| Several servers | PostgreSQL, one shared schema | `database`, or `filesystem` on a shared disk | Its own `data-dir` per server |
+| One server | SQLite | `database`, `filesystem`, or `s3` | Local or block-backed disk |
+| One server | PostgreSQL | `database`, `filesystem`, or `s3` | Its own `data-dir` |
+| Several servers | PostgreSQL, one shared schema | `database`, `s3`, or `filesystem` on a shared disk | Its own `data-dir` per server |
 
 - SQLite supports one server. The database file lives in `data-dir`.
 - Several servers can share one PostgreSQL schema. All of them use the same
@@ -164,13 +164,15 @@ stop startup.
   `data-dir` stops a second process from using it. With PostgreSQL, `data-dir`
   holds only working directories and Terraform caches, so a server can start
   with an empty one.
-- Artifacts must be readable by every server. The `database` backend works with
-  any number of servers. A `filesystem` directory works only when every server
-  mounts the same shared disk at the configured `storage.artifacts.directory`
-  and that filesystem renames files atomically, because Atlantis writes each
+- Artifacts must be readable by every server. The `database` and `s3` backends
+  work with any number of servers; with `s3`, every server uses the same bucket
+  and prefix and stages its uploads in its own `data-dir/s3-uploads`. A
+  `filesystem` directory works only when every server mounts the same shared
+  disk at the configured `storage.artifacts.directory` and that filesystem
+  renames files atomically, because Atlantis writes each
   artifact to a temporary file and renames it into place. With PostgreSQL,
   Atlantis logs a warning at startup when filesystem artifacts are inside
-  `data-dir`, which belongs to one server. Object storage is not available yet.
+  `data-dir`, which belongs to one server.
 - Webhooks can go to any server, for example through a load balancer. Each
   server records the delivery ID that the VCS provider sends, so a delivery
   that reaches two servers, or arrives twice, runs once; the duplicate gets
@@ -267,8 +269,31 @@ Redis locking (`--locking-db-type=redis`) is deprecated.
 - **Earliest removal:** no sooner than 2 minor releases and 60 days after durable
   storage graduates. Removal is a separate reviewed PR.
 
-`--enable-external-stores` is not deprecated yet. Its replacement, object
-storage for artifacts, is not part of this experiment yet.
+### External stores deprecation
+
+::: warning Deprecated
+`--enable-external-stores` and the `external_stores.plan_store` block in the
+server-side repo config are deprecated.
+:::
+
+- **Why:** [ADR 0005](/contributing/adr/0005-use-durable-storage-with-one-data-model.md)
+  keeps plans, logs, and their records in one data model. The legacy S3 plan
+  store keeps plan files outside that model, keyed by repository path.
+- **Replacement:** the `durable-storage` experiment with `storage.artifacts.type: s3`.
+  It stores plan snapshots and job log archives in the bucket and records them
+  in the database.
+- **Migration:** follow [Enable](#enable) with `storage.artifacts.type: s3`, then
+  remove `--enable-external-stores` and `external_stores`. Drain commands, start
+  with a fresh `data-dir`, and replan open PRs. Plans in the legacy plan store are
+  not imported. Use a different bucket or prefix from the legacy plan store.
+- **Shared deployments:** installations that combine external stores with Redis
+  to run several replicas move to `storage.database.type: postgres` with
+  `storage.artifacts.type: s3`; see [Redis deprecation](#redis-deprecation) and
+  [Supported topologies](#supported-topologies).
+- **Deprecated in:** the first release that includes this notice. From that
+  release, Atlantis logs a warning at startup when `--enable-external-stores` is set.
+- **Earliest removal:** no sooner than 2 minor releases and 60 days after durable
+  storage graduates. Removal is a separate reviewed PR.
 
 ### Behavior and limits
 
@@ -290,17 +315,18 @@ storage for artifacts, is not part of this experiment yet.
   and the records that locate artifacts in any backend. With PostgreSQL those
   records live in the database, and `data-dir` keeps working directories and
   filesystem artifacts.
-- Each producing plan job owns one immutable snapshot bundle on the database
-  or filesystem backend. Its manifest binds plan, lock-file, initialization,
+- Each producing plan job owns one immutable snapshot bundle on the database,
+  filesystem, or S3 backend. Its manifest binds plan, lock-file, initialization,
   and declared workflow files to their paths and checksums. Apply and policy checks
   use the snapshot selected at admission; restoration verifies the archive and its
   members. A lost or cleaned working directory is restored from the snapshot.
 - Logs flush every 200 ms or at 64 KiB, and before job completion. Every backend
   writes live output to a journal in the database. With the database backend the
-  journal is the final copy. With the filesystem backend, maintenance archives each
-  sealed log as one file and deletes its journal bytes only after the archive is
-  verified and recorded; a failed write keeps the journal. Readers keep their byte
-  offsets across archival. A crash can lose output still in the flush buffer.
+  journal is the final copy. With the filesystem or S3 backend, maintenance archives
+  each sealed log as one file or object and deletes its journal bytes only after the
+  archive is verified and recorded; a failed write keeps the journal. Readers keep
+  their byte offsets across archival; S3 serves them with ranged reads. A crash can
+  lose output still in the flush buffer.
   Interrupted logs seal at their last committed byte without clearing the
   execution claim. A log write failure fails the job.
 - Plans also capture the project's `.terraform.lock.hcl`. Custom workflow files
@@ -323,6 +349,14 @@ storage for artifacts, is not part of this experiment yet.
   files referenced by init arguments in `storage.workflow_files`. Custom setup
   outside an initial built-in init step requires an explicit apply/policy init.
   Terraform state itself is not backed up by artifact storage.
+- The S3 backend writes each artifact with one `PutObject` carrying its SHA-256
+  checksum, so an object is either absent or complete. Uploads are staged in
+  `data-dir/s3-uploads`, which startup clears. Every key sits under
+  `storage.artifacts.s3.prefix`; collection lists only that prefix and deletes only
+  unreferenced snapshots, expired logs, and stale write temporaries there.
+  Lifecycle rules or other writers must not delete or replace objects under the
+  prefix. A missing object fails restoration and log reads. A changed snapshot
+  fails verification, and a changed log archive fails full-log checksum checks.
 - Job records survive artifact cleanup. Retention protects pending plans, running
   consumers, and uncertain executions.
 - Every command, autoplan, unlock, and API call holds an execution claim on its
@@ -418,7 +452,8 @@ Stop every Atlantis server before backing up the database and artifact storage. 
 include WAL sidecars or use a consistent SQLite backup. For PostgreSQL, back up
 the schema with `pg_dump` or a snapshot of the database. A dump restores only
 into PostgreSQL; there is no conversion between SQLite and PostgreSQL. Preserve filesystem
-artifacts with the matching database backup.
+or S3 artifacts with the matching database backup; for S3, copy the prefix or
+enable bucket versioning.
 
 To disable or roll back, drain commands, independently verify Terraform has stopped,
 and retain matching binary, configuration, database, and artifact backups. Remove
@@ -436,4 +471,4 @@ does not migrate state.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.
 
-Graduation, changing defaults, and removing BoltDB and Redis are separate reviewed changes. The experiment does not yet store artifacts in object storage and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).
+Graduation, changing defaults, and removing BoltDB, Redis, and the legacy external stores are separate reviewed changes. The experiment is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).

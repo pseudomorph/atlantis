@@ -762,6 +762,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	if storage.Store != nil {
 		planStore = storage.Artifacts
 	} else if userConfig.EnableExternalStores {
+		logger.Warn(externalStoresDeprecationWarning)
 		psCfg := globalCfg.ExternalStores.PlanStore
 		if psCfg.Type == "" {
 			return nil, fmt.Errorf("--enable-external-stores is set but no external_stores.plan_store.type is configured in the server-side repo config")

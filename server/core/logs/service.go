@@ -79,6 +79,14 @@ func (s *Service) readArchive(id string, offset, length int64) ([]byte, error) {
 	if s.Archive == nil || Key(id) == "" {
 		return nil, fmt.Errorf("log archive is unavailable")
 	}
+	if ranged, ok := s.Archive.(artifacts.RangeStore); ok {
+		reader, err := ranged.OpenRange(Key(id), offset, length)
+		if err != nil {
+			return nil, err
+		}
+		data, err := io.ReadAll(io.LimitReader(reader, length))
+		return data, errors.Join(err, reader.Close())
+	}
 	reader, err := s.Archive.Open(Key(id))
 	if err != nil {
 		return nil, err

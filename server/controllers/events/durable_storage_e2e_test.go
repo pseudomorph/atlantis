@@ -19,6 +19,7 @@ import (
 	"github.com/runatlantis/atlantis/server"
 	events_controllers "github.com/runatlantis/atlantis/server/controllers/events"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/artifacts/artifactstest"
 	runtimemocks "github.com/runatlantis/atlantis/server/core/runtime/mocks"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/core/sqlstore/sqlstoretest"
@@ -42,7 +43,10 @@ type durableE2E struct {
 	Jobs      *jobs.Service
 	Execution *events.ExecutionCoordinator
 	Cleaner   *events.PullClosedExecutor
-	closed    bool
+	// Objects, when set, holds plan snapshots instead of the database, as the
+	// filesystem and S3 artifact backends do.
+	Objects artifacts.Store
+	closed  bool
 	// restarted is set when setup reuses DataDir.
 	restarted bool
 }
@@ -97,7 +101,10 @@ func (d *durableE2E) open(t *testing.T) {
 		_, err := store.ExpireClaims()
 		Ok(t, err)
 	}
-	blobs := sqlstore.BlobStore{Store: store}
+	var blobs artifacts.SnapshotBackend = sqlstore.BlobStore{Store: store}
+	if d.Objects != nil {
+		blobs = artifacts.ObjectSnapshots{Store: d.Objects}
+	}
 	d.Store = store
 	d.Artifacts = &artifacts.Service{Records: store, Blobs: blobs}
 	d.Jobs = &jobs.Service{Store: store}
@@ -220,6 +227,32 @@ func TestDurableStoragePlanSurvivesRestart(t *testing.T) {
 	locks, err = restarted.storage.Store.List()
 	Ok(t, err)
 	Equals(t, 1, len(locks))
+}
+
+// With S3 artifacts, a restarted server that lost its working directory
+// restores the plan snapshot from the bucket and applies it.
+func TestDurableStorageS3PlanSurvivesRestartAndLostWorkingDirectory(t *testing.T) {
+	skipUnlessDurableE2E(t)
+	repoDir, headSHA := initializeRepo(t, "simple")
+	fake := artifactstest.New("artifacts")
+	bucket := func() artifacts.Store {
+		store, err := artifacts.NewS3(fake, fake.Bucket, "atlantis", filepath.Join(t.TempDir(), "uploads"))
+		Ok(t, err)
+		return store
+	}
+	storage := &durableE2E{Objects: bucket()}
+	first := startDurableServer(t, repoDir, headSHA, storage)
+	first.open(t, headSHA)
+	lastReplyContains(t, first, "Plan: 3 to add")
+	keys := fake.Keys()
+	Equals(t, 1, len(keys))
+	Assert(t, strings.HasPrefix(keys[0], "atlantis/snapshots/v1/"), "plan snapshot stored outside the prefix: %v", keys)
+	Ok(t, os.RemoveAll(pullWorkingDir(first)))
+	first.storage.stop(t)
+
+	restarted := startDurableServer(t, repoDir, headSHA, &durableE2E{DataDir: storage.DataDir, Objects: bucket()})
+	restarted.comment(t, "atlantis apply")
+	lastReplyContains(t, restarted, "Apply complete!")
 }
 
 func TestDurableStorageRestoresPlanIntoLostWorkingDirectory(t *testing.T) {

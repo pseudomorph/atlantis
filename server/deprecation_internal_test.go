@@ -23,3 +23,17 @@ func TestDeprecationWarningsFollowLogStyle(t *testing.T) {
 		}
 	}
 }
+
+func TestExternalStoresDeprecationWarningFollowsLogStyle(t *testing.T) {
+	if strings.Contains(externalStoresDeprecationWarning, ":") {
+		t.Fatalf("log message must not contain colons: %q", externalStoresDeprecationWarning)
+	}
+	if externalStoresDeprecationWarning != strings.ToLower(externalStoresDeprecationWarning) {
+		t.Fatalf("log message must be lowercase: %q", externalStoresDeprecationWarning)
+	}
+	for _, want := range []string{"enable-external-stores", "deprecated", "durable-storage", "s3", "migration"} {
+		if !strings.Contains(externalStoresDeprecationWarning, want) {
+			t.Fatalf("warning %q does not mention %q", externalStoresDeprecationWarning, want)
+		}
+	}
+}
