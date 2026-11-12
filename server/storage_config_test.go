@@ -15,15 +15,18 @@ import (
 func TestStorageConfig(t *testing.T) {
 	valid := server.StorageConfig{Database: server.StorageDatabaseConfig{Type: "sqlite"}}
 	Ok(t, valid.Validate())
-	planArtifacts, err := valid.PlanArtifactRetention()
+	logs, planArtifacts, err := valid.Durations()
 	Ok(t, err)
+	Equals(t, 7*24*time.Hour, logs)
 	Equals(t, time.Duration(0), planArtifacts)
 	filesystem := valid
 	filesystem.Artifacts = server.StorageArtifactsConfig{Type: "filesystem"}
+	filesystem.Retention.Logs = "48h"
 	filesystem.Retention.PlanArtifacts = "24h"
 	Ok(t, filesystem.Validate())
-	planArtifacts, err = filesystem.PlanArtifactRetention()
+	logs, planArtifacts, err = filesystem.Durations()
 	Ok(t, err)
+	Equals(t, 48*time.Hour, logs)
 	Equals(t, 24*time.Hour, planArtifacts)
 	Equals(t, "/data/artifacts", filesystem.ArtifactDirectory("/data"))
 	filesystem.Artifacts.Directory = "/srv/artifacts"
@@ -33,6 +36,7 @@ func TestStorageConfig(t *testing.T) {
 		{Database: server.StorageDatabaseConfig{Type: "postgres"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Directory: "/var/lib/atlantis"}},
+		{Database: valid.Database, Retention: server.StorageRetentionConfig{Logs: "0s"}},
 		{Database: valid.Database, Retention: server.StorageRetentionConfig{PlanArtifacts: "-1h"}},
 		{Database: valid.Database, WorkflowFiles: []string{"../outside"}},
 	} {

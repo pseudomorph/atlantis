@@ -73,34 +73,41 @@ func readyLifecyclePlan(t *testing.T, s *Store, p models.PullRequest) models.Job
 }
 
 func TestPendingLifecycleVerificationBlocksJobAdmission(t *testing.T) {
-	s := conformanceStore(t)
-	p := claimPull()
-	p.Execution = &models.Execution{Owner: "owner"}
-	Ok(t, s.AcquireClaim(p, "owner"))
-	plan := readyLifecyclePlan(t, s, p)
-	queued := claimJob(p, uuid.NewString())
-	queued.Command = "apply"
-	Ok(t, s.QueueLifecycleCheck(p))
-	ErrContains(t, "awaiting VCS verification", s.StartJob(queued))
-	recorded, err := s.Job(queued.ID)
-	Ok(t, err)
-	Assert(t, recorded == nil, "rejected job was persisted")
-	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
-	Ok(t, err)
-	Equals(t, 1, len(pending))
-	Equals(t, plan.ID, pending[0].ID)
-	Ok(t, s.CheckClaim(p))
-	checks, err := s.PendingLifecycleChecks()
-	Ok(t, err)
-	Equals(t, 1, len(checks))
-	Ok(t, s.ResolveLifecycleCheck(checks[0]))
-	Ok(t, s.StartJob(queued))
-	recorded, err = s.Job(queued.ID)
-	Ok(t, err)
-	Equals(t, "running", recorded.State)
-	Equals(t, plan.ID, recorded.PlanJobID)
-	Ok(t, s.FinishJob(queued.ID, "succeeded", ""))
-	Ok(t, s.ReleaseClaim(p))
+	for _, kind := range []models.JobKind{models.CommandJob, models.WorkflowHookJob} {
+		t.Run(string(kind), func(t *testing.T) {
+			s := conformanceStore(t)
+			p := claimPull()
+			p.Execution = &models.Execution{Owner: "owner"}
+			Ok(t, s.AcquireClaim(p, "owner"))
+			plan := readyLifecyclePlan(t, s, p)
+			queued := claimJob(p, uuid.NewString())
+			queued.Command = "apply"
+			queued.Kind = kind
+			Ok(t, s.QueueLifecycleCheck(p))
+			ErrContains(t, "awaiting VCS verification", s.StartJob(queued))
+			recorded, err := s.Job(queued.ID)
+			Ok(t, err)
+			Assert(t, recorded == nil, "rejected job was persisted")
+			pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+			Ok(t, err)
+			Equals(t, 1, len(pending))
+			Equals(t, plan.ID, pending[0].ID)
+			Ok(t, s.CheckClaim(p))
+			checks, err := s.PendingLifecycleChecks()
+			Ok(t, err)
+			Equals(t, 1, len(checks))
+			Ok(t, s.ResolveLifecycleCheck(checks[0]))
+			Ok(t, s.StartJob(queued))
+			recorded, err = s.Job(queued.ID)
+			Ok(t, err)
+			Equals(t, "running", recorded.State)
+			if kind == models.CommandJob {
+				Equals(t, plan.ID, recorded.PlanJobID)
+			}
+			Ok(t, s.FinishJob(queued.ID, "succeeded", ""))
+			Ok(t, s.ReleaseClaim(p))
+		})
+	}
 }
 
 func TestPendingLifecycleVerificationLetsAdmittedJobFinish(t *testing.T) {

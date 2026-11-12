@@ -14,7 +14,7 @@ timestamps retain their instant. SQLite's clock has millisecond resolution.
 `OpenServer` holds a process lock before opening or migrating SQLite. Run one
 server on local or block-backed storage; network filesystems are unsupported.
 The store holds project locks, global command locks, pull request status, jobs,
-execution claims, pending plans and plan snapshot metadata.
+execution claims, pending plans, plan snapshot metadata and job log journals.
 
 Commands own persisted execution claims until completion, and lock, status and
 job writes require the live claim. Startup marks leftover claims uncertain,
@@ -46,6 +46,13 @@ lifecycle row belongs to a pull, so the lock also fences inserts that a
 missing-row check cannot. Other writes are single conditional `UPDATE` or
 `DELETE` statements whose affected row count is checked. The SQLite dialector
 omits `FOR UPDATE`; a backend with row locks under `READ COMMITTED` must honor it.
+
+Log reads follow the same rule. `ReadLogJournal` locks the `job_logs` row
+before it reads `job_log_chunks`, and appends, archive handoff and retention lock
+or update that row before they add or delete chunks. Under `READ COMMITTED` each
+statement sees its own snapshot, so without the row lock a reader could see a
+journal marker and then find its chunks deleted by a concurrent archive handoff.
+With it, a reader sees either the complete journal or the archive marker.
 
 Native database dumps are not a cross-backend migration format; a future transfer
 must copy typed rows into a schema initialized by Goose.
@@ -82,3 +89,10 @@ roles, paths and checksums, and publication requires the live claim. Retention
 protects the bundle while any consumer is running, even after pending-plan
 invalidation, then purges it once `storage.retention.plan_artifacts` has passed.
 Orphan collection deletes unreferenced bundles only while no claim or job is active.
+
+Logs use separate byte-offset journals and never participate in plan selection.
+Running output always goes to the journal. With filesystem artifacts, a sealed
+log is archived once under `logs/v1/<job>` and its journal bytes are deleted in
+the transaction that records the archive; with database artifacts, the journal
+is the final copy. Workflow hooks have no project; project commands require one.
+SQL enforces these cardinalities.

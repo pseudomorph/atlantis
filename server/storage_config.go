@@ -30,6 +30,8 @@ type StorageArtifactsConfig struct {
 
 // StorageRetentionConfig sets how long finished artifacts are kept.
 type StorageRetentionConfig struct {
+	// Logs is measured from PR closure, or completion for jobs without a PR.
+	Logs string `mapstructure:"logs"`
 	// PlanArtifacts covers plans, showfiles, and workflow files after apply or invalidation.
 	PlanArtifacts string `mapstructure:"plan_artifacts"`
 }
@@ -53,20 +55,27 @@ func (c StorageConfig) Validate() error {
 	default:
 		return fmt.Errorf("storage.artifacts.type must be database or filesystem")
 	}
-	_, err := c.PlanArtifactRetention()
+	_, _, err := c.Durations()
 	return err
 }
 
-// PlanArtifactRetention returns how long plan artifacts outlive their pending plan.
-func (c StorageConfig) PlanArtifactRetention() (time.Duration, error) {
-	if c.Retention.PlanArtifacts == "" {
-		return 0, nil
+// Durations returns the log and plan-artifact retention periods.
+func (c StorageConfig) Durations() (time.Duration, time.Duration, error) {
+	logs, planArtifacts := 7*24*time.Hour, time.Duration(0)
+	var err error
+	if c.Retention.Logs != "" {
+		logs, err = time.ParseDuration(c.Retention.Logs)
+		if err != nil || logs <= 0 {
+			return 0, 0, fmt.Errorf("storage.retention.logs must be a positive duration")
+		}
 	}
-	retention, err := time.ParseDuration(c.Retention.PlanArtifacts)
-	if err != nil || retention < 0 {
-		return 0, fmt.Errorf("storage.retention.plan_artifacts must be a nonnegative duration")
+	if c.Retention.PlanArtifacts != "" {
+		planArtifacts, err = time.ParseDuration(c.Retention.PlanArtifacts)
+		if err != nil || planArtifacts < 0 {
+			return 0, 0, fmt.Errorf("storage.retention.plan_artifacts must be a nonnegative duration")
+		}
 	}
-	return retention, nil
+	return logs, planArtifacts, nil
 }
 
 // ArtifactDirectory returns the filesystem backend directory, defaulting under dataDir.

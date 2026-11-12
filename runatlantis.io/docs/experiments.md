@@ -106,16 +106,16 @@ See the [feature lifecycle ADR](/contributing/adr/0004-govern-feature-lifecycles
 ## Durable storage
 
 ::: warning Incomplete implementation
-This experiment implements most of the SQLite portion of ADR 0005: project
-locks, global command locks, PR status, job history, execution claims,
-cancellation, and pending plans. Logs, PostgreSQL, and multi-instance operation
-are not durable yet.
+This experiment implements the SQLite portion of ADR 0005: project locks,
+global command locks, PR status, job history, job logs, execution claims,
+cancellation, and pending plans. PostgreSQL, distributed recovery, comprehensive
+webhook deduplication, and multi-instance acceptance tests remain incomplete.
 Use it only for development and testing.
 :::
 
 SQLite uses versioned Goose SQL migrations and works in CGO-disabled builds.
 The database owns project locks, global command locks, PR status, job records,
-pending-plan relationships, execution claims, and cancellation requests.
+live job logs, pending-plan relationships, execution claims, and cancellation requests.
 Artifacts can use the database or a filesystem directory.
 
 ### Enable
@@ -173,13 +173,21 @@ of this experiment.
   different instances never share them. Working directories and their in-process
   locks include the VCS instance to prevent same-named repo collisions.
 - Keep `data-dir` on persistent storage. It holds the database; losing it loses
-  locks, PR status, job history, execution claims, pending plans, and the records
-  that locate artifacts in any backend.
+  locks, PR status, job history, job logs, execution claims, pending plans, and the
+  records that locate artifacts in any backend.
 - Each producing plan job owns one immutable snapshot bundle on the database
   or filesystem backend. Its manifest binds plan, lock-file, initialization,
   and declared workflow files to their paths and checksums. Apply and policy checks
   use the snapshot selected at admission; restoration verifies the archive and its
   members. A lost or cleaned working directory is restored from the snapshot.
+- Logs flush every 200 ms or at 64 KiB, and before job completion. Every backend
+  writes live output to a journal in the database. With the database backend the
+  journal is the final copy. With the filesystem backend, maintenance archives each
+  sealed log as one file and deletes its journal bytes only after the archive is
+  verified and recorded; a failed write keeps the journal. Readers keep their byte
+  offsets across archival. A crash can lose output still in the flush buffer.
+  Interrupted logs seal at their last committed byte without clearing the
+  execution claim. A log write failure fails the job.
 - Plans also capture the project's `.terraform.lock.hcl`. Custom workflow files
   or directories must be declared in `storage.workflow_files` to survive loss of
   a working directory. Snapshot bundles support regular files and directories;
@@ -204,9 +212,9 @@ of this experiment.
   consumers, and uncertain executions.
 - Every command, autoplan, unlock, and API call holds an execution claim on its
   PR or API invocation for its whole run, including hooks and publication. Each
-  project command records a job with its issuer, trigger, revision, arguments,
-  workflow step names, outcome, and timestamps. Step commands and environment
-  values are not stored.
+  project command and workflow hook records a job with its issuer, trigger,
+  revision, arguments, workflow step names, outcome, timestamps, and output.
+  Step commands and environment values are not stored.
 - `atlantis cancel` prevents queued jobs from starting; running jobs continue to
   completion while their execution claim remains held. Active-process interruption
   is deferred. PR closure invalidates pending plans. After a crash, prior claims become uncertain and block new commands
@@ -225,7 +233,7 @@ of this experiment.
   Non-PR API calls remain synchronous. Their temporary negative identifiers are
   reserved before checkout; a collision retries or fails without reusing history.
   This experiment adds no execution-group identifiers, persistent API group
-  lifecycle, retries, or group-management UI.
+  lifecycle, retries, or group-management UI. Those API enhancements require separate work.
 - Project locks survive successful apply until closure, merge, or explicit unlock.
   `disable-repo-locking` disables project locks, while execution claims remain active.
 
@@ -245,7 +253,7 @@ atlantis unlock --confirm-stopped
 This is an operator attestation, not automatic process detection. Recovery records
 its actor, previous owner, and timestamp; marks unfinished jobs interrupted;
 invalidates pending plans; and acquires recovery ownership in one transaction.
-Unlock then releases the PR's reservations. Job history remains available. A failed
+Unlock then releases the PR's reservations. Job history and logs remain available. A failed
 recovery write rolls back; uncertain work never permits automatic retry. If apply
 may have changed infrastructure, inspect its outcome and create a fresh plan. Do
 not retry the old saved plan.
@@ -294,8 +302,8 @@ does not migrate state.
 
 - [ ] Validate locks, status, jobs, claims, and artifacts against supported SQLite and PostgreSQL versions. Initial evidence: `server/core/sqlstore/store_test.go` and `store_internal_test.go` cover persistence, concurrency, ownership, constraints, and transaction rollback. `server/jobs/service_test.go` covers job binding, artifact restoration, corruption, supersession, and history preservation after invalidation.
 - [ ] Test competing commands, duplicate webhooks, cancellation, PR close, and instance failure before supporting multiple instances.
-- [ ] Verify artifact retention and restoring pending plans across restarts and PR cleanup.
+- [ ] Verify artifact retention, durable logs, and restoring pending plans across restarts and PR cleanup.
 - [ ] Test backup, upgrade, clean cutover, and rollback procedures for released schemas.
 - [ ] Review stable configuration and document remaining operational limits.
 
-Graduation, changing defaults, and removing BoltDB are separate reviewed changes. The experiment implements only part of the SQLite portion of ADR 0005 and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).
+Graduation, changing defaults, and removing BoltDB are separate reviewed changes. The experiment implements only the SQLite part of ADR 0005 and is not ready for production use. Track remaining work in [#7031](https://github.com/runatlantis/atlantis/issues/7031).

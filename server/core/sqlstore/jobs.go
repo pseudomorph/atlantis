@@ -19,7 +19,7 @@ func (s *Store) StartJob(want models.Job) error {
 	if want.Kind == "" {
 		want.Kind = models.CommandJob
 	}
-	if want.Kind != models.CommandJob {
+	if want.Kind != models.CommandJob && want.Kind != models.WorkflowHookJob {
 		return fmt.Errorf("invalid job kind")
 	}
 	return s.db.Transaction(func(tx *gorm.DB) error {
@@ -27,9 +27,13 @@ func (s *Store) StartJob(want models.Job) error {
 		if err != nil {
 			return err
 		}
-		project, err := saveProject(tx, p.RepositoryID, want.Project.Path, want.Project.ProjectName, want.Workspace)
-		if err != nil {
-			return err
+		var projectID *string
+		if want.Kind == models.CommandJob {
+			project, err := saveProject(tx, p.RepositoryID, want.Project.Path, want.Project.ProjectName, want.Workspace)
+			if err != nil {
+				return err
+			}
+			projectID = &project.ID
 		}
 		if err := s.guard(tx, want.Pull); err != nil {
 			return err
@@ -56,20 +60,20 @@ func (s *Store) StartJob(want models.Job) error {
 				return err
 			}
 		}
-		row := job{ToolDistribution: want.ToolDistribution, ToolVersion: want.ToolVersion, Kind: want.Kind, ManagedPlan: want.ManagedPlan, Owner: want.Pull.ExecutionOwner(), ID: want.ID, RepositoryID: p.RepositoryID, PullID: p.ID, ProjectID: &project.ID, Command: want.Command, SubCommand: want.SubCommand,
+		row := job{ToolDistribution: want.ToolDistribution, ToolVersion: want.ToolVersion, Kind: want.Kind, ManagedPlan: want.ManagedPlan, Owner: want.Pull.ExecutionOwner(), ID: want.ID, RepositoryID: p.RepositoryID, PullID: p.ID, ProjectID: projectID, Command: want.Command, SubCommand: want.SubCommand,
 			Arguments: want.Arguments, Steps: want.Steps, Issuer: want.Issuer.Username, IssuerTeams: want.Issuer.Teams, Trigger: want.Trigger, Revision: want.Revision,
 			State: "running", Private: want.Private, StartedAt: startedAt}
 		var binding *planBinding
-		if consumesPlan(want.Command) {
+		if want.Kind == models.CommandJob && consumesPlan(want.Command) {
 			var pending struct{ JobID, Kind, Command, State string }
 			err := tx.Table("pending_plans AS pending").Select("pending.job_id, producer.kind, producer.command, producer.state").
 				Joins("JOIN jobs AS producer ON producer.id = pending.job_id").
-				Where("pending.project_id = ? AND pending.pull_id = ? AND pending.ready = ?", project.ID, p.ID, true).Take(&pending).Error
+				Where("pending.project_id = ? AND pending.pull_id = ? AND pending.ready = ?", projectID, p.ID, true).Take(&pending).Error
 			if err == nil {
 				if pending.Kind != string(models.CommandJob) || pending.Command != "plan" || pending.State != "succeeded" {
 					return fmt.Errorf("selected pending producer is not a completed plan")
 				}
-				binding = &planBinding{JobID: row.ID, PlanJobID: pending.JobID, ProjectID: project.ID, PullID: p.ID}
+				binding = &planBinding{JobID: row.ID, PlanJobID: pending.JobID, ProjectID: *projectID, PullID: p.ID}
 			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
@@ -82,7 +86,7 @@ func (s *Store) StartJob(want models.Job) error {
 				return fmt.Errorf("binding plan: %w", err)
 			}
 		}
-		return nil
+		return tx.Create(&logStream{LogStream: models.LogStream{JobID: row.ID}}).Error
 	})
 }
 
@@ -112,6 +116,12 @@ func (s *Store) FinishJob(id, state, message string) error {
 		}
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("job %q is no longer running", id)
+		}
+		if err := sealLog(tx, id, now, false); err != nil {
+			return err
+		}
+		if err := anchorFinishedLog(tx, row, now); err != nil {
+			return err
 		}
 		if row.Kind == models.CommandJob && row.Command == "plan" {
 			if state != "succeeded" || closed.Closed {
@@ -297,8 +307,12 @@ func consumesPlan(command string) bool {
 // MarkJobMutating records the boundary after which failure requires a new plan.
 func (s *Store) MarkJobMutating(id string) error {
 	return s.db.Transaction(func(tx *gorm.DB) error {
-		if _, err := s.artifactJob(tx, id); err != nil {
+		row, err := s.artifactJob(tx, id)
+		if err != nil {
 			return err
+		}
+		if row.Kind != models.CommandJob {
+			return fmt.Errorf("workflow hooks cannot mutate plan state")
 		}
 		return tx.Model(&job{}).Where("id = ?", id).Update("mutation_started", true).Error
 	})

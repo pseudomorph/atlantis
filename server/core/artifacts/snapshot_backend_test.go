@@ -20,7 +20,7 @@ import (
 	. "github.com/runatlantis/atlantis/testing"
 )
 
-func TestObjectSnapshotsIsolatesJobsAndOtherObjects(t *testing.T) {
+func TestObjectSnapshotsIsolatesJobsAndLogArchives(t *testing.T) {
 	factories := map[string]func(*testing.T) artifacts.Store{
 		"filesystem": func(t *testing.T) artifacts.Store {
 			store, err := artifacts.NewFilesystem(t.TempDir())
@@ -38,7 +38,7 @@ func TestObjectSnapshotsIsolatesJobsAndOtherObjects(t *testing.T) {
 			Ok(t, err)
 			_, err = backend.PutSnapshot(second, strings.NewReader("second bundle"))
 			Ok(t, err)
-			_, err = raw.Put("other/v1/"+first, strings.NewReader("unrelated object"))
+			_, err = raw.Put("logs/v1/"+first, strings.NewReader("log archive"))
 			Ok(t, err)
 			reader, err := backend.OpenSnapshot(first)
 			Ok(t, err)
@@ -55,7 +55,7 @@ func TestObjectSnapshotsIsolatesJobsAndOtherObjects(t *testing.T) {
 			Ok(t, backend.CollectOrphans(map[string]bool{first: true}, true, time.Now().Add(2*time.Hour)))
 			_, err = backend.OpenSnapshot(second)
 			Assert(t, err != nil, "orphan snapshot remained")
-			reader, err = raw.Open("other/v1/" + first)
+			reader, err = raw.Open("logs/v1/" + first)
 			Ok(t, err)
 			Ok(t, reader.Close())
 			reader, err = backend.OpenSnapshot(first)
