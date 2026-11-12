@@ -69,6 +69,9 @@ func (s *Store) DeletePullStatus(p models.PullRequest) error {
 		if err := s.guardRemoval(tx, p); err != nil {
 			return err
 		}
+		if err := tx.Where("pull_id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&pendingPlan{}).Error; err != nil {
+			return err
+		}
 		return tx.Where("pull_id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&pullStatus{}).Error
 	})
 }
@@ -89,7 +92,11 @@ func (s *Store) UpdateProjectStatus(p models.PullRequest, workspace, directory s
 		if err != nil {
 			return err
 		}
-		return tx.Model(&projectStatus{}).Where("pull_id = ? AND project_id = ?", target.PullID, target.ProjectID).Update("status", status).Error
+		updates := map[string]any{"status": status}
+		if status == models.DiscardedPlanStatus || status == models.AppliedPlanStatus {
+			updates["plan_hash"] = ""
+		}
+		return tx.Model(&projectStatus{}).Where("pull_id = ? AND project_id = ?", target.PullID, target.ProjectID).Updates(updates).Error
 	})
 }
 

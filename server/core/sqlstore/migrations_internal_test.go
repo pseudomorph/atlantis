@@ -120,3 +120,69 @@ func TestUpgradeFromLocksAndStatus(t *testing.T) {
 	Ok(t, s.db.Table("pulls").Where("id = ?", "pull").Take(&lifecycle).Error)
 	Assert(t, lifecycle.Closed && lifecycle.Cancelled && lifecycle.ClosedAt != nil && lifecycle.ClosureGeneration == 1, "migrated pull did not close: %+v", lifecycle)
 }
+
+// writeJobsAndClaims adds the rows version 2 stores for finished work on the
+// pull from writeLocksAndStatus: a succeeded plan, an apply interrupted by
+// recovery, and the recovery audit.
+func writeJobsAndClaims(t *testing.T, db *gorm.DB, startedAt time.Time) {
+	t.Helper()
+	insert := "INSERT INTO jobs(id, repository_id, pull_id, project_id, command, sub_command, arguments, steps, issuer, issuer_teams, trigger, revision, state, error, private, started_at, finished_at, owner, kind) VALUES (?, 'repository', 'pull', 'project', ?, '', '[\"-no-color\"]', '[]', 'issuer', '[\"admins\"]', 'comment', 'revision', ?, ?, FALSE, ?, ?, ?, 'command')"
+	Ok(t, db.Exec(insert, "old-plan", "plan", "succeeded", "", databaseTime(startedAt), databaseTime(startedAt.Add(time.Minute)), "old-owner").Error)
+	Ok(t, db.Exec(insert, "old-apply", "apply", "interrupted", "operator reconciled stopped execution", databaseTime(startedAt.Add(2*time.Minute)), databaseTime(startedAt.Add(3*time.Minute)), "crashed-owner").Error)
+	Ok(t, db.Exec("INSERT INTO execution_recoveries(id, pull_id, previous_owner, recovery_owner, source_job_id, actor, recovered_at) VALUES ('recovery', 'pull', 'crashed-owner', 'recovery-owner', 'old-apply', 'operator', ?)", databaseTime(startedAt.Add(3*time.Minute))).Error)
+}
+
+func TestUpgradeFromJobsAndClaims(t *testing.T) {
+	dir := t.TempDir()
+	p := upgradePull()
+	startedAt := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	databaseAt(t, dir, 2, func(db *gorm.DB) {
+		writeLocksAndStatus(t, db, p, startedAt)
+		writeJobsAndClaims(t, db, startedAt)
+	})
+
+	s, err := OpenServer(dir)
+	Ok(t, err)
+	defer s.Close()
+
+	old, err := s.Job("old-plan")
+	Ok(t, err)
+	Assert(t, old != nil, "old plan job is missing")
+	Equals(t, "plan", old.Command)
+	Equals(t, "succeeded", old.State)
+	Equals(t, []string{"-no-color"}, old.Arguments)
+	Equals(t, models.User{Username: "issuer", Teams: []string{"admins"}}, old.Issuer)
+	Assert(t, old.StartedAt.Equal(startedAt), "start time changed to %s", old.StartedAt)
+	Assert(t, old.ManagedPlan && old.PlanJobID == "" && old.ToolDistribution == "" && old.ToolVersion == "", "old job defaults changed: %+v", old)
+	var recoveries int64
+	Ok(t, s.db.Table("execution_recoveries").Where("source_job_id = ?", "old-apply").Count(&recoveries).Error)
+	Equals(t, int64(1), recoveries)
+
+	// The unique index added for composite references covers existing jobs.
+	Assert(t, s.db.Create(&pendingPlan{ProjectID: "project", PullID: "pull", JobID: "missing"}).Error != nil, "pending plan accepted a missing job")
+	Ok(t, s.db.Create(&pendingPlan{ProjectID: "project", PullID: "pull", JobID: "old-plan"}).Error)
+	Ok(t, s.db.Where("job_id = ?", "old-plan").Delete(&pendingPlan{}).Error)
+	ErrContains(t, "CHECK constraint failed", s.db.Create(&planBinding{JobID: "old-apply", PlanJobID: "old-apply", ProjectID: "project", PullID: "pull"}).Error)
+
+	// An old plan has no snapshot, so a consumer admitted after the upgrade
+	// binds only a plan produced by the new version.
+	p = claimed(t, s, p)
+	unbound := claimJob(p, "unbound-apply")
+	unbound.Command = "apply"
+	Ok(t, s.StartJob(unbound))
+	got, err := s.Job(unbound.ID)
+	Ok(t, err)
+	Equals(t, "", got.PlanJobID)
+	Ok(t, s.FinishJob(unbound.ID, "failed", "no plan"))
+	plan := readyLifecyclePlan(t, s, p)
+	consumer := claimJob(p, "apply")
+	consumer.Command = "apply"
+	Ok(t, s.StartJob(consumer))
+	got, err = s.Job(consumer.ID)
+	Ok(t, err)
+	Equals(t, plan.ID, got.PlanJobID)
+	Ok(t, s.FinishJob(consumer.ID, "succeeded", ""))
+	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+	Ok(t, err)
+	Equals(t, 0, len(pending))
+}

@@ -1242,6 +1242,11 @@ func (p *DefaultProjectCommandBuilder) pathConfiguredOnlyOnAnotherBranch(ctx *co
 // pending plans in this ctx.
 func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *command.Context, commentCmd *CommentCommand) ([]command.ProjectContext, error) {
 	pullDir, err := p.WorkingDir.GetPullDir(ctx.Pull.BaseRepo, ctx.Pull)
+	inventory, hasInventory := p.PlanStore.(planstore.Inventory)
+	if hasInventory && (err == nil || os.IsNotExist(err)) {
+		err = os.ErrNotExist
+	}
+
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
@@ -1286,9 +1291,29 @@ func (p *DefaultProjectCommandBuilder) buildAllProjectCommandsByPlan(ctx *comman
 		}
 	}
 
-	plans, err := p.PendingPlanFinder.Find(pullDir)
-	if err != nil {
-		return nil, err
+	var plans []PendingPlan
+	if hasInventory {
+		pending, err := inventory.PendingPlans(ctx.Pull.BaseRepo, ctx.Pull.Num)
+		if err != nil {
+			return nil, fmt.Errorf("listing pending plans: %w", err)
+		}
+		for _, job := range pending {
+			repoDir, err := workspaceRepoDir(pullDir, job.Workspace)
+			if err != nil {
+				return nil, err
+			}
+			plans = append(plans, PendingPlan{
+				RepoDir:     repoDir,
+				RepoRelDir:  job.Project.Path,
+				ProjectName: job.Project.ProjectName,
+				Workspace:   job.Workspace,
+			})
+		}
+	} else {
+		plans, err = p.PendingPlanFinder.Find(pullDir)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// use the default repository workspace because it is the only one guaranteed to have an atlantis.yaml,

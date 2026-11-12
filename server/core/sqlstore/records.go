@@ -41,20 +41,50 @@ type project struct {
 }
 
 type job struct {
-	Kind                 models.JobKind
-	ID                   string `gorm:"primaryKey"`
-	Owner                string
-	RepositoryID, PullID string
-	ProjectID            *string
-	Command, SubCommand  string
-	Arguments            []string `gorm:"serializer:json"`
-	Steps, Issuer        string
-	IssuerTeams          []string `gorm:"serializer:json"`
-	Trigger, Revision    string
-	State, Error         string
-	Private              bool
-	StartedAt            time.Time
-	FinishedAt           *time.Time
+	ToolDistribution, ToolVersion string
+	MutationStarted               bool
+	Kind                          models.JobKind
+	ManagedPlan                   bool
+	ID                            string `gorm:"primaryKey"`
+	Owner                         string
+	RepositoryID, PullID          string
+	ProjectID                     *string
+	Command, SubCommand           string
+	Arguments                     []string `gorm:"serializer:json"`
+	Steps, Issuer                 string
+	IssuerTeams                   []string `gorm:"serializer:json"`
+	Trigger, Revision             string
+	State, Error                  string
+	Private                       bool
+	StartedAt                     time.Time
+	FinishedAt                    *time.Time
+}
+
+// planBinding records the producer a consumer selected at admission.
+type planBinding struct {
+	JobID     string `gorm:"primaryKey"`
+	PlanJobID string
+	ProjectID string
+	PullID    string
+}
+
+// boundPlan returns the producer bound to a consumer job, or "" when it has none.
+func boundPlan(tx *gorm.DB, jobID string) (string, error) {
+	var ids []string
+	if err := tx.Model(&planBinding{}).Where("job_id = ?", jobID).Pluck("plan_job_id", &ids).Error; err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", nil
+	}
+	return ids[0], nil
+}
+
+type pendingPlan struct {
+	ProjectID string `gorm:"primaryKey;autoIncrement:false"`
+	PullID    string `gorm:"primaryKey;autoIncrement:false"`
+	JobID     string
+	Ready     bool
 }
 
 func repoIDs(tx *gorm.DB, repo models.Repo) *gorm.DB {

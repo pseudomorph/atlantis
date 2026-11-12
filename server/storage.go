@@ -4,6 +4,11 @@
 package server
 
 import (
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events"
@@ -14,22 +19,45 @@ import (
 )
 
 type storageRuntime struct {
-	Store     *sqlstore.Store
-	Claims    db.ExecutionStore
-	Execution *events.ExecutionCoordinator
-	Jobs      *jobs.Service
+	Store         *sqlstore.Store
+	Claims        db.ExecutionStore
+	Execution     *events.ExecutionCoordinator
+	Artifacts     *artifacts.Service
+	Jobs          *jobs.Service
+	planArtifacts time.Duration
 }
 
-func newStorageRuntime(store *sqlstore.Store) (*storageRuntime, error) {
-	// Claims left active by the previous server may still have running Terraform children.
-	if err := store.MarkPreviousExecutionsUncertain(); err != nil {
+func newStorageRuntime(store *sqlstore.Store, config UserConfig) (*storageRuntime, error) {
+	planArtifacts, err := config.Storage.PlanArtifactRetention()
+	if err != nil {
 		return nil, err
 	}
+	var blobs artifacts.SnapshotBackend
+	switch config.Storage.Artifacts.Type {
+	case "", "database":
+		blobs = sqlstore.BlobStore{Store: store}
+	case "filesystem":
+		raw, err := artifacts.NewFilesystem(config.Storage.ArtifactDirectory(config.DataDir))
+		if err != nil {
+			return nil, fmt.Errorf("opening artifact storage: %w", err)
+		}
+		blobs = artifacts.ObjectSnapshots{Store: raw}
+	default:
+		return nil, fmt.Errorf("unsupported artifact storage type %q", config.Storage.Artifacts.Type)
+	}
+	// Claims left active by the previous server may still have running Terraform children.
+	if err := store.MarkPreviousExecutionsUncertain(); err != nil {
+		_ = blobs.Close()
+		return nil, err
+	}
+	files := &artifacts.Service{Records: store, Blobs: blobs, WorkflowFiles: slices.Clone(config.Storage.WorkflowFiles)}
 	return &storageRuntime{
-		Store:     store,
-		Claims:    store,
-		Execution: &events.ExecutionCoordinator{Store: store},
-		Jobs:      &jobs.Service{Store: store},
+		Store:         store,
+		Claims:        store,
+		Execution:     &events.ExecutionCoordinator{Store: store},
+		Artifacts:     files,
+		Jobs:          &jobs.Service{Store: store},
+		planArtifacts: planArtifacts,
 	}, nil
 }
 
@@ -73,6 +101,14 @@ func (s *storageRuntime) Maintain(worker *events.PullClosedExecutor, logger logg
 			if err := worker.CleanUpPull(logger, pull.BaseRepo, pull); err != nil {
 				logger.Err("deferred cleanup: %v", err)
 			}
+		}
+		now, err := s.Store.Now()
+		if err != nil {
+			logger.Err("reading retention clock: %v", err)
+			return
+		}
+		if err := s.Artifacts.Collect(now, s.planArtifacts); err != nil {
+			logger.Err("collecting expired artifacts: %v", err)
 		}
 	}
 }

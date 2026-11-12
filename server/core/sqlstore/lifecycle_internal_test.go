@@ -59,11 +59,25 @@ func TestLifecycleVerificationStopsQueuedProjectsWithoutLosingOwnership(t *testi
 	Ok(t, s.ReleaseClaim(p))
 }
 
+func readyLifecyclePlan(t *testing.T, s *Store, p models.PullRequest) models.Job {
+	t.Helper()
+	plan := claimJob(p, uuid.NewString())
+	plan.Revision = p.HeadCommit
+	Ok(t, s.StartJob(plan))
+	Ok(t, s.StartPlan(plan.ID))
+	snapshot := validSnapshot(plan.ID)
+	Ok(t, s.BeginSnapshot(snapshot))
+	Ok(t, s.CommitSnapshot(snapshot))
+	Ok(t, s.FinishJob(plan.ID, "succeeded", ""))
+	return plan
+}
+
 func TestPendingLifecycleVerificationBlocksJobAdmission(t *testing.T) {
 	s := conformanceStore(t)
 	p := claimPull()
 	p.Execution = &models.Execution{Owner: "owner"}
 	Ok(t, s.AcquireClaim(p, "owner"))
+	plan := readyLifecyclePlan(t, s, p)
 	queued := claimJob(p, uuid.NewString())
 	queued.Command = "apply"
 	Ok(t, s.QueueLifecycleCheck(p))
@@ -71,6 +85,10 @@ func TestPendingLifecycleVerificationBlocksJobAdmission(t *testing.T) {
 	recorded, err := s.Job(queued.ID)
 	Ok(t, err)
 	Assert(t, recorded == nil, "rejected job was persisted")
+	pending, err := s.PendingPlans(p.BaseRepo, p.Num)
+	Ok(t, err)
+	Equals(t, 1, len(pending))
+	Equals(t, plan.ID, pending[0].ID)
 	Ok(t, s.CheckClaim(p))
 	checks, err := s.PendingLifecycleChecks()
 	Ok(t, err)
@@ -80,6 +98,7 @@ func TestPendingLifecycleVerificationBlocksJobAdmission(t *testing.T) {
 	recorded, err = s.Job(queued.ID)
 	Ok(t, err)
 	Equals(t, "running", recorded.State)
+	Equals(t, plan.ID, recorded.PlanJobID)
 	Ok(t, s.FinishJob(queued.ID, "succeeded", ""))
 	Ok(t, s.ReleaseClaim(p))
 }
@@ -90,6 +109,7 @@ func TestPendingLifecycleVerificationLetsAdmittedJobFinish(t *testing.T) {
 	p.Execution = &models.Execution{Owner: "owner"}
 	p.BaseRepo.Execution = p.Execution
 	Ok(t, s.AcquireClaim(p, "owner"))
+	readyLifecyclePlan(t, s, p)
 	active := claimJob(p, uuid.NewString())
 	active.Command = "apply"
 	Ok(t, s.StartJob(active))
@@ -99,6 +119,7 @@ func TestPendingLifecycleVerificationLetsAdmittedJobFinish(t *testing.T) {
 	Ok(t, s.QueueLifecycleCheck(p))
 	Ok(t, s.CheckClaim(p))
 	Assert(t, s.ReleaseClaim(p) != nil, "unfinished job released ownership")
+	Ok(t, s.MarkJobMutating(active.ID))
 	Ok(t, s.FinishJob(active.ID, "succeeded", ""))
 	recorded, err := s.Job(active.ID)
 	Ok(t, err)
