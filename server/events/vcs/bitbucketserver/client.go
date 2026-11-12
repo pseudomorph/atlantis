@@ -224,6 +224,14 @@ func (b *Client) GetPullRequestIdentity(logger logging.SimpleLogging, repo model
 	}
 	pull.HeadCommit = *pullResp.FromRef.LatestCommit
 	pull.BaseBranch = *pullResp.ToRef.DisplayID
+	switch strings.ToUpper(*pullResp.State) {
+	case "OPEN":
+		pull.State = models.OpenPullState
+	case "MERGED", "DECLINED", "SUPERSEDED":
+		pull.State = models.ClosedPullState
+	default:
+		return models.PullRequest{}, fmt.Errorf("unsupported pull request state %q", *pullResp.State)
+	}
 	return pull, nil
 }
 

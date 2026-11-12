@@ -86,7 +86,8 @@ type WorkingDir interface {
 
 // FileWorkspace implements WorkingDir with the file system.
 type FileWorkspace struct {
-	DataDir string
+	InstanceScoped bool
+	DataDir        string
 	// LocalSharePlanDir is the root directory for local Terraform plan files.
 	// If empty, DataDir is used for backward compatibility.
 	LocalSharePlanDir string
@@ -1000,7 +1001,11 @@ func removeAllSubPath(baseDir, targetDir string) error {
 }
 
 func (w *FileWorkspace) repoPullDir(r models.Repo, p models.PullRequest) (string, error) {
-	dir := filepath.Join(w.DataDir, workingDirPrefix, r.FullName, strconv.Itoa(p.Num))
+	root := filepath.Join(w.DataDir, workingDirPrefix)
+	if w.InstanceScoped {
+		root = filepath.Join(root, r.StorageIdentity().Directory())
+	}
+	dir := filepath.Join(root, r.FullName, strconv.Itoa(p.Num))
 	if err := utils.EnsureSubPath(filepath.Join(w.DataDir, workingDirPrefix), dir); err != nil {
 		return "", fmt.Errorf("repo path traversal detected: %w", err)
 	}
@@ -1015,6 +1020,9 @@ func (w *FileWorkspace) localSharePlanDir() string {
 }
 
 func (w *FileWorkspace) planPullDir(r models.Repo, p models.PullRequest) (string, error) {
+	if w.InstanceScoped {
+		return w.repoPullDir(r, p)
+	}
 	dir := runtime.GetPlanPullDir(w.localSharePlanDir(), r, p)
 	if err := utils.EnsureSubPath(filepath.Join(w.localSharePlanDir(), workingDirPrefix), dir); err != nil {
 		return "", fmt.Errorf("plan path traversal detected: %w", err)
