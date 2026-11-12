@@ -56,6 +56,15 @@ func (p *Service) Load(ctx command.ProjectContext, filename string) error {
 		if !verifiedPlan {
 			return fmt.Errorf("expected plan checksum requires a plan artifact")
 		}
+		if ctx.RestoredDataDirectory != "" {
+			selected := records[:0]
+			for _, artifact := range records {
+				if artifact.Kind == "plan" || artifact.Kind == "show" {
+					selected = append(selected, artifact)
+				}
+			}
+			records = selected
+		}
 		return p.restoreArtifacts(plan, records, filename, filepath.Join(filepath.Dir(filename), ctx.GetShowResultFileName()), root, root)
 	}
 	return fmt.Errorf("pending plan was invalidated or replaced; run plan again")
@@ -70,7 +79,7 @@ func (p *Service) restoreJob(job models.Job, planPath, showPath, root string) er
 func (p *Service) restoreArtifacts(job models.Job, records []models.Artifact, planPath, showPath, root, workflowRoot string) error {
 	havePlan, haveShow := false, false
 	for _, a := range records {
-		if a.Kind == "workflow" || a.Kind == "lockfile" {
+		if a.Kind == "workflow" || a.Kind == "lockfile" || a.Kind == "backend" || a.Kind == "workspace" {
 			if !filepath.IsLocal(a.RelativePath) {
 				return fmt.Errorf("invalid workflow artifact destination")
 			}

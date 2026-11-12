@@ -42,6 +42,7 @@ type project struct {
 }
 
 type job struct {
+	ToolDistribution, ToolVersion   string
 	MutationStarted                 bool
 	Kind                            models.JobKind
 	ManagedPlan                     bool

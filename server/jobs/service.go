@@ -129,7 +129,14 @@ func jobFromContext(ctx command.ProjectContext) models.Job {
 	} else if ctx.Trigger == command.AutoTrigger {
 		trigger = "automatic"
 	}
-	return models.Job{Kind: models.CommandJob, ManagedPlan: ctx.RequiresAtlantisManagedPlanFile, ID: ctx.JobID, Owner: ctx.Pull.ExecutionOwner(), Pull: ctx.Pull, Project: models.NewProject(ctx.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), Workspace: ctx.Workspace,
+	tool, toolVersion := "", ""
+	if ctx.TerraformDistribution != nil {
+		tool = *ctx.TerraformDistribution
+	}
+	if ctx.TerraformVersion != nil {
+		toolVersion = ctx.TerraformVersion.String()
+	}
+	return models.Job{ToolDistribution: tool, ToolVersion: toolVersion, Kind: models.CommandJob, ManagedPlan: ctx.RequiresAtlantisManagedPlanFile, ID: ctx.JobID, Owner: ctx.Pull.ExecutionOwner(), Pull: ctx.Pull, Project: models.NewProject(ctx.BaseRepo.FullName, ctx.RepoRelDir, ctx.ProjectName), Workspace: ctx.Workspace,
 		Command: ctx.CommandName.String(), SubCommand: ctx.SubCommand, Arguments: ctx.CommentArgs, Issuer: ctx.User, Trigger: trigger,
 		Revision: ctx.Pull.HeadCommit, State: "running", Private: ctx.SuppressJobOutput}
 }

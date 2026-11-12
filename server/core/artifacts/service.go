@@ -46,7 +46,7 @@ func artifactName(j models.Job, kind string) string {
 	if name == "" {
 		name = j.Workspace
 	}
-	extension := map[string]string{"plan": "tfplan", "show": "json", "log": "log", "lockfile": "lock.hcl"}[kind]
+	extension := map[string]string{"plan": "tfplan", "show": "json", "log": "log", "lockfile": "lock.hcl", "backend": "backend.json", "runtime": "runtime.json", "workspace": "workspace"}[kind]
 	return component(name) + "." + extension
 }
 

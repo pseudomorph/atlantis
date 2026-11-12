@@ -13,26 +13,28 @@ const (
 )
 
 type Job struct {
-	Kind        JobKind
-	ManagedPlan bool
-	ID          string
-	Owner       string `json:"-"`
-	Pull        PullRequest
-	Project     Project
-	Workspace   string
-	Command     string
-	SubCommand  string
-	Arguments   []string
-	Steps       string
-	Issuer      User
-	Trigger     string
-	Revision    string
-	PlanJobID   string
-	State       string
-	Error       string
-	Private     bool
-	StartedAt   time.Time
-	FinishedAt  *time.Time
+	ToolDistribution string
+	ToolVersion      string
+	Kind             JobKind
+	ManagedPlan      bool
+	ID               string
+	Owner            string `json:"-"`
+	Pull             PullRequest
+	Project          Project
+	Workspace        string
+	Command          string
+	SubCommand       string
+	Arguments        []string
+	Steps            string
+	Issuer           User
+	Trigger          string
+	Revision         string
+	PlanJobID        string
+	State            string
+	Error            string
+	Private          bool
+	StartedAt        time.Time
+	FinishedAt       *time.Time
 }
 
 type Artifact struct {
