@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 )
 
 // StorageConfig is the structured storage section of the server config file.
@@ -57,8 +59,19 @@ func (c StorageDatabaseConfig) ConnectionString() (string, error) {
 
 // StorageArtifactsConfig selects where artifact bytes are stored.
 type StorageArtifactsConfig struct {
-	Type      string `mapstructure:"type"`
-	Directory string `mapstructure:"directory"`
+	Type      string          `mapstructure:"type"`
+	Directory string          `mapstructure:"directory"`
+	S3        StorageS3Config `mapstructure:"s3"`
+}
+
+// StorageS3Config configures S3-compatible artifact storage.
+type StorageS3Config struct {
+	Bucket         string `mapstructure:"bucket"`
+	Region         string `mapstructure:"region"`
+	Prefix         string `mapstructure:"prefix"`
+	Endpoint       string `mapstructure:"endpoint"`
+	ForcePathStyle bool   `mapstructure:"force_path_style"`
+	Profile        string `mapstructure:"profile"`
 }
 
 // StorageRetentionConfig sets how long finished artifacts are kept.
@@ -91,12 +104,25 @@ func (c StorageConfig) Validate() error {
 	}
 	switch c.Artifacts.Type {
 	case "", "database":
-		if c.Artifacts.Directory != "" {
-			return fmt.Errorf("storage.artifacts: database does not accept a directory")
+		if c.Artifacts.Directory != "" || c.Artifacts.S3 != (StorageS3Config{}) {
+			return fmt.Errorf("storage.artifacts: database does not accept directory or s3 settings")
 		}
 	case "filesystem":
+		if c.Artifacts.S3 != (StorageS3Config{}) {
+			return fmt.Errorf("storage.artifacts: filesystem does not accept s3 settings")
+		}
+	case "s3":
+		if c.Artifacts.Directory != "" {
+			return fmt.Errorf("storage.artifacts: s3 does not accept directory")
+		}
+		if c.Artifacts.S3.Bucket == "" || c.Artifacts.S3.Region == "" {
+			return fmt.Errorf("storage.artifacts.s3 requires bucket and region")
+		}
+		if prefix := strings.TrimSuffix(c.Artifacts.S3.Prefix, "/"); prefix != "" && !artifacts.ValidKey(prefix) {
+			return fmt.Errorf("storage.artifacts.s3.prefix must be a relative object key prefix")
+		}
 	default:
-		return fmt.Errorf("storage.artifacts.type must be database or filesystem")
+		return fmt.Errorf("storage.artifacts.type must be database, filesystem, or s3")
 	}
 	_, _, err := c.Durations()
 	return err
@@ -127,4 +153,10 @@ func (c StorageConfig) ArtifactDirectory(dataDir string) string {
 		return c.Artifacts.Directory
 	}
 	return filepath.Join(dataDir, "artifacts")
+}
+
+// S3UploadDirectory returns the private directory under dataDir that stages
+// S3 uploads.
+func (c StorageConfig) S3UploadDirectory(dataDir string) string {
+	return filepath.Join(dataDir, "s3-uploads")
 }

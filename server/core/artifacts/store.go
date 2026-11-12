@@ -11,7 +11,7 @@ type Metadata struct {
 }
 
 // Store uses opaque relative keys confined to a backend root.
-// Filesystem implements byte transport; database snapshots use a typed foreign key.
+// Filesystem and S3 implement byte transport; database snapshots use a typed foreign key.
 type Store interface {
 	Close() error
 	List() ([]Object, error)
