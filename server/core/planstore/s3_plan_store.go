@@ -17,32 +17,16 @@ import (
 	securejoin "github.com/cyphar/filepath-securejoin"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/runatlantis/atlantis/server/core/artifacts"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
 	"github.com/runatlantis/atlantis/server/utils"
 )
 
-// S3Client is the subset of the S3 API used by S3PlanStore, extracted for testability.
-type S3Client interface {
-	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
-	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
-	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
-	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
-	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-}
-
-// S3PlanStoreConfig holds configuration for connecting to S3.
-type S3PlanStoreConfig struct {
-	Bucket         string
-	Region         string
-	Prefix         string
-	Endpoint       string
-	ForcePathStyle bool
-	Profile        string
-}
+type S3Client = artifacts.S3Client
+type S3PlanStoreConfig = artifacts.S3Config
 
 // S3PlanStore implements PlanStore by persisting plan files to S3.
 type S3PlanStore struct {
@@ -54,43 +38,10 @@ type S3PlanStore struct {
 
 // NewS3PlanStore creates an S3PlanStore using the AWS SDK default credential chain.
 func NewS3PlanStore(cfg S3PlanStoreConfig, logger logging.SimpleLogging) (*S3PlanStore, error) {
-	var opts []func(*awsconfig.LoadOptions) error
-	opts = append(opts, awsconfig.WithRegion(cfg.Region))
-
-	if cfg.Profile != "" {
-		opts = append(opts, awsconfig.WithSharedConfigProfile(cfg.Profile))
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
+	client, err := artifacts.NewS3Client(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("loading AWS config: %w", err)
+		return nil, fmt.Errorf("S3 plan store: %w", err)
 	}
-
-	var s3Opts []func(*s3.Options)
-	if cfg.Endpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
-			if cfg.ForcePathStyle {
-				o.UsePathStyle = true
-			}
-		})
-	} else if cfg.ForcePathStyle {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.UsePathStyle = true
-		})
-	}
-
-	client := s3.NewFromConfig(awsCfg, s3Opts...)
-
-	if _, err := client.HeadBucket(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(cfg.Bucket),
-	}); err != nil {
-		return nil, fmt.Errorf("validating S3 plan store bucket %q: %w", cfg.Bucket, err)
-	}
-
 	return NewS3PlanStoreWithClient(client, cfg.Bucket, cfg.Prefix, logger), nil
 }
 
