@@ -126,6 +126,12 @@ func (s *Store) ReleaseClaim(p models.PullRequest) error {
 		if running != 0 {
 			return fmt.Errorf("execution still has unfinished jobs")
 		}
+		// Non-PR inputs belong to one invocation and are invalidated on release.
+		if p.Num < 0 {
+			if err := tx.Where("pull_id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&pendingPlan{}).Error; err != nil {
+				return err
+			}
+		}
 		result := tx.Where("owner = ? AND state = ? AND pull_id IN (?)", p.ExecutionOwner(), "active", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&executionClaim{})
 		if result.Error != nil {
 			return result.Error
@@ -172,7 +178,10 @@ func (s *Store) ClosePull(p models.PullRequest) error {
 		if err != nil {
 			return err
 		}
-		return tx.Model(&pull{}).Where("id = ?", row.ID).Updates(map[string]any{"closed": true, "cancelled": true, "reopen_requested": false, "closed_at": gorm.Expr("COALESCE(closed_at, ?)", now), "closure_generation": gorm.Expr("CASE WHEN closed THEN closure_generation ELSE closure_generation + 1 END"), "cleanup_complete": gorm.Expr("CASE WHEN closed THEN cleanup_complete ELSE ? END", false)}).Error
+		if err = tx.Model(&pull{}).Where("id = ?", row.ID).Updates(map[string]any{"closed": true, "cancelled": true, "reopen_requested": false, "closed_at": gorm.Expr("COALESCE(closed_at, ?)", now), "closure_generation": gorm.Expr("CASE WHEN closed THEN closure_generation ELSE closure_generation + 1 END"), "cleanup_complete": gorm.Expr("CASE WHEN closed THEN cleanup_complete ELSE ? END", false)}).Error; err != nil {
+			return err
+		}
+		return tx.Where("pull_id = ?", row.ID).Delete(&pendingPlan{}).Error
 	})
 }
 

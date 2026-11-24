@@ -36,5 +36,7 @@ type JobReader interface {
 type JobStore interface {
 	JobReader
 	StartJob(models.Job) error
+	StartPlan(string) error
+	MarkJobMutating(string) error
 	FinishJob(id, state, message string) error
 }
