@@ -7,7 +7,10 @@ import "time"
 
 type JobKind string
 
-const CommandJob JobKind = "command"
+const (
+	CommandJob      JobKind = "command"
+	WorkflowHookJob JobKind = "workflow_hook"
+)
 
 type Job struct {
 	ToolDistribution string
