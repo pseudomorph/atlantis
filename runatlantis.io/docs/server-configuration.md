@@ -59,12 +59,44 @@ storage:
     plan_artifacts: 0s
 ```
 
-`storage.database.type` currently accepts only `sqlite`, stored in `atlantis.sqlite`
-under `data-dir`. Keep `data-dir` on persistent storage: losing it loses locks,
-PR status, job history, job logs, execution claims, pending plans, and the metadata that
-locates artifacts in any backend. Run one Atlantis 64-bit process on local or
-block-backed storage; network filesystems such as NFS/EFS are unsupported.
-PostgreSQL and shared operation are deferred.
+`storage.database.type` accepts `sqlite` or `postgres`. Both require a 64-bit
+server, and both allow exactly one Atlantis process per database.
+
+With `sqlite`, the database is `atlantis.sqlite` under `data-dir`. Keep `data-dir`
+on persistent storage: losing it loses locks, PR status, job history, job logs,
+execution claims, pending plans, and the metadata that locates artifacts in any
+backend. Run Atlantis on local or block-backed storage; network filesystems such
+as NFS/EFS are unsupported.
+
+With `postgres`, the database holds those records instead, and `data-dir` holds
+working directories and, with filesystem artifacts, the artifact directory. The
+connection string is never written in the config file. Set exactly one of:
+
+- `connection_string_env`: the name of an environment variable that holds the
+  connection string.
+- `connection_string_file`: the path of a file whose contents are the
+  connection string, for example a mounted Kubernetes secret. Surrounding
+  whitespace is ignored.
+
+```yaml
+storage:
+  database:
+    type: postgres
+    connection_string_env: ATLANTIS_STORAGE_DATABASE_URL
+```
+
+```bash
+ATLANTIS_STORAGE_DATABASE_URL="postgres://atlantis:<password>@db.example:5432/atlantis?sslmode=verify-full"
+```
+
+The connection string uses the libpq URL or keyword/value format. Its
+`search_path` selects the schema, which must already exist; the default is
+`public`. Atlantis runs its migrations in that schema at startup, so the role
+needs permission to create tables there. At startup Atlantis takes a
+session-level PostgreSQL advisory lock for the schema and holds it on a
+dedicated connection. A second server against the same schema fails to start
+with an `already in use by another server` error. Multiple instances and
+high availability are unsupported.
 
 `storage.artifacts.type` accepts `database` (the default) or `filesystem`.
 Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`; the

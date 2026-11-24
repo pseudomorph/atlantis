@@ -562,7 +562,7 @@ func NewServer(userConfig UserConfig, config Config) (*Server, error) {
 	case "durable":
 		logger.Warn("using experimental durable storage")
 		var store *sqlstore.Store
-		store, err = sqlstore.OpenServer(userConfig.DataDir)
+		store, err = openDurableStore(userConfig.Storage.Database, userConfig.DataDir)
 		if err != nil {
 			return nil, err
 		}

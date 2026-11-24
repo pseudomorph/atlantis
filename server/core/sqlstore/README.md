@@ -1,18 +1,29 @@
 # Relational storage
 
-The SQLite implementation runs embedded Goose SQL migrations. GORM does not
-create or alter the schema. Migrations can transform data with statements such
-as `INSERT INTO ... SELECT ...`; Goose runs each transactionally unless it opts out.
+The store runs on SQLite (`OpenServer`) or PostgreSQL (`OpenPostgresServer`).
+Both run the same embedded Goose SQL migrations, through Goose's `sqlite3` and
+`postgres` dialects. GORM does not create or alter the schema. Migrations can
+transform data with statements such as `INSERT INTO ... SELECT ...`; Goose runs
+each transactionally unless it opts out.
 
-Keep schema definitions portable for a future PostgreSQL backend: UUIDs use
-`TEXT`, counters use `BIGINT`, binary payloads use `BYTEA`, and booleans use
-`TRUE`/`FALSE`. SQLite accepts these declarations without `STRICT` tables.
-Store timestamps in UTC, normalized to microseconds. Storage-generated timestamps
-and production retention cutoffs use `databaseNow`; explicitly supplied event
+Schema definitions are portable between the two: UUIDs use `TEXT`, counters use
+`BIGINT`, binary payloads use `BYTEA`, booleans use `TRUE`/`FALSE`, and
+timestamps use `TIMESTAMP` without a time zone. SQLite accepts these
+declarations without `STRICT` tables. Store timestamps in UTC, normalized to
+microseconds with `databaseTime`; pgx writes a `TIMESTAMP` from a value's wall
+clock, so a non-UTC value would shift its instant. Storage-generated timestamps
+and production retention cutoffs use `databaseNow`, which reads SQLite's
+`strftime('now')` or PostgreSQL's `clock_timestamp()`; explicitly supplied event
 timestamps retain their instant. SQLite's clock has millisecond resolution.
 
 `OpenServer` holds a process lock before opening or migrating SQLite. Run one
 server on local or block-backed storage; network filesystems are unsupported.
+`OpenPostgresServer` takes a session-level advisory lock, keyed by the schema
+in `search_path`, on a dedicated pgx connection before migrating, and holds it
+until `Close`. A second server against the same schema fails to start. The
+advisory lock ends with its session, so `VerifyServerLock` pings that session
+on each heartbeat; once it fails, the store refuses new claims and heartbeat
+refreshes, and its claims expire into stopped-work recovery.
 The store holds project locks, global command locks, pull request status, jobs,
 execution claims, pending plans, plan snapshot metadata and job log journals.
 
@@ -37,11 +48,23 @@ that a sweep or recovery changed. `ExpireClaims` locks each candidate claim,
 rechecks its heartbeat against `ClaimExpiry` in Go, marks it uncertain and seals
 its owner's open logs as interrupted. Recovery treats an active claim with an
 expired heartbeat as uncertain. Expiry never transfers a claim. Heartbeat
-comparisons use database time read by `databaseNow`. With SQLite, startup marks
-claims from every earlier instance uncertain without waiting for expiry.
+comparisons use database time read by `databaseNow`. Because the server lock
+proves earlier servers exited or lost their lock, startup marks claims from
+every earlier instance uncertain without waiting for expiry.
 
-Run storage tests with `go test -race ./server/core/sqlstore`. PostgreSQL and
-multi-server execution are separate follow-up work.
+Run storage tests with `go test -race ./server/core/sqlstore`. They run on
+SQLite, and on PostgreSQL too when `ATLANTIS_TEST_POSTGRES_DSN` holds a
+connection string; each PostgreSQL test creates and drops its own schema.
+`ForEachDatabase` runs a test on both. Locally:
+
+```bash
+docker run -d --name atlantis-pg -e POSTGRES_PASSWORD=atlantis -e POSTGRES_DB=atlantis -p 55432:5432 postgres:17
+ATLANTIS_TEST_POSTGRES_DSN='postgres://postgres:atlantis@localhost:55432/atlantis?sslmode=disable' go test -race ./server/core/sqlstore
+```
+
+Set `ATLANTIS_TEST_DURABLE_DATABASE=postgres` as well to run the durable
+end-to-end tests in `server/controllers/events` on PostgreSQL. Multi-server
+execution is separate follow-up work.
 
 Each schema change adds a new numbered file under `migrations/`, and released
 migrations are never edited. An existing database upgrades by applying the newer
@@ -50,13 +73,16 @@ existing table adds columns with defaults, puts new checks on the added columns,
 or adds a table keyed by the parent row.
 
 SQLite serializes writers with `_txlock=immediate` and one connection, but
-correctness does not depend on that. A transaction that reads pull-scoped state
+correctness does not depend on that. PostgreSQL runs transactions concurrently
+under `READ COMMITTED`. A transaction that reads pull-scoped state
 and writes based on it first locks the governing `pulls` row with `lockPull`
 (then the execution claim, when it has one). Every claim, job, lock, status and
 lifecycle row belongs to a pull, so the lock also fences inserts that a
 missing-row check cannot. Other writes are single conditional `UPDATE` or
 `DELETE` statements whose affected row count is checked. The SQLite dialector
-omits `FOR UPDATE`; a backend with row locks under `READ COMMITTED` must honor it.
+omits `FOR UPDATE`; the PostgreSQL dialector emits `FOR UPDATE` and `FOR SHARE`
+(`TestRowLockEmittedByPostgres`), and `concurrency_internal_test.go` races
+release against admission and checks that a lock waiter sees the committed state.
 
 Log reads follow the same rule. `ReadLogJournal` locks the `job_logs` row
 before it reads `job_log_chunks`, and appends, archive handoff and retention lock

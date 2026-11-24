@@ -21,6 +21,7 @@ import (
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/db/mocks"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
+	"github.com/runatlantis/atlantis/server/core/sqlstore/sqlstoretest"
 	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -193,6 +194,31 @@ func TestDurableStorageStartupBlocksPreviousExecution(t *testing.T) {
 	pull.Num++
 	Ok(t, store.AcquireClaim(pull, "unrelated"))
 	Assert(t, s.Drainer != nil, "server did not wire execution draining")
+}
+
+// With PostgreSQL the advisory lock taken at startup plays the role of the
+// SQLite file lock: a previous server's claims become uncertain, and a second
+// server against the same schema fails to start.
+func TestDurableStorageStartupOnPostgres(t *testing.T) {
+	dsn := sqlstoretest.PostgresDSN(t)
+	previous, err := sqlstore.OpenPostgresServer(dsn, t.TempDir())
+	Ok(t, err)
+	pull := models.PullRequest{Num: 1, BaseRepo: models.Repo{FullName: "owner/repo"}, Execution: &models.Execution{Owner: "previous-owner"}}
+	Ok(t, previous.AcquireClaim(pull, pull.ExecutionOwner()))
+	Ok(t, previous.Close())
+	t.Setenv("ATLANTIS_TEST_STORAGE_DSN", dsn)
+	config := func() UserConfig {
+		return UserConfig{Experiments: []string{"durable-storage"}, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "postgres", ConnectionStringEnv: "ATLANTIS_TEST_STORAGE_DSN"}}, DataDir: t.TempDir(),
+			AllowCommands: "plan,apply", AtlantisURL: "http://example.com", GithubHostname: "github.com", GithubUser: "user"}
+	}
+	s, err := NewServer(config(), Config{AtlantisVersion: "test"})
+	Ok(t, err)
+	t.Cleanup(func() { Ok(t, s.closeDatabase(time.Second)); Ok(t, s.StatsCloser.Close()) })
+	store := s.database.(*sqlstore.Store)
+	Assert(t, store.CheckClaim(pull) != nil, "startup accepted a previous execution owner")
+	Assert(t, store.AcquireClaim(pull, "replacement") != nil, "startup silently took over unfinished work")
+	_, err = NewServer(config(), Config{AtlantisVersion: "test"})
+	ErrContains(t, "already in use by another server", err)
 }
 
 func TestDurableRecoveryRouteUsesProductionGate(t *testing.T) {
