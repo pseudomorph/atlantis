@@ -1527,6 +1527,9 @@ func TestDurableStorageExperiments(t *testing.T) {
 		{name: "explicit legacy default", config: "experiments: [durable-storage]\nlocking-db-type: boltdb\nstorage: {database: {type: sqlite}}", err: "storage cannot be combined"},
 
 		{name: "yaml", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite}}", want: []string{"durable-storage"}},
+		{name: "s3 artifacts", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite}, artifacts: {type: s3, s3: {bucket: atlantis, region: us-east-1, prefix: team/, endpoint: 'http://minio:9000', force_path_style: true, profile: artifacts}}}", want: []string{"durable-storage"}},
+		{name: "unknown s3 key", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite}, artifacts: {type: s3, s3: {bucket: atlantis, region: us-east-1, buckt: x}}}", err: "invalid storage configuration"},
+		{name: "s3 requires bucket", config: "experiments: [durable-storage]\nstorage: {database: {type: sqlite}, artifacts: {type: s3, s3: {region: us-east-1}}}", err: "storage.artifacts.s3 requires bucket and region"},
 		{name: "environment", env: "durable-storage", want: []string{"durable-storage"}},
 		{name: "environment list", env: "durable-storage,durable-storage", want: []string{"durable-storage", "durable-storage"}},
 		{name: "coexists with upstream experiments", args: []string{"--experiments=durable-storage,api,drift-detection", "--api-secret=token", "--enable-drift-detection"}, want: []string{"durable-storage", "api", "drift-detection"}},
@@ -1566,6 +1569,9 @@ func TestDurableStorageExperiments(t *testing.T) {
 			}
 			Ok(t, err)
 			Equals(t, strings.Join(tc.want, ","), strings.Join(passedConfig.Experiments, ","))
+			if tc.name == "s3 artifacts" {
+				Equals(t, server.StorageS3Config{Bucket: "atlantis", Region: "us-east-1", Prefix: "team/", Endpoint: "http://minio:9000", ForcePathStyle: true, Profile: "artifacts"}, passedConfig.Storage.Artifacts.S3)
+			}
 			if !strings.Contains(tc.config, "sqlite") && !strings.Contains(strings.Join(tc.args, " "), "sqlite") && !strings.Contains(strings.Join(tc.args, " "), "--locking-db-type") {
 				Equals(t, "boltdb", passedConfig.LockingDBType)
 			}

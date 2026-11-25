@@ -321,3 +321,26 @@ func TestStorageHeartbeatContinuesWhileDraining(t *testing.T) {
 	Equals(t, int32(1), calls.Load())
 	s.Drainer.OpDone()
 }
+
+func TestDurableStorageRejectsLegacyExternalPlanStore(t *testing.T) {
+	_, err := NewServer(UserConfig{Experiments: []string{"durable-storage"}, Storage: &StorageConfig{Database: StorageDatabaseConfig{Type: "sqlite"}}, DataDir: t.TempDir(),
+		RepoConfigJSON: `{"repos":[{"id":"/.*/"}],"external_stores":{"plan_store":{"type":"s3","s3":{"bucket":"plans","region":"us-east-1"}}}}`,
+		AllowCommands:  "plan,apply", AtlantisURL: "http://example.com", GithubHostname: "github.com", GithubUser: "user"}, Config{AtlantisVersion: "test"})
+	ErrContains(t, "storage cannot be combined with external_stores.plan_store", err)
+}
+
+func TestExternalStoresLogsDeprecationWarning(t *testing.T) {
+	// The structured logger writes to stderr, which it resolves when it is built.
+	captured, err := os.CreateTemp(t.TempDir(), "stderr")
+	Ok(t, err)
+	stderr := os.Stderr
+	os.Stderr = captured
+	_, err = NewServer(UserConfig{DataDir: t.TempDir(), EnableExternalStores: true, AllowCommands: "plan,apply", AtlantisURL: "http://example.com", GithubHostname: "github.com", GithubUser: "user"}, Config{AtlantisVersion: "test"})
+	os.Stderr = stderr
+	// No plan store is configured, so startup stops after the warning.
+	ErrContains(t, "no external_stores.plan_store.type is configured", err)
+	Ok(t, captured.Close())
+	logged, err := os.ReadFile(captured.Name())
+	Ok(t, err)
+	Assert(t, strings.Contains(string(logged), externalStoresDeprecationWarning), "warning was not logged: %s", logged)
+}

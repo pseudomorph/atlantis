@@ -9,12 +9,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/artifacts/artifactstest"
 	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/logs"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
@@ -338,4 +340,76 @@ func TestCollectRemovesStaleArchiveWriteTemporaries(t *testing.T) {
 		_, err = os.Stat(filepath.Join(root, filepath.FromSlash(key)))
 		Ok(t, err)
 	}
+}
+
+// An S3 archive serves reads after the handoff with ranged GetObject calls at
+// the same byte offsets the journal used, and never downloads earlier bytes.
+func TestS3ArchiveHandoffUsesRangedReads(t *testing.T) {
+	store, journal, job := setup(t)
+	fake := artifactstest.New("artifacts")
+	archive, err := artifacts.NewS3(fake, fake.Bucket, "atlantis", filepath.Join(t.TempDir(), "uploads"))
+	Ok(t, err)
+	journal.Archive = archive
+	output := append(bytes.Repeat([]byte("x"), 1500*1024), []byte("tail\n")...)
+	Ok(t, journal.Append(job.ID, output))
+	Ok(t, journal.ArchiveSealed())
+	Equals(t, 0, len(fake.Keys()))
+	prefix, cursor, err := journal.ReadAfter(job.ID, 0)
+	Ok(t, err)
+	Ok(t, store.FinishJob(job.ID, "succeeded", ""))
+	Ok(t, journal.ArchiveSealed())
+	info, remaining, err := store.ReadLogJournal(job.ID, 0, int64(len(output)))
+	Ok(t, err)
+	Assert(t, info.ArchivedAt != nil, "sealed output was not archived")
+	Equals(t, 0, len(remaining))
+	archived, ok := fake.Object("atlantis/" + logs.Key(job.ID))
+	Assert(t, ok, "archive object missing under the prefix")
+	Equals(t, output, archived)
+	suffix, end, err := journal.ReadAfter(job.ID, cursor)
+	Ok(t, err)
+	Equals(t, int64(len(output)), end)
+	Equals(t, output, append(prefix, suffix...))
+	data, _, err := journal.ReadAfter(job.ID, int64(len(output)-5))
+	Ok(t, err)
+	Equals(t, "tail\n", string(data))
+	Equals(t, []string{fmt.Sprintf("bytes=%d-%d", cursor, len(output)-1), fmt.Sprintf("bytes=%d-%d", len(output)-5, len(output)-1)}, fake.Ranges())
+	all, err := journal.ReadAll(job.ID)
+	Ok(t, err)
+	Equals(t, output, all)
+
+	tampered := slices.Clone(output)
+	tampered[0] = 'z'
+	fake.Set("atlantis/"+logs.Key(job.ID), tampered, time.Now())
+	_, err = journal.ReadAll(job.ID)
+	ErrContains(t, "checksum mismatch", err)
+
+	Ok(t, store.ClosePull(job.Pull))
+	Ok(t, store.ReleaseClaim(job.Pull))
+	Ok(t, journal.Collect(time.Now().Add(24*time.Hour), time.Hour))
+	Equals(t, 0, len(fake.Keys()))
+	info, err = journal.Info(job.ID)
+	Ok(t, err)
+	Assert(t, info.PurgedAt != nil, "expired log was not purged")
+}
+
+// A failed S3 upload keeps every journal byte and is retried by the next pass.
+func TestS3ArchiveFailureKeepsJournal(t *testing.T) {
+	store, journal, job := setup(t)
+	fake := artifactstest.New("artifacts")
+	fake.FailPut = fmt.Errorf("service unavailable")
+	archive, err := artifacts.NewS3(fake, fake.Bucket, "", filepath.Join(t.TempDir(), "uploads"))
+	Ok(t, err)
+	journal.Archive = archive
+	Ok(t, journal.Append(job.ID, []byte("kept\n")))
+	Ok(t, store.FinishJob(job.ID, "succeeded", ""))
+	ErrContains(t, "service unavailable", journal.ArchiveSealed())
+	info, remaining, err := store.ReadLogJournal(job.ID, 0, 1024)
+	Ok(t, err)
+	Assert(t, info.ArchivedAt == nil, "failed upload became visible")
+	Equals(t, "kept\n", string(remaining))
+	fake.FailPut = nil
+	Ok(t, journal.ArchiveSealed())
+	data, err := journal.ReadAll(job.ID)
+	Ok(t, err)
+	Equals(t, "kept\n", string(data))
 }

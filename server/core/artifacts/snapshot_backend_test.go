@@ -8,12 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/runatlantis/atlantis/server/core/artifacts"
+	"github.com/runatlantis/atlantis/server/core/artifacts/artifactstest"
 	"github.com/runatlantis/atlantis/server/core/sqlstore"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
@@ -26,6 +28,12 @@ func TestObjectSnapshotsIsolatesJobsAndLogArchives(t *testing.T) {
 			store, err := artifacts.NewFilesystem(t.TempDir())
 			Ok(t, err)
 			t.Cleanup(func() { _ = store.Close() })
+			return store
+		},
+		"s3": func(t *testing.T) artifacts.Store {
+			fake := artifactstest.New("artifacts")
+			store, err := artifacts.NewS3(fake, fake.Bucket, "atlantis", filepath.Join(t.TempDir(), "uploads"))
+			Ok(t, err)
 			return store
 		},
 	}
@@ -68,7 +76,7 @@ func TestObjectSnapshotsIsolatesJobsAndLogArchives(t *testing.T) {
 }
 
 func TestSnapshotBackendWorkflowConformance(t *testing.T) {
-	for _, mode := range []string{"database", "filesystem"} {
+	for _, mode := range []string{"database", "filesystem", "s3"} {
 		t.Run(mode, func(t *testing.T) {
 			store, err := sqlstore.OpenServer(t.TempDir())
 			Ok(t, err)
@@ -79,6 +87,11 @@ func TestSnapshotBackendWorkflowConformance(t *testing.T) {
 				backend = sqlstore.BlobStore{Store: store}
 			case "filesystem":
 				raw, err := artifacts.NewFilesystem(t.TempDir())
+				Ok(t, err)
+				backend = artifacts.ObjectSnapshots{Store: raw}
+			case "s3":
+				fake := artifactstest.New("artifacts")
+				raw, err := artifacts.NewS3(fake, fake.Bucket, "atlantis", filepath.Join(t.TempDir(), "uploads"))
 				Ok(t, err)
 				backend = artifacts.ObjectSnapshots{Store: raw}
 			}
@@ -164,4 +177,26 @@ func TestObjectSnapshotsCollectsStaleWriteTemporaries(t *testing.T) {
 	reader, err := backend.OpenSnapshot(id)
 	Ok(t, err)
 	Ok(t, reader.Close())
+}
+
+// S3 objects appear only after a complete PutObject, so collection removes
+// unreferenced bundles by age and never touches keys outside the prefix.
+func TestS3SnapshotOrphansConfinedToPrefix(t *testing.T) {
+	fake := artifactstest.New("shared")
+	raw, err := artifacts.NewS3(fake, fake.Bucket, "atlantis", filepath.Join(t.TempDir(), "uploads"))
+	Ok(t, err)
+	backend := artifacts.ObjectSnapshots{Store: raw}
+	referenced, orphan, fresh := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	key := func(prefix, id string) string { return prefix + "snapshots/v1/" + id + "/plan-snapshot.tar.gz" }
+	fake.Set(key("atlantis/", referenced), []byte("kept"), old)
+	fake.Set(key("atlantis/", orphan), []byte("orphan"), old)
+	fake.Set(key("atlantis/", fresh), []byte("uploading"), now)
+	fake.Set(key("other/", orphan), []byte("foreign"), old)
+	fake.Set(key("", orphan), []byte("foreign"), old)
+	Ok(t, backend.CollectOrphans(map[string]bool{referenced: true}, true, now))
+	want := []string{key("", orphan), key("atlantis/", fresh), key("atlantis/", referenced), key("other/", orphan)}
+	slices.Sort(want)
+	Equals(t, want, fake.Keys())
 }

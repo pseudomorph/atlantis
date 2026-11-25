@@ -33,6 +33,11 @@ func TestStorageConfig(t *testing.T) {
 	Equals(t, "/data/artifacts", filesystem.ArtifactDirectory("/data"))
 	filesystem.Artifacts.Directory = "/srv/artifacts"
 	Equals(t, "/srv/artifacts", filesystem.ArtifactDirectory("/data"))
+	s3 := server.StorageArtifactsConfig{Type: "s3", S3: server.StorageS3Config{Bucket: "atlantis", Region: "us-east-1", Prefix: "team/atlantis/", Endpoint: "http://minio:9000", ForcePathStyle: true, Profile: "artifacts"}}
+	withS3 := valid
+	withS3.Artifacts = s3
+	Ok(t, withS3.Validate())
+	Equals(t, "/data/s3-uploads", withS3.S3UploadDirectory("/data"))
 	for _, bad := range []server.StorageConfig{
 		{}, {Database: server.StorageDatabaseConfig{Type: "redis"}},
 		{Database: server.StorageDatabaseConfig{Type: "postgres"}},
@@ -40,6 +45,14 @@ func TestStorageConfig(t *testing.T) {
 		{Database: server.StorageDatabaseConfig{Type: "sqlite", ConnectionStringEnv: "DSN"}},
 		{Database: server.StorageDatabaseConfig{Type: "sqlite", ConnectionStringFile: "/run/secrets/dsn"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3"}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3", S3: server.StorageS3Config{Bucket: "b"}}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3", S3: server.StorageS3Config{Region: "us-east-1"}}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3", Directory: "/srv", S3: s3.S3}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3", S3: server.StorageS3Config{Bucket: "b", Region: "r", Prefix: "../escape"}}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "s3", S3: server.StorageS3Config{Bucket: "b", Region: "r", Prefix: "/absolute"}}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "filesystem", S3: s3.S3}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "database", S3: s3.S3}},
+		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Type: "gcs"}},
 		{Database: valid.Database, Artifacts: server.StorageArtifactsConfig{Directory: "/var/lib/atlantis"}},
 		{Database: valid.Database, Retention: server.StorageRetentionConfig{Logs: "0s"}},
 		{Database: valid.Database, Retention: server.StorageRetentionConfig{PlanArtifacts: "-1h"}},
