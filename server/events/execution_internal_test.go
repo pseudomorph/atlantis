@@ -4,6 +4,8 @@
 package events
 
 import (
+	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -110,4 +112,54 @@ func TestAPICollisionRetriesBeforeReturningExecutionContext(t *testing.T) {
 	coordinator.NewAPIPullNumber = func() int { return -1 }
 	_, err = coordinator.Acquire(&command.Context{API: true, Pull: models.PullRequest{Num: -1, BaseRepo: repo}, Log: ctx.Log})
 	Assert(t, err != nil, "exhausted collision retries reused historical identity")
+}
+
+type checkoutRecorder struct {
+	WorkingDir
+	present   bool
+	deleteErr error
+	deletes   int
+}
+
+func (c *checkoutRecorder) GetPullDir(models.Repo, models.PullRequest) (string, error) {
+	if !c.present {
+		return "", os.ErrNotExist
+	}
+	return "checkout", nil
+}
+
+func (c *checkoutRecorder) Delete(logging.SimpleLogging, models.Repo, models.PullRequest) error {
+	c.deletes++
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
+	c.present = false
+	return nil
+}
+
+func TestCheckoutLivesForOneCommand(t *testing.T) {
+	store, err := sqlstore.OpenServer(t.TempDir())
+	Ok(t, err)
+	defer store.Close()
+	checkouts := &checkoutRecorder{present: true}
+	runner := &ExecutionCoordinator{Store: store, WorkingDir: checkouts}
+	pull := models.PullRequest{Num: 1, BaseRepo: models.Repo{FullName: "org/repo"}}
+
+	ctx := &command.Context{Pull: pull, Log: logging.NewNoopLogger(t)}
+	release, err := runner.Acquire(ctx)
+	Ok(t, err)
+	Equals(t, 1, checkouts.deletes)
+	Assert(t, !checkouts.present, "command started with an earlier checkout")
+	checkouts.present = true
+	release()
+	Equals(t, 2, checkouts.deletes)
+	Assert(t, !checkouts.present, "checkout outlived its command")
+
+	// A checkout that cannot be removed is never reused, and the claim is given up.
+	checkouts.present, checkouts.deleteErr = true, errors.New("device busy")
+	_, err = runner.Acquire(&command.Context{Pull: pull, Log: logging.NewNoopLogger(t)})
+	ErrContains(t, "removing previous checkout", err)
+	idle, err := store.PullIdle(pull)
+	Ok(t, err)
+	Assert(t, idle, "failed admission kept the claim")
 }

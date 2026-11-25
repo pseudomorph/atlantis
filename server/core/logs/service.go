@@ -177,11 +177,34 @@ func (s *Service) ArchiveSealed() error {
 			err = fmt.Errorf("log archive differs from sealed output")
 		}
 		if err == nil {
-			err = s.Records.MarkLogArchived(stream.JobID, stream.ByteLength, checksum)
+			if err = s.Records.MarkLogArchived(stream.JobID, stream.ByteLength, checksum); err != nil {
+				err = s.discardExpiredArchive(stream.JobID, err)
+			}
 		}
 		failures = errors.Join(failures, err)
 	}
 	return failures
+}
+
+// discardExpiredArchive handles a handoff that failed after the archive write
+// landed. Retention on another server can expire the log between the journal
+// read and the handoff. Its archive delete then ran before this write, and
+// nothing else would remove the object, because retention skips purged logs.
+// When the record shows the log expired, the object is deleted here and the
+// handoff failure is dropped. Otherwise the object stays: the next pass
+// rewrites the same key, or retention deletes it.
+func (s *Service) discardExpiredArchive(id string, handoff error) error {
+	info, err := s.Records.Log(id)
+	if err != nil {
+		return errors.Join(handoff, err)
+	}
+	if info != nil && info.DeletedAt == nil {
+		return handoff
+	}
+	if err := s.Archive.Delete(Key(id)); err != nil {
+		return fmt.Errorf("deleting archive of expired log: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) Collect(now time.Time, retention time.Duration) error {

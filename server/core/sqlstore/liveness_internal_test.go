@@ -249,6 +249,9 @@ func TestAPIRecoveryOfSweptClaim(t *testing.T) {
 	})
 }
 
+// With SQLite the data directory lock proves the earlier server exited, so
+// startup marks its claims uncertain. With PostgreSQL another server may still
+// hold them, so they stay active until the sweep finds their heartbeat expired.
 func TestStartupMarksEarlierInstancesUncertain(t *testing.T) {
 	ForEachDatabase(t, func(t *testing.T, d TestDatabase) {
 		first, err := d.Open()
@@ -264,8 +267,24 @@ func TestStartupMarksEarlierInstancesUncertain(t *testing.T) {
 		mine = claimed(t, second, mine)
 		Ok(t, second.MarkPreviousExecutionsUncertain())
 		earlier := storedClaim(t, second, p.ExecutionOwner())
-		Equals(t, "uncertain", earlier.State)
 		Equals(t, first.InstanceID(), earlier.ServerInstanceID)
+		if d.Name == "postgres" {
+			Equals(t, "active", earlier.State)
+			expireOtherInstances(t, second)
+			earlier = storedClaim(t, second, p.ExecutionOwner())
+		}
+		Equals(t, "uncertain", earlier.State)
 		Ok(t, second.CheckClaim(mine))
 	})
+}
+
+// expireOtherInstances moves the heartbeat of every active claim held by
+// another instance past the expiry and runs the sweep, which is the state a
+// PostgreSQL server reaches once the expiry has passed after a restart.
+func expireOtherInstances(t *testing.T, s *Store) {
+	t.Helper()
+	old := databaseTime(time.Now().Add(-s.claimExpiry - time.Minute))
+	Ok(t, s.db.Model(&executionClaim{}).Where("state = ? AND server_instance_id <> ?", "active", s.instance).Update("heartbeat_at", old).Error)
+	_, err := s.ExpireClaims()
+	Ok(t, err)
 }

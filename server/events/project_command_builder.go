@@ -333,7 +333,7 @@ func (p *DefaultProjectCommandBuilder) restorePullDir(pullDir string, r models.R
 		return pullDir, nil
 	}
 	planPullDir := runtime.GetPlanPullDir(p.LocalSharePlanDir, r, pull)
-	if err := utils.EnsureSubPath(filepath.Join(p.LocalSharePlanDir, workingDirPrefix), planPullDir); err != nil {
+	if err := utils.EnsureSubPath(filepath.Join(p.LocalSharePlanDir, WorkingDirPrefix), planPullDir); err != nil {
 		return "", fmt.Errorf("plan path traversal detected: %w", err)
 	}
 	return planPullDir, nil
@@ -1694,11 +1694,11 @@ func (p *DefaultProjectCommandBuilder) buildProjectCommand(ctx *command.Context,
 	if err != nil {
 		return projCtx, err
 	}
-	// Durable plans can be restored into any checkout, so a targeted apply
-	// recovers each missing workspace even when something else, such as a
-	// pre-workflow hook, already recreated the default checkout.
+	// With durable storage a command starts without a checkout, so a targeted
+	// command clones each workspace it needs even when something else, such as
+	// a pre-workflow hook, already recreated the default checkout.
 	_, durablePlans := p.PlanStore.(planstore.Inventory)
-	if recloned || (durablePlans && cmd.Name == command.Apply) {
+	if recloned || durablePlans {
 		if err := p.cloneMissingWorkspaces(ctx, projCtx); err != nil {
 			return nil, err
 		}

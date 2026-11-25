@@ -83,7 +83,7 @@ func (p *DefaultPendingPlanFinder) planPullDir(pullDir string) (string, bool, er
 		return pullDir, false, nil
 	}
 
-	cloneRoot := filepath.Clean(filepath.Join(p.DataDir, workingDirPrefix))
+	cloneRoot := filepath.Clean(filepath.Join(p.DataDir, WorkingDirPrefix))
 	cleanPullDir := filepath.Clean(pullDir)
 	relPullDir, err := filepath.Rel(cloneRoot, cleanPullDir)
 	if err != nil {
@@ -96,7 +96,7 @@ func (p *DefaultPendingPlanFinder) planPullDir(pullDir string) (string, bool, er
 	// SecureJoin resolves the PR-derived relative path against the plan store
 	// repos root and guarantees the result stays within it (rejecting "..",
 	// absolute paths, and symlink escapes).
-	planStoreRoot := filepath.Join(p.LocalSharePlanDir, workingDirPrefix)
+	planStoreRoot := filepath.Join(p.LocalSharePlanDir, WorkingDirPrefix)
 	planPullDir, err := securejoin.SecureJoin(planStoreRoot, relPullDir)
 	if err != nil {
 		return "", false, fmt.Errorf("resolving plan pull directory for %q: %w", pullDir, err)
@@ -175,7 +175,7 @@ func (p *DefaultPendingPlanFinder) findInPlanStore(clonePullDir string, planPull
 	// store root via SecureJoin at the point of use, so the path handed to
 	// os.ReadDir is provably contained within that root regardless of how the
 	// caller built it. This is idempotent for values produced by planPullDir().
-	planStoreRoot := filepath.Join(p.LocalSharePlanDir, workingDirPrefix)
+	planStoreRoot := filepath.Join(p.LocalSharePlanDir, WorkingDirPrefix)
 	relPlanPullDir, err := filepath.Rel(planStoreRoot, planPullDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("checking plan pull directory %q: %w", planPullDir, err)

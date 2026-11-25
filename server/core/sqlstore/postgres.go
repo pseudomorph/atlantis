@@ -5,82 +5,52 @@ package sqlstore
 
 import (
 	"context"
-	"errors"
+	"database/sql/driver"
 	"fmt"
 	"hash/fnv"
-	"os"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/pressly/goose/v3"
+	gooselock "github.com/pressly/goose/v3/lock"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
-// serverLockClass is the first key of the advisory lock that makes one server
-// the only user of a PostgreSQL schema. The second key hashes the schema name.
-const serverLockClass int32 = 0x41544c53
+// advisoryLockClass is the first key of the two-key advisory locks that
+// maintenance passes take. The second key hashes the schema and the pass name.
+// Migrations use the one-key form, so the two never collide.
+const advisoryLockClass int32 = 0x41544c53
 
-// ErrServerLockLost reports that the PostgreSQL session holding the server lock ended.
-var ErrServerLockLost = errors.New("durable-storage lost its PostgreSQL server lock; restart the server")
-
-// OpenPostgresServer opens PostgreSQL storage for the only server using it.
+// OpenPostgresServer opens PostgreSQL storage. Several servers may share one
+// schema; each needs its own data directory, which a file lock enforces.
 // connString is a libpq keyword/value or URL connection string; its search_path
-// selects the schema. A session-level advisory lock, held on a dedicated
-// connection until Close, keeps a second server from opening the same schema.
-// It is taken before migrations run.
+// selects the schema. Migrations run under a session-level advisory lock, so
+// servers that start together migrate once while the others wait.
 func OpenPostgresServer(connString, dataDir string) (*Store, error) {
 	if strconv.IntSize < 64 {
 		return nil, fmt.Errorf("durable-storage requires a 64-bit server; legacy storage remains supported")
 	}
-	if err := os.MkdirAll(dataDir, 0700); err != nil {
-		return nil, fmt.Errorf("creating data directory: %w", err)
-	}
-	config, err := pgx.ParseConfig(connString)
-	if err != nil {
+	if _, err := pgx.ParseConfig(connString); err != nil {
 		// pgx redacts the password from the connection string it echoes.
 		return nil, fmt.Errorf("parsing PostgreSQL connection string: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	session, err := pgx.ConnectConfig(ctx, config)
+	owner, err := lockDataDir(dataDir, "durable-storage data directory is already in use by another server; give each server its own data-dir")
 	if err != nil {
-		return nil, fmt.Errorf("connecting to PostgreSQL: %w", err)
-	}
-	store, err := openPostgres(ctx, session, connString, dataDir)
-	if err != nil {
-		_ = session.Close(context.Background())
 		return nil, err
 	}
+	store, err := openPostgres(connString, dataDir)
+	if err != nil {
+		_ = owner.Unlock()
+		return nil, err
+	}
+	store.owner = owner
 	return store, nil
 }
 
-func openPostgres(ctx context.Context, session *pgx.Conn, connString, dataDir string) (*Store, error) {
-	var schema *string
-	if err := session.QueryRow(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
-		return nil, fmt.Errorf("reading PostgreSQL schema: %w", err)
-	}
-	if schema == nil {
-		return nil, fmt.Errorf("the PostgreSQL search_path names no existing schema")
-	}
-	key := fnv.New32a()
-	_, _ = key.Write([]byte(*schema))
-	var held bool
-	if err := session.QueryRow(ctx, "SELECT pg_try_advisory_lock($1, $2)", serverLockClass, int32(key.Sum32())).Scan(&held); err != nil {
-		return nil, fmt.Errorf("locking PostgreSQL server: %w", err)
-	}
-	if !held {
-		return nil, fmt.Errorf("durable-storage PostgreSQL schema %q is already in use by another server", *schema)
-	}
-	var initialized bool
-	if err := session.QueryRow(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&initialized); err != nil {
-		return nil, fmt.Errorf("reading PostgreSQL schema version: %w", err)
-	}
-	if err := checkDataDir(dataDir, initialized); err != nil {
-		return nil, err
-	}
+func openPostgres(connString, dataDir string) (*Store, error) {
 	orm, err := gorm.Open(postgres.Open(connString), gormConfig())
 	if err != nil {
 		return nil, fmt.Errorf("opening PostgreSQL: %w", err)
@@ -91,44 +61,86 @@ func openPostgres(ctx context.Context, session *pgx.Conn, connString, dataDir st
 	}
 	conn.SetMaxOpenConns(16)
 	conn.SetMaxIdleConns(4)
-	if err := migrate(conn, goose.DialectPostgres); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var schema *string
+	if err := conn.QueryRowContext(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("reading PostgreSQL schema: %w", err)
+	}
+	if schema == nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("the PostgreSQL search_path names no existing schema")
+	}
+	var initialized bool
+	if err := conn.QueryRowContext(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&initialized); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("reading PostgreSQL schema version: %w", err)
+	}
+	if err := checkDataDir(dataDir, initialized); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	// The session locker retries every second for up to 5 minutes while another
+	// server migrates the same schema.
+	locker, err := gooselock.NewPostgresSessionLocker(gooselock.WithLockID(migrationLockID(*schema)), gooselock.WithLockTimeout(1, 300), gooselock.WithUnlockTimeout(1, 60))
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := migrate(conn, goose.DialectPostgres, goose.WithSessionLocker(locker)); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("migrating PostgreSQL: %w", err)
 	}
-	return &Store{db: orm, conn: conn, session: session, instance: uuid.NewString(), claimExpiry: ClaimExpiry}, nil
+	return &Store{db: orm, conn: conn, schema: *schema, instance: uuid.NewString(), claimExpiry: ClaimExpiry}, nil
 }
 
-// VerifyServerLock checks that this server still holds exclusive use of its
-// database. A SQLite file lock lasts as long as the process. The PostgreSQL
-// advisory lock ends with its session, so a failed check is permanent: the
-// store then admits no new claims and stops refreshing heartbeats, and the
-// claims it holds expire and need stopped-work recovery.
-func (s *Store) VerifyServerLock() error {
-	if s.session == nil {
-		return nil
-	}
-	if s.serverLockLost.Load() {
-		return ErrServerLockLost
-	}
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-	if s.session.IsClosed() {
-		s.serverLockLost.Store(true)
-		return ErrServerLockLost
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := s.session.Ping(ctx); err != nil {
-		s.serverLockLost.Store(true)
-		return fmt.Errorf("%w: %w", ErrServerLockLost, err)
-	}
-	return nil
+// migrationLockID is the advisory lock that serializes migrations of one schema.
+func migrationLockID(schema string) int64 {
+	return int64(advisoryLockClass)<<32 | int64(hashKey(schema))
 }
 
-// checkServerLock refuses new ownership once the server lock is known lost.
-func (s *Store) checkServerLock() error {
-	if s.serverLockLost.Load() {
-		return ErrServerLockLost
+// hashKey maps a name to the second key of an advisory lock.
+func hashKey(name string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(name))
+	return h.Sum32()
+}
+
+// RunMaintenance runs pass unless another server holds the lock for the pass
+// named name, and reports whether it ran. With SQLite only one server exists,
+// so pass always runs. With PostgreSQL the lock is a session-level advisory
+// lock held on a dedicated connection for the length of the pass; it keeps
+// servers from repeating each other's work and VCS comments. Correctness does
+// not depend on it: the row-lock rule still governs every write a pass makes,
+// and a lock that ends with a lost connection lets two servers run one pass.
+func (s *Store) RunMaintenance(name string, pass func()) (bool, error) {
+	if s.schema == "" {
+		pass()
+		return true, nil
 	}
-	return nil
+	ctx := context.Background()
+	conn, err := s.conn.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reserving maintenance connection: %w", err)
+	}
+	key := int32(hashKey(s.schema + "\x00" + name))
+	var held bool
+	if err := conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1, $2)", advisoryLockClass, key).Scan(&held); err != nil {
+		_ = conn.Close()
+		return false, fmt.Errorf("locking maintenance pass %q: %w", name, err)
+	}
+	if !held {
+		return false, conn.Close()
+	}
+	defer func() {
+		var released bool
+		if err := conn.QueryRowContext(ctx, "SELECT pg_advisory_unlock($1, $2)", advisoryLockClass, key).Scan(&released); err != nil || !released {
+			// Discard the connection, which ends the session and its lock.
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
+		_ = conn.Close()
+	}()
+	pass()
+	return true, nil
 }

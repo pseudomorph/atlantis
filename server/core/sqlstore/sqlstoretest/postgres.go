@@ -45,14 +45,22 @@ func PostgresDSN(t testing.TB) string {
 	return u.String()
 }
 
-func exec(t testing.TB, dsn, statement string) {
+// AgeHeartbeats moves the heartbeat of the active claims matching where, a SQL
+// condition on execution_claims, a day into the past. It stands in for a
+// server that stopped refreshing them longer ago than the claim expiry.
+func AgeHeartbeats(t testing.TB, dsn, where string, args ...any) {
+	t.Helper()
+	exec(t, dsn, "UPDATE execution_claims SET heartbeat_at = heartbeat_at - interval '1 day' WHERE state = 'active' AND ("+where+")", args...)
+}
+
+func exec(t testing.TB, dsn, statement string, args ...any) {
 	t.Helper()
 	conn, err := pgx.Connect(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("connecting to the PostgreSQL test database: %v", err)
 	}
 	defer conn.Close(context.Background())
-	if _, err := conn.Exec(context.Background(), statement); err != nil {
+	if _, err := conn.Exec(context.Background(), statement, args...); err != nil {
 		t.Fatalf("running %q: %v", statement, err)
 	}
 }
