@@ -53,6 +53,16 @@ func (c *CancelCommandRunner) Run(ctx *command.Context, cmd *CommentCommand) {
 		return
 	}
 
+	if defaultRunner.Execution != nil {
+		if err := defaultRunner.Execution.Store.CancelPull(ctx.Pull); err != nil {
+			ctx.Log.Err("requesting cancellation: %v", err)
+			return
+		}
+		if err := c.VCSClient.CreateComment(ctx.Log, ctx.Pull.BaseRepo, ctx.Pull.Num, "Cancelled queued operations for this pull request. Running operations will continue to completion; new work remains blocked until the current execution finishes or is reconciled.", ""); err != nil {
+			ctx.Log.Err("commenting cancellation: %v", err)
+		}
+		return
+	}
 	// Cancel the entire pull request to prevent future execution order groups from running
 	defaultRunner.CancellationTracker.Cancel(ctx.Pull)
 

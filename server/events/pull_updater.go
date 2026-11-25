@@ -7,16 +7,24 @@ import (
 	"slices"
 
 	"github.com/runatlantis/atlantis/server/events/command"
+	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 )
 
 type PullUpdater struct {
+	ClaimCheck           func(models.PullRequest) error
 	HidePrevPlanComments bool
 	VCSClient            vcs.Client
 	MarkdownRenderer     *MarkdownRenderer
 }
 
 func (c *PullUpdater) updatePull(ctx *command.Context, cmd PullCommand, res command.Result) {
+	if c.ClaimCheck != nil && ctx.Pull.ExecutionOwner() != "" {
+		if err := c.ClaimCheck(ctx.Pull); err != nil {
+			ctx.Log.Err("suppressing stale execution publication: %v", err)
+			return
+		}
+	}
 	// Log if we got any errors or failures.
 	if res.Error != nil {
 		ctx.Log.Err("%s", res.Error.Error())

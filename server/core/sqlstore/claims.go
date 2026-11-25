@@ -1,0 +1,401 @@
+// Copyright 2026 The Atlantis Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package sqlstore
+
+import (
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/runatlantis/atlantis/server/core/db"
+	"github.com/runatlantis/atlantis/server/events/models"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type executionClaim struct {
+	PullID       string `gorm:"primaryKey;autoIncrement:false"`
+	Owner, State string
+	AcquiredAt   time.Time
+	// ServerInstanceID is the process holding the claim; HeartbeatAt is its last refresh.
+	ServerInstanceID string
+	HeartbeatAt      time.Time
+}
+
+// newClaim is an active claim held by this server instance.
+func (s *Store) newClaim(pullID, owner string, now time.Time) executionClaim {
+	return executionClaim{PullID: pullID, Owner: owner, State: "active", AcquiredAt: now, ServerInstanceID: s.instance, HeartbeatAt: now}
+}
+
+// AcquireClaim rejects existing ownership, including unfinished work from a prior server.
+func (s *Store) AcquireClaim(p models.PullRequest, owner string) error {
+	if owner == "" {
+		return fmt.Errorf("invalid execution claim")
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		row, err := savePull(tx, p)
+		if err != nil {
+			return err
+		}
+		if _, err := lockPull(tx, row.ID); err != nil {
+			return err
+		}
+		var verification int64
+		if err := tx.Table("pending_pull_lifecycles").Where("pull_id = ?", row.ID).Count(&verification).Error; err != nil {
+			return err
+		}
+		if verification != 0 {
+			return fmt.Errorf("pull request closure is awaiting VCS verification; retry shortly")
+		}
+		if err := reopenIfRequested(tx, row.ID); err != nil {
+			return err
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		claim := s.newClaim(row.ID, owner, now)
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("execution is already owned or uncertain; reconcile stopped work before retrying")
+		}
+		return tx.Model(&pull{}).Where("id = ?", row.ID).Update("cancelled", false).Error
+	})
+}
+
+// Locking rule: a transaction that reads pull-scoped state and writes based on it
+// first locks the governing pulls row with lockPull, then the execution claim.
+// The pull row exists before any claim, job, lock, status or lifecycle row for it,
+// so the lock also fences inserts that a missing-row check cannot. Writes that do
+// not run under that lock are single conditional statements whose RowsAffected is
+// checked. SQLite serializes writers with _txlock=immediate and the glebarez
+// dialector omits FOR UPDATE; PostgreSQL runs transactions concurrently under
+// READ COMMITTED and relies on this rule and the FOR UPDATE it emits.
+// Transactions locking several pulls take them in a deterministic order.
+var rowLock = clause.Locking{Strength: clause.LockingStrengthUpdate}
+
+// lockPull locks and returns the pull row selected by an ID or an ID subquery.
+func lockPull(tx *gorm.DB, ids any) (pull, error) {
+	var row pull
+	err := tx.Clauses(rowLock).Where("id IN (?)", ids).Take(&row).Error
+	return row, err
+}
+
+// lockClaim locks the governing pull and then its claim, in that order.
+func lockClaim(tx *gorm.DB, ids any) (executionClaim, error) {
+	var claim executionClaim
+	if _, err := lockPull(tx, ids); err != nil {
+		return claim, err
+	}
+	err := tx.Clauses(rowLock).Where("pull_id IN (?)", ids).Take(&claim).Error
+	return claim, err
+}
+
+func (s *Store) guard(tx *gorm.DB, p models.PullRequest) error {
+	claim, err := lockClaim(tx, pullIDs(tx, p.BaseRepo, p.Num))
+	return checkExecutionClaim(claim, p.ExecutionOwner(), err)
+}
+
+func checkExecutionClaim(claim executionClaim, owner string, err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("%w: claim is missing", db.ErrExecutionClaimLost)
+	}
+	if err != nil {
+		return fmt.Errorf("reading execution claim: %w", err)
+	}
+	if owner == "" || claim.Owner != owner || claim.State != "active" {
+		return fmt.Errorf("%w: claim is inactive or belongs to another execution", db.ErrExecutionClaimLost)
+	}
+	return nil
+}
+
+// Jobs retain the pull and owner that admitted them, fencing writes after recovery.
+func (s *Store) guardJob(tx *gorm.DB, row job) error {
+	claim, err := lockClaim(tx, row.PullID)
+	return checkExecutionClaim(claim, row.Owner, err)
+}
+
+func (s *Store) CheckClaim(p models.PullRequest) error {
+	return s.db.Transaction(func(tx *gorm.DB) error { return s.guard(tx, p) })
+}
+func (s *Store) ReleaseClaim(p models.PullRequest) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := s.guard(tx, p); err != nil {
+			return err
+		}
+		var running int64
+		if err := tx.Model(&job{}).Where("pull_id IN (?) AND owner = ? AND state = ?", pullIDs(tx, p.BaseRepo, p.Num), p.ExecutionOwner(), "running").Count(&running).Error; err != nil {
+			return err
+		}
+		if running != 0 {
+			return fmt.Errorf("execution still has unfinished jobs")
+		}
+		// Non-PR inputs belong to one invocation and are invalidated on release.
+		if p.Num < 0 {
+			if err := tx.Where("pull_id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&pendingPlan{}).Error; err != nil {
+				return err
+			}
+		}
+		result := tx.Where("owner = ? AND state = ? AND pull_id IN (?)", p.ExecutionOwner(), "active", pullIDs(tx, p.BaseRepo, p.Num)).Delete(&executionClaim{})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("%w: claim changed during release", db.ErrExecutionClaimLost)
+		}
+		return nil
+	})
+}
+func (s *Store) CancelPull(p models.PullRequest) error {
+	row, err := s.ensurePull(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Model(&pull{}).Where("id = ?", row.ID).Update("cancelled", true).Error
+}
+func (s *Store) ensurePull(p models.PullRequest) (pull, error) {
+	var out pull
+	err := s.db.Transaction(func(tx *gorm.DB) error { var err error; out, err = savePull(tx, p); return err })
+	return out, err
+}
+func (s *Store) IsCancelled(p models.PullRequest) (bool, error) {
+	var row struct{ Cancelled, Closed, Pending bool }
+	err := s.db.Model(&pull{}).Select("cancelled, closed, EXISTS(SELECT 1 FROM pending_pull_lifecycles WHERE pull_id = pulls.id) AS pending").Where("id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Take(&row).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	return row.Cancelled || row.Closed || row.Pending, err
+}
+
+// ClosePull records a verified closure. Deferred cleanup uses its generation
+// instead of replaying the close event, so a second closure cancels any reopen request.
+func (s *Store) ClosePull(p models.PullRequest) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		row, err := savePull(tx, p)
+		if err != nil {
+			return err
+		}
+		if _, err := lockPull(tx, row.ID); err != nil {
+			return err
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		if err = tx.Model(&pull{}).Where("id = ?", row.ID).Updates(map[string]any{"closed": true, "cancelled": true, "reopen_requested": false, "closed_at": gorm.Expr("COALESCE(closed_at, ?)", now), "closure_generation": gorm.Expr("CASE WHEN closed THEN closure_generation ELSE closure_generation + 1 END"), "cleanup_complete": gorm.Expr("CASE WHEN closed THEN cleanup_complete ELSE ? END", false)}).Error; err != nil {
+			return err
+		}
+		if err := anchorClosedLogs(tx, row.ID); err != nil {
+			return err
+		}
+		return tx.Where("pull_id = ?", row.ID).Delete(&pendingPlan{}).Error
+	})
+}
+
+// RequestReopen records a reopened pull request. The next claim reopens it once
+// closure cleanup has finished, so cleanup never races new work in its directory.
+func (s *Store) RequestReopen(p models.PullRequest) error {
+	row, err := s.ensurePull(p)
+	if err != nil {
+		return err
+	}
+	return s.db.Model(&pull{}).Where("id = ? AND closed = ?", row.ID, true).Update("reopen_requested", true).Error
+}
+
+func reopenIfRequested(tx *gorm.DB, pullID string) error {
+	var row struct{ Closed, ReopenRequested, CleanupComplete bool }
+	if err := tx.Model(&pull{}).Select("closed", "reopen_requested", "cleanup_complete").Where("id = ?", pullID).Take(&row).Error; err != nil {
+		return err
+	}
+	switch {
+	case !row.Closed:
+		return nil
+	case !row.ReopenRequested:
+		return fmt.Errorf("pull request is closed")
+	case !row.CleanupComplete:
+		return fmt.Errorf("pull request was reopened, but cleanup from its closure has not finished; retry shortly")
+	}
+	return tx.Model(&pull{}).Where("id = ?", pullID).Updates(map[string]any{
+		"closed": false, "cancelled": false, "closed_at": nil, "cleanup_complete": false, "reopen_requested": false,
+	}).Error
+}
+
+func (s *Store) PullIdle(p models.PullRequest) (bool, error) {
+	var n int64
+	err := s.db.Model(&executionClaim{}).Where("pull_id IN (?)", pullIDs(s.db, p.BaseRepo, p.Num)).Count(&n).Error
+	return n == 0, err
+}
+
+// guardRemoval allows the owner, or anyone once a closed pull has no claim.
+// guard has already locked the pull row, so no claim can appear before commit.
+func (s *Store) guardRemoval(tx *gorm.DB, p models.PullRequest) error {
+	if err := s.guard(tx, p); err == nil {
+		return nil
+	}
+	locked, err := lockPull(tx, pullIDs(tx, p.BaseRepo, p.Num))
+	if err != nil {
+		return err
+	}
+	var row struct{ Closed bool }
+	if err := tx.Table("pulls").Select("closed").Where("id = ?", locked.ID).Take(&row).Error; err != nil {
+		return err
+	}
+	var claims int64
+	if err := tx.Model(&executionClaim{}).Where("pull_id = ?", locked.ID).Count(&claims).Error; err != nil {
+		return err
+	}
+	if row.Closed && claims == 0 {
+		return nil
+	}
+	return fmt.Errorf("cleanup requires the execution owner or a closed idle pull request")
+}
+
+func (s *Store) MarkUncertain(p models.PullRequest) error {
+	if p.ExecutionOwner() == "" {
+		return fmt.Errorf("%w: missing execution owner", db.ErrExecutionClaimLost)
+	}
+	result := s.db.Model(&executionClaim{}).Where("owner = ?", p.ExecutionOwner()).Update("state", "uncertain")
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("%w: could not mark execution uncertain", db.ErrExecutionClaimLost)
+	}
+	return nil
+}
+
+func (s *Store) ClosedPullsReady() ([]models.PullRequest, error) {
+	var rows []pull
+	if err := s.db.Where("closed = ? AND cleanup_complete = ? AND id NOT IN (?)", true, false, s.db.Model(&executionClaim{}).Select("pull_id")).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	var out []models.PullRequest
+	for _, row := range rows {
+		p, err := loadPull(s.db, row.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+func (s *Store) MarkClosedClean(p models.PullRequest) error {
+	if p.ExecutionOwner() != "" && p.ClosureGeneration != 0 {
+		return s.db.Transaction(func(tx *gorm.DB) error {
+			if err := s.guard(tx, p); err != nil {
+				return err
+			}
+			closed, err := lockPull(tx, pullIDs(tx, p.BaseRepo, p.Num))
+			if err != nil {
+				return err
+			}
+			if err := anchorClosedLogs(tx, closed.ID); err != nil {
+				return err
+			}
+			result := tx.Model(&pull{}).Where("id = ? AND closed = ? AND closure_generation = ?", closed.ID, true, p.ClosureGeneration).Update("cleanup_complete", true)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("closure generation changed during cleanup")
+			}
+			return nil
+		})
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		row, err := lockPull(tx, pullIDs(tx, p.BaseRepo, p.Num))
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return tx.Model(&pull{}).Where("id = ? AND closed = ? AND NOT EXISTS (SELECT 1 FROM execution_claims WHERE pull_id = ?)", row.ID, true, row.ID).Update("cleanup_complete", true).Error
+	})
+}
+
+// MarkPreviousExecutionsUncertain blocks work left by earlier server instances
+// without waiting for their claims to expire. With SQLite the data directory
+// lock proves the earlier server exited, not that Terraform children stopped.
+// With PostgreSQL other servers may share the database and hold live claims, so
+// startup marks only claims of this instance, and instance IDs are new in each
+// process, so there are none. Claims of a server that stopped become uncertain
+// when the expiry sweep finds their heartbeat expired.
+func (s *Store) MarkPreviousExecutionsUncertain() error {
+	if s.schema != "" {
+		return nil
+	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&executionClaim{}).Where("state = ? AND server_instance_id <> ?", "active", s.instance).Update("state", "uncertain").Error; err != nil {
+			return err
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		return tx.Model(&logStream{}).Where("sealed_at IS NULL").Updates(map[string]any{"sealed_at": now, "interrupted": true}).Error
+	})
+}
+
+// ClaimCleanup serializes destructive cleanup with other cleaners and commands.
+func (s *Store) ClaimCleanup(p models.PullRequest, owner string) (models.PullRequest, bool, error) {
+	claimed := false
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var row struct {
+			ID                      string
+			Closed, CleanupComplete bool
+			ClosureGeneration       int64
+		}
+		if err := tx.Table("pulls").Clauses(rowLock).Where("id IN (?)", pullIDs(tx, p.BaseRepo, p.Num)).Take(&row).Error; err != nil {
+			return err
+		}
+		if !row.Closed || row.CleanupComplete || (p.ClosureGeneration != 0 && p.ClosureGeneration != row.ClosureGeneration) {
+			return nil
+		}
+		now, err := databaseNow(tx)
+		if err != nil {
+			return err
+		}
+		claim := s.newClaim(row.ID, owner, now)
+		result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return fmt.Errorf("cleanup deferred until execution is stopped or reconciled")
+		}
+		p.ClosureGeneration = row.ClosureGeneration
+		p.Execution = &models.Execution{Owner: owner}
+		p.BaseRepo.Execution = p.Execution
+		claimed = true
+		return nil
+	})
+	return p, claimed, err
+}
+
+// CheckExecutionStopped requires a recorded terminal outcome for every owned job.
+func (s *Store) CheckExecutionStopped(p models.PullRequest) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		if err := s.guard(tx, p); err != nil {
+			return err
+		}
+		var running int64
+		if err := tx.Table("jobs").Where("pull_id IN (?) AND owner = ? AND state = ?", pullIDs(tx, p.BaseRepo, p.Num), p.ExecutionOwner(), "running").Count(&running).Error; err != nil {
+			return err
+		}
+		if running != 0 {
+			return fmt.Errorf("execution has jobs without a persisted completion; reconcile stopped work before unlocking")
+		}
+		return nil
+	})
+}
+
+// Each log's retention clock belongs to the closure after its job, not to a later
+// reopen/close cycle of the same PR. Final cleanup also anchors late log chunks.
+func anchorClosedLogs(tx *gorm.DB, pullID string) error {
+	return anchorLogRetention(tx, pullID)
+}

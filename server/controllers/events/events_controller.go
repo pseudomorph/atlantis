@@ -19,6 +19,7 @@ import (
 	"github.com/google/go-github/v88/github"
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/runatlantis/atlantis/server/events"
+	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
 	"github.com/runatlantis/atlantis/server/events/vcs/bitbucketcloud"
@@ -52,15 +53,20 @@ const azuredevopsTestURL = "https://fabrikam.visualstudio.com/DefaultCollection/
 // VCSEventsController handles all webhook requests which signify 'events' in the
 // VCS host, ex. GitHub.
 type VCSEventsController struct {
-	CommandRunner  events.CommandRunner  `validate:"required"`
-	PullCleaner    events.PullCleaner    `validate:"required"`
-	Logger         logging.SimpleLogging `validate:"required"`
-	Scope          tally.Scope           `validate:"required"`
-	Parser         events.EventParsing   `validate:"required"`
-	CommentParser  events.CommentParsing `validate:"required"`
-	ApplyDisabled  bool
-	EmojiReaction  string
-	ExecutableName string
+	CommandRunner events.CommandRunner `validate:"required"`
+	PullCleaner   events.PullCleaner   `validate:"required"`
+	// PullReopener, when set, records reopened pull requests so durable storage
+	// can accept their commands again after closure cleanup.
+	PullReopener PullReopener
+	// LivePullHeadFetcher rejects delayed lifecycle events against the current VCS state.
+	LivePullHeadFetcher events.LivePullHeadFetcher
+	Logger              logging.SimpleLogging `validate:"required"`
+	Scope               tally.Scope           `validate:"required"`
+	Parser              events.EventParsing   `validate:"required"`
+	CommentParser       events.CommentParsing `validate:"required"`
+	ApplyDisabled       bool
+	EmojiReaction       string
+	ExecutableName      string
 	// GithubWebhookSecret is the secret added to this webhook via the GitHub
 	// UI that identifies this call as coming from GitHub. If empty, no
 	// request validation is done.
@@ -95,6 +101,8 @@ type VCSEventsController struct {
 	AzureDevopsWebhookBasicPassword []byte
 	AzureDevopsRequestValidator     AzureDevopsRequestValidator `validate:"required"`
 	GiteaWebhookSecret              []byte
+	// Deliveries, set with durable storage, ignores redelivered webhooks.
+	Deliveries WebhookDeliveries
 }
 
 // Post handles POST webhook requests.
@@ -173,6 +181,10 @@ func (e *VCSEventsController) handleGithubPost(w http.ResponseWriter, r *http.Re
 		e.respond(w, logging.Warn, http.StatusBadRequest, "%s", err.Error())
 		return
 	}
+	w, accepted := e.acceptDelivery(w, r, models.Github)
+	if !accepted {
+		return
+	}
 
 	githubReqID := "X-Github-Delivery=" + html.EscapeString(r.Header.Get("X-Github-Delivery"))
 	logger := e.Logger.With("gh-request-id", githubReqID)
@@ -230,6 +242,10 @@ func (e *VCSEventsController) handleBitbucketCloudPost(w http.ResponseWriter, r 
 			return
 		}
 	}
+	w, accepted := e.acceptDelivery(w, r, models.BitbucketCloud)
+	if !accepted {
+		return
+	}
 	switch eventType {
 	case bitbucketcloud.PullCreatedHeader, bitbucketcloud.PullUpdatedHeader, bitbucketcloud.PullFulfilledHeader, bitbucketcloud.PullRejectedHeader:
 		e.Logger.Debug("handling as pull request state changed event")
@@ -265,6 +281,10 @@ func (e *VCSEventsController) handleBitbucketServerPost(w http.ResponseWriter, r
 			e.respond(w, logging.Warn, http.StatusBadRequest, "%s", fmt.Errorf("request did not pass validation: %w", err).Error())
 			return
 		}
+	}
+	w, accepted := e.acceptDelivery(w, r, models.BitbucketServer)
+	if !accepted {
+		return
 	}
 	switch eventType {
 	case bitbucketserver.PullCreatedHeader, bitbucketserver.PullFromRefUpdatedHeader, bitbucketserver.PullMergedHeader, bitbucketserver.PullDeclinedHeader, bitbucketserver.PullDeletedHeader:
@@ -331,6 +351,10 @@ func (e *VCSEventsController) handleGiteaPost(w http.ResponseWriter, r *http.Req
 			e.respond(w, logging.Warn, http.StatusBadRequest, "%s", fmt.Errorf("request did not pass validation: %w", err).Error())
 			return
 		}
+	}
+	w, accepted := e.acceptDelivery(w, r, models.Gitea)
+	if !accepted {
+		return
 	}
 
 	logger := e.Logger.With("gitea-request-id", reqID)
@@ -560,6 +584,11 @@ func (e *VCSEventsController) HandleGithubPullRequestEvent(logger logging.Simple
 	return e.handlePullRequestEvent(logger, baseRepo, headRepo, pull, user, pullEventType)
 }
 
+// PullReopener records that a pull request was opened or reopened.
+type PullReopener interface {
+	RequestReopen(models.PullRequest) error
+}
+
 func (e *VCSEventsController) handlePullRequestEvent(logger logging.SimpleLogging, baseRepo models.Repo, headRepo models.Repo, pull models.PullRequest, user models.User, eventType models.PullRequestEventType) HTTPResponse {
 	if !e.RepoAllowlistChecker.IsAllowlisted(baseRepo.FullName, baseRepo.VCSHost.Hostname) {
 		// If the repo isn't allowlisted and we receive an opened pull request
@@ -582,9 +611,40 @@ func (e *VCSEventsController) handlePullRequestEvent(logger logging.SimpleLoggin
 		}
 	}
 
+	if e.PullReopener != nil && e.LivePullHeadFetcher != nil && (eventType == models.OpenedPullEvent || eventType == models.ReopenedPullEvent || eventType == models.ClosedPullEvent) {
+		current, err := e.LivePullHeadFetcher.GetLivePullIdentity(command.ProjectContext{Pull: pull, Log: logger})
+		if err != nil {
+			if eventType == models.ClosedPullEvent {
+				if queue, ok := e.PullReopener.(interface {
+					QueueLifecycleCheck(models.PullRequest) error
+				}); ok {
+					if queueErr := queue.QueueLifecycleCheck(pull); queueErr != nil {
+						logger.Err("persisting closure verification: %v", queueErr)
+					}
+				}
+			}
+			return HTTPResponse{body: "could not verify current pull request state; closure verification will retry if recorded", err: HTTPError{code: http.StatusServiceUnavailable, err: err}}
+		}
+		expected := models.OpenPullState
+		if eventType == models.ClosedPullEvent {
+			expected = models.ClosedPullState
+		}
+		if current.State != expected {
+			return HTTPResponse{body: "Ignoring stale pull request lifecycle event"}
+		}
+		pull = current
+	}
+	if eventType == models.ReopenedPullEvent && e.PullReopener == nil {
+		return HTTPResponse{body: "Ignoring non-actionable pull request event"}
+	}
 	switch eventType {
-	case models.OpenedPullEvent, models.UpdatedPullEvent:
+	case models.OpenedPullEvent, models.UpdatedPullEvent, models.ReopenedPullEvent:
 		// If the pull request was opened or updated, we will try to autoplan.
+		if (eventType == models.OpenedPullEvent || eventType == models.ReopenedPullEvent) && e.PullReopener != nil {
+			if err := e.PullReopener.RequestReopen(pull); err != nil {
+				logger.Err("recording reopened pull request: %s", err)
+			}
+		}
 
 		// Respond with success and then actually execute the command asynchronously.
 		// We use a goroutine so that this function returns and the connection is
@@ -631,6 +691,10 @@ func (e *VCSEventsController) handleGitlabPost(w http.ResponseWriter, r *http.Re
 		return
 	}
 	e.Logger.Debug("request valid")
+	w, accepted := e.acceptDelivery(w, r, models.Gitlab)
+	if !accepted {
+		return
+	}
 
 	switch event := event.(type) {
 	case gitlab.MergeCommentEvent:

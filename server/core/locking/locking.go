@@ -34,9 +34,10 @@ type Client struct {
 type Locker interface {
 	TryLock(p models.Project, workspace string, pull models.PullRequest, user models.User) (TryLockResponse, error)
 	Unlock(key string) (*models.ProjectLock, error)
-	UnlockIfOwnedByPull(project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
+	UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error)
+	UnlockIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error)
 	List() (map[string]models.ProjectLock, error)
-	UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error)
+	UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error)
 	GetLock(key string) (*models.ProjectLock, error)
 }
 
@@ -63,7 +64,7 @@ func (c *Client) TryLock(p models.Project, workspace string, pull models.PullReq
 	if err != nil {
 		return TryLockResponse{}, err
 	}
-	return TryLockResponse{lockAcquired, currLock, c.key(p, workspace)}, nil
+	return TryLockResponse{lockAcquired, currLock, c.key(pull.BaseRepo, p, workspace)}, nil
 }
 
 // Unlock attempts to unlock a project and workspace. If successful,
@@ -71,15 +72,35 @@ func (c *Client) TryLock(p models.Project, workspace string, pull models.PullReq
 // pointer will be nil. An error will only be returned if there was
 // an error deleting the lock (i.e. not if there was no lock).
 func (c *Client) Unlock(key string) (*models.ProjectLock, error) {
-	project, workspace, err := c.lockKeyToProjectWorkspace(key)
+	repo, project, workspace, err := c.decodeKey(key)
 	if err != nil {
 		return nil, err
+	}
+	return c.unlock(repo, project, workspace)
+}
+
+// UnlockOwned carries an internal claim owner without adding it to the public lock key.
+func (c *Client) UnlockOwned(key string, pull models.PullRequest) (*models.ProjectLock, error) {
+	repo, project, workspace, err := c.decodeKey(key)
+	if err != nil {
+		return nil, err
+	}
+	repo.Execution = pull.Execution
+	return c.unlock(repo, project, workspace)
+}
+
+func (c *Client) unlock(repo models.Repo, project models.Project, workspace string) (*models.ProjectLock, error) {
+	if scoped, ok := c.database.(db.RepoScopedLocks); ok {
+		return scoped.UnlockInRepo(repo, project, workspace)
 	}
 	return c.database.Unlock(project, workspace)
 }
 
 // UnlockIfOwnedByPull unlocks project and workspace only when it is still owned by pullNum.
-func (c *Client) UnlockIfOwnedByPull(project models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
+func (c *Client) UnlockIfOwnedByPull(repo models.Repo, project models.Project, workspace string, pullNum int) (*models.ProjectLock, error) {
+	if scoped, ok := c.database.(db.RepoScopedLocks); ok {
+		return scoped.UnlockInRepoIfOwnedByPull(repo, project, workspace, pullNum)
+	}
 	return c.database.UnlockIfOwnedByPull(project, workspace, pullNum)
 }
 
@@ -92,14 +113,17 @@ func (c *Client) List() (map[string]models.ProjectLock, error) {
 		return m, err
 	}
 	for _, lock := range locks {
-		m[c.key(lock.Project, lock.Workspace)] = lock
+		m[c.key(lock.Pull.BaseRepo, lock.Project, lock.Workspace)] = lock
 	}
 	return m, nil
 }
 
 // UnlockByPull deletes all locks associated with that pull request.
-func (c *Client) UnlockByPull(repoFullName string, pullNum int) ([]models.ProjectLock, error) {
-	return c.database.UnlockByPull(repoFullName, pullNum)
+func (c *Client) UnlockByPull(repo models.Repo, pullNum int) ([]models.ProjectLock, error) {
+	if scoped, ok := c.database.(db.RepoScopedLocks); ok {
+		return scoped.UnlockByPullInRepo(repo, pullNum)
+	}
+	return c.database.UnlockByPull(repo.FullName, pullNum)
 }
 
 // GetLock attempts to get the lock stored at key. If successful,
@@ -107,21 +131,30 @@ func (c *Client) UnlockByPull(repoFullName string, pullNum int) ([]models.Projec
 // An error will only be returned if there was an error getting the lock
 // (i.e. not if there was no lock).
 func (c *Client) GetLock(key string) (*models.ProjectLock, error) {
-	project, workspace, err := c.lockKeyToProjectWorkspace(key)
+	repo, project, workspace, err := c.decodeKey(key)
 	if err != nil {
 		return nil, err
 	}
 
-	projectLock, err := c.database.GetLock(project, workspace)
-	if err != nil {
-		return nil, err
+	if scoped, ok := c.database.(db.RepoScopedLocks); ok {
+		return scoped.GetLockInRepo(repo, project, workspace)
 	}
-
-	return projectLock, nil
+	return c.database.GetLock(project, workspace)
 }
 
-func (c *Client) key(p models.Project, workspace string) string {
+func (c *Client) key(repo models.Repo, p models.Project, workspace string) string {
+	if codec, ok := c.database.(db.LockKeyCodec); ok {
+		return codec.LockKey(repo, p, workspace)
+	}
 	return models.GenerateLockKey(p, workspace)
+}
+
+func (c *Client) decodeKey(key string) (models.Repo, models.Project, string, error) {
+	if codec, ok := c.database.(db.LockKeyCodec); ok {
+		return codec.ParseLockKey(key)
+	}
+	p, workspace, err := c.lockKeyToProjectWorkspace(key)
+	return models.Repo{FullName: p.RepoFullName}, p, workspace, err
 }
 
 func IsCurrentLocking(key string) ([]string, error) {
@@ -161,7 +194,7 @@ func (c *NoOpLocker) Unlock(_ string) (*models.ProjectLock, error) {
 }
 
 // UnlockIfOwnedByPull is a no-op for commands that do not use repository locks.
-func (c *NoOpLocker) UnlockIfOwnedByPull(_ models.Project, _ string, _ int) (*models.ProjectLock, error) {
+func (c *NoOpLocker) UnlockIfOwnedByPull(_ models.Repo, _ models.Project, _ string, _ int) (*models.ProjectLock, error) {
 	return nil, nil
 }
 
@@ -173,7 +206,7 @@ func (c *NoOpLocker) List() (map[string]models.ProjectLock, error) {
 }
 
 // UnlockByPull deletes all locks associated with that pull request.
-func (c *NoOpLocker) UnlockByPull(_ string, _ int) ([]models.ProjectLock, error) {
+func (c *NoOpLocker) UnlockByPull(_ models.Repo, _ int) ([]models.ProjectLock, error) {
 	return []models.ProjectLock{}, nil
 }
 
@@ -187,4 +220,8 @@ func (c *NoOpLocker) GetLock(_ string) (*models.ProjectLock, error) {
 
 func (c *NoOpLocker) key(p models.Project, workspace string) string {
 	return models.GenerateLockKey(p, workspace)
+}
+
+func (c *NoOpLocker) UnlockOwned(string, models.PullRequest) (*models.ProjectLock, error) {
+	return nil, nil
 }

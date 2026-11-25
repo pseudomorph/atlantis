@@ -263,6 +263,14 @@ func (b *Client) GetPullRequestIdentity(logger logging.SimpleLogging, repo model
 	}
 	pull.HeadCommit = *pullResp.Source.Commit.Hash
 	pull.BaseBranch = *pullResp.Destination.Branch.Name
+	switch strings.ToUpper(*pullResp.State) {
+	case "OPEN":
+		pull.State = models.OpenPullState
+	default:
+		// Callers outside durable storage read only the head and base. Durable
+		// storage treats any state other than OPEN as closed.
+		pull.State = models.ClosedPullState
+	}
 	return pull, nil
 }
 

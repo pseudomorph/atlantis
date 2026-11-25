@@ -655,3 +655,26 @@ func TestClient_HidePRComments(t *testing.T) {
 	Ok(t, err)
 	Equals(t, 2, called)
 }
+
+// Legacy callers read only the head and base, so an unrecognized state must
+// not turn the identity lookup into an error. Durable storage treats it as closed.
+func TestBitbucketCloud_GetPullRequestIdentityToleratesUnknownState(t *testing.T) {
+	logger := logging.NewNoopLogger(t)
+	pullRequest, err := os.ReadFile(filepath.Join("testdata", "pull-approved.json"))
+	Ok(t, err)
+	pullRequest = []byte(strings.Replace(string(pullRequest), `"state": "OPEN"`, `"state": "QUEUED"`, 1))
+	testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(pullRequest) // nolint: errcheck
+	}))
+	defer testServer.Close()
+	client := bitbucketcloud.New(http.DefaultClient, "user", "pass", "", "runatlantis.io")
+	client.BaseURL = testServer.URL
+	repo := models.Repo{FullName: "owner/repo", Owner: "owner", Name: "repo", VCSHost: models.VCSHost{Type: models.BitbucketCloud, Hostname: "bitbucket.org"}}
+
+	identity, err := client.GetPullRequestIdentity(logger, repo, models.PullRequest{Num: 1, BaseRepo: repo})
+
+	Ok(t, err)
+	Equals(t, "75d1e7c57cd9", identity.HeadCommit)
+	Equals(t, "main", identity.BaseBranch)
+	Equals(t, models.ClosedPullState, identity.State)
+}

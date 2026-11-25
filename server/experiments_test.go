@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/runatlantis/atlantis/server"
 	"github.com/runatlantis/atlantis/server/controllers"
+
 	. "github.com/runatlantis/atlantis/testing"
 )
 
@@ -23,6 +24,8 @@ func TestValidateExperiments(t *testing.T) {
 		err    string
 	}{
 		{name: "default"},
+		{name: "durable storage permission alone", config: server.UserConfig{Experiments: []string{"durable-storage"}}},
+		{name: "all experiments configured", config: server.UserConfig{Experiments: []string{"api", "drift-detection", "durable-storage"}, APISecret: token, EnableDriftDetection: true, Storage: &server.StorageConfig{Database: server.StorageDatabaseConfig{Type: "sqlite"}}}},
 		{name: "API permission alone", config: server.UserConfig{Experiments: []string{"api"}}},
 		{name: "drift permission alone", config: server.UserConfig{Experiments: []string{"drift-detection"}}},
 		{name: "API configured", config: server.UserConfig{Experiments: []string{"api"}, APISecret: token}},
@@ -54,7 +57,7 @@ func TestValidateExperiments(t *testing.T) {
 }
 
 func TestExperimentPermissionsDoNotSetActivationFlags(t *testing.T) {
-	for _, names := range [][]string{{"api"}, {"drift-detection"}, {"api", "drift-detection"}} {
+	for _, names := range [][]string{{"api"}, {"drift-detection"}, {"api", "drift-detection"}, {"durable-storage"}} {
 		cfg := server.UserConfig{Experiments: names}
 		Ok(t, cfg.ValidateExperiments())
 		Equals(t, "", cfg.APISecret)

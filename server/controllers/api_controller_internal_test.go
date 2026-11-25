@@ -4,6 +4,7 @@
 package controllers
 
 import (
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/core/sqlstore"
+	"github.com/runatlantis/atlantis/server/events"
 	"github.com/runatlantis/atlantis/server/events/command"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/logging"
@@ -204,4 +208,93 @@ func runControllerGitAllowError(dir string, args ...string) (string, error) {
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	return string(output), err
+}
+
+type reservationRecorder struct {
+	locking.Locker
+	calls int
+	repo  models.Repo
+}
+
+func (r *reservationRecorder) UnlockByPull(repo models.Repo, _ int) ([]models.ProjectLock, error) {
+	r.calls++
+	r.repo = repo
+	return nil, nil
+}
+
+func TestAPICleanupPreservesPRReservations(t *testing.T) {
+	store, err := sqlstore.OpenServer(t.TempDir())
+	Ok(t, err)
+	defer store.Close()
+	locker := &reservationRecorder{}
+	controller := &APIController{Locker: locker, Execution: &events.ExecutionCoordinator{Store: store}}
+	controller.cleanupProjectLocks(&command.Context{Pull: models.PullRequest{Num: 42}, Log: logging.NewNoopLogger(t)})
+	Equals(t, 0, locker.calls)
+}
+
+func TestAPICleanupRequiresPersistedCompletion(t *testing.T) {
+	store, err := sqlstore.OpenServer(t.TempDir())
+	Ok(t, err)
+	defer store.Close()
+	locker := &reservationRecorder{}
+	controller := &APIController{Locker: locker, Execution: &events.ExecutionCoordinator{Store: store}}
+	pull := models.PullRequest{Num: -1, BaseRepo: models.Repo{FullName: "org/repo"}, Execution: &models.Execution{Owner: "owner"}}
+	Ok(t, store.AcquireClaim(pull, "owner"))
+	pull.BaseRepo.Execution = pull.Execution
+	job := models.Job{ID: "apply", Pull: pull, Project: models.NewProject("org/repo", ".", ""), Workspace: "default", Command: "apply"}
+	Ok(t, store.StartJob(job))
+	ctx := &command.Context{Pull: pull, HeadRepo: models.Repo{FullName: "fork/repo"}, Log: logging.NewNoopLogger(t)}
+	controller.cleanupProjectLocks(ctx)
+	Equals(t, 0, locker.calls)
+	Ok(t, store.FinishJob(job.ID, "succeeded", ""))
+	controller.cleanupProjectLocks(ctx)
+	Equals(t, 1, locker.calls)
+	Equals(t, "org/repo", locker.repo.FullName)
+	Ok(t, store.MarkUncertain(pull))
+	controller.cleanupProjectLocks(ctx)
+	Equals(t, 1, locker.calls)
+}
+
+// Legacy cleanup keeps the head repository unlock it had before durable storage.
+func TestLegacyAPICleanupUsesHeadRepository(t *testing.T) {
+	locker := &reservationRecorder{}
+	controller := &APIController{Locker: locker}
+	controller.cleanupProjectLocks(&command.Context{Pull: models.PullRequest{Num: 42, BaseRepo: models.Repo{FullName: "base/repo"}}, HeadRepo: models.Repo{FullName: "fork/repo"}, Log: logging.NewNoopLogger(t)})
+	Equals(t, 1, locker.calls)
+	Equals(t, "fork/repo", locker.repo.FullName)
+}
+
+// Durable synthetic pull numbers key durable records, so they must stay
+// negative and must not repeat independently of the clock.
+func TestNextNonPRPullNumIsNegative(t *testing.T) {
+	controller := &APIController{Execution: &events.ExecutionCoordinator{}}
+	wide := false
+	for range 128 {
+		n := controller.nextNonPRPullNum()
+		if n >= 0 {
+			t.Fatalf("synthetic pull number %d is not negative", n)
+		}
+		wide = wide || n < -(1<<40)
+	}
+	Assert(t, wide, "durable synthetic pull numbers stayed in the legacy clock range")
+}
+
+// Without durable storage, synthetic pull numbers keep the legacy clock and
+// counter derivation.
+func TestLegacyNextNonPRPullNumUsesClockRange(t *testing.T) {
+	controller := &APIController{}
+	for range 128 {
+		n := controller.nextNonPRPullNum()
+		if n >= 0 || int64(-n) > 0x3fffffff+nonPRPullCounter.Load() {
+			t.Fatalf("legacy synthetic pull number %d is outside the clock range", n)
+		}
+	}
+}
+
+func TestSyntheticPullNumStaysNegativeAtBounds(t *testing.T) {
+	for _, random := range []uint64{0, 1, math.MaxUint64, 1 << 63, uint64(math.MaxInt), uint64(math.MaxInt) + 1} {
+		if n := syntheticPullNum(random); n >= 0 {
+			t.Fatalf("syntheticPullNum(%#x) = %d, want negative", random, n)
+		}
+	}
 }

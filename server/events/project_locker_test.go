@@ -123,7 +123,7 @@ func TestDefaultProjectLocker_TryLockWhenLockedSamePull(t *testing.T) {
 		},
 		nil,
 	)
-	mockLocker.EXPECT().UnlockIfOwnedByPull(expProject, expWorkspace, expPull.Num).Return(nil, nil)
+	mockLocker.EXPECT().UnlockIfOwnedByPull(expPull.BaseRepo, expProject, expWorkspace, expPull.Num).Return(nil, nil)
 	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, true)
 	Ok(t, err)
 	Equals(t, true, res.LockAcquired)
@@ -162,7 +162,7 @@ func TestDefaultProjectLocker_TryLockUnlocked(t *testing.T) {
 		},
 		nil,
 	)
-	mockLocker.EXPECT().UnlockIfOwnedByPull(expProject, expWorkspace, expPull.Num).Return(nil, nil)
+	mockLocker.EXPECT().UnlockIfOwnedByPull(expPull.BaseRepo, expProject, expWorkspace, expPull.Num).Return(nil, nil)
 	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, true)
 	Ok(t, err)
 	Equals(t, true, res.LockAcquired)
@@ -198,7 +198,7 @@ func TestDefaultProjectLocker_TryLockRepoLockingDisabledUnlockUsesNoOpLocker(t *
 		},
 		nil,
 	)
-	mockNoOpLocker.EXPECT().UnlockIfOwnedByPull(expProject, expWorkspace, expPull.Num).Return(nil, nil)
+	mockNoOpLocker.EXPECT().UnlockIfOwnedByPull(expPull.BaseRepo, expProject, expWorkspace, expPull.Num).Return(nil, nil)
 
 	res, err := locker.TryLock(logging.NewNoopLogger(t), expPull, expUser, expWorkspace, expProject, false)
 	Ok(t, err)

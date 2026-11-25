@@ -95,7 +95,7 @@ func TestCleanUpPullUnlockErr(t *testing.T) {
 		PullClosedTemplate: &events.PullClosedEventTemplate{},
 	}
 	err = errors.New("err")
-	l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, err)
+	l.EXPECT().UnlockByPull(testdata.GithubRepo, testdata.Pull.Num).Return(nil, err)
 	actualErr := pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 	Equals(t, "cleaning up locks: err", actualErr.Error())
 }
@@ -120,7 +120,7 @@ func TestCleanUpPullNoLocks(t *testing.T) {
 		WorkingDir: w,
 		Database:   db,
 	}
-	l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, nil)
+	l.EXPECT().UnlockByPull(testdata.GithubRepo, testdata.Pull.Num).Return(nil, nil)
 	err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 	Ok(t, err)
 	cp.VerifyWasCalled(Never()).CreateComment(Any[logging.SimpleLogging](), Any[models.Repo](), Any[int](), Any[string](), Any[string]())
@@ -222,7 +222,7 @@ func TestCleanUpPullComments(t *testing.T) {
 				Database:   db,
 			}
 			t.Log("testing: " + c.Description)
-			l.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(c.Locks, nil)
+			l.EXPECT().UnlockByPull(testdata.GithubRepo, testdata.Pull.Num).Return(c.Locks, nil)
 			err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
 			Ok(t, err)
 			_, _, _, comment, _ := cp.VerifyWasCalledOnce().CreateComment(
@@ -312,7 +312,7 @@ func TestCleanUpLogStreaming(t *testing.T) {
 				Workspace: "default",
 			},
 		}
-		locker.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(locks, nil)
+		locker.EXPECT().UnlockByPull(testdata.GithubRepo, testdata.Pull.Num).Return(locks, nil)
 
 		// Clean up.
 		err = pullClosedExecutor.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)
@@ -380,7 +380,7 @@ func TestCleanUpPullWithCorrectJobContext(t *testing.T) {
 	}
 
 	// Setup mock expectations
-	locker.EXPECT().UnlockByPull(testdata.GithubRepo.FullName, testdata.Pull.Num).Return(nil, nil)
+	locker.EXPECT().UnlockByPull(testdata.GithubRepo, testdata.Pull.Num).Return(nil, nil)
 
 	// Execute CleanUpPull
 	err = pce.CleanUpPull(logger, testdata.GithubRepo, testdata.Pull)

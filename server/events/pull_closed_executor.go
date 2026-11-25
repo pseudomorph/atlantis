@@ -13,10 +13,14 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/google/uuid"
+
 	"github.com/runatlantis/atlantis/server/logging"
 
 	"github.com/runatlantis/atlantis/server/core/db"
+
 	"github.com/runatlantis/atlantis/server/core/locking"
+	"github.com/runatlantis/atlantis/server/core/planstore"
 	"github.com/runatlantis/atlantis/server/core/runtime"
 	"github.com/runatlantis/atlantis/server/events/models"
 	"github.com/runatlantis/atlantis/server/events/vcs"
@@ -41,6 +45,8 @@ type PullCleaner interface {
 // PullClosedExecutor executes the tasks required to clean up a closed pull
 // request.
 type PullClosedExecutor struct {
+	LivePullHeadFetcher      LivePullHeadFetcher
+	Executions               db.ExecutionStore
 	Locker                   locking.Locker
 	VCSClient                vcs.Client
 	WorkingDir               WorkingDir
@@ -73,6 +79,40 @@ func (t *PullClosedEventTemplate) Execute(wr io.Writer, data any) error {
 
 // CleanUpPull cleans up after a closed pull request.
 func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo models.Repo, pull models.PullRequest) error {
+	if p.Executions != nil {
+		if pull.ClosureGeneration == 0 {
+			if err := p.Executions.ClosePull(pull); err != nil {
+				return err
+			}
+		}
+		if cleaner, ok := p.Executions.(interface {
+			ClaimCleanup(models.PullRequest, string) (models.PullRequest, bool, error)
+		}); ok {
+			owned, claimed, err := cleaner.ClaimCleanup(pull, "cleanup:"+uuid.NewString())
+			if err != nil {
+				return err
+			}
+			if !claimed {
+				return nil
+			}
+			pull, repo = owned, owned.BaseRepo
+			defer func() {
+				if err := p.Executions.ReleaseClaim(pull); err != nil {
+					logger.Err("releasing cleanup ownership: %v", err)
+					_ = p.Executions.MarkUncertain(pull)
+				}
+			}()
+		} else {
+			idle, err := p.Executions.PullIdle(pull)
+			if err != nil {
+				return err
+			}
+			if !idle {
+				return fmt.Errorf("cleanup deferred until execution is stopped or reconciled")
+			}
+		}
+	}
+
 	pullStatus, err := p.Database.GetPullStatus(pull)
 	if err != nil {
 		// Log and continue to clean up other resources.
@@ -101,7 +141,7 @@ func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo mode
 	// Always attempt external plan cleanup even if workspace deletion failed,
 	// so S3 objects are not orphaned when local delete errors.
 	if p.PlanStore != nil {
-		if err := p.PlanStore.DeleteForPull(repo.Owner, repo.Name, pull.Num); err != nil {
+		if err := planstore.DeleteForPullInRepo(p.PlanStore, repo, pull.Num); err != nil {
 			logger.Warn("failed to delete plans from external store: %s", err)
 		}
 	}
@@ -113,7 +153,7 @@ func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo mode
 	// Finally, delete locks. We do this last because when someone
 	// unlocks a project, right now we don't actually delete the plan
 	// so we might have plans laying around but no locks.
-	locks, err := p.Locker.UnlockByPull(repo.FullName, pull.Num)
+	locks, err := p.Locker.UnlockByPull(repo, pull.Num)
 	if err != nil {
 		return fmt.Errorf("cleaning up locks: %w", err)
 	}
@@ -126,6 +166,13 @@ func (p *PullClosedExecutor) CleanUpPull(logger logging.SimpleLogging, repo mode
 	// Clear any operations to avoid unbounded growth.
 	if p.CancellationTracker != nil {
 		p.CancellationTracker.Clear(pull)
+	}
+
+	// A reopened pull request may claim new work only after this point.
+	if p.Executions != nil {
+		if err := p.Executions.MarkClosedClean(pull); err != nil {
+			return fmt.Errorf("recording closure cleanup: %w", err)
+		}
 	}
 
 	// If there are no locks then there's no need to comment.

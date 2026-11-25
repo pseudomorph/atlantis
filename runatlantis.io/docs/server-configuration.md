@@ -38,8 +38,133 @@ log-level: ...
 
 ::: warning
 The config file you pass to `--config` is different from the `--repo-config` file.
-The `--config` config file is only used as an alternate way of setting `atlantis server` flags.
+The `--config` config file sets server options, including the experimental structured `storage` section below.
 :::
+
+## Durable storage configuration
+
+The unreleased `durable-storage` experiment uses a structured YAML section with
+no corresponding storage flags. Other server configuration remains unchanged.
+
+```yaml
+experiments: [durable-storage]
+data-dir: /var/lib/atlantis-durable
+storage:
+  database:
+    type: sqlite
+  artifacts:
+    type: database
+  retention:
+    logs: 168h
+    plan_artifacts: 0s
+```
+
+`storage.database.type` accepts `sqlite` or `postgres`. Both require a 64-bit
+server. SQLite allows one Atlantis process. Several servers can share one
+PostgreSQL schema, each with its own `data-dir`; see
+[Supported topologies](experiments.md#supported-topologies).
+
+With `sqlite`, the database is `atlantis.sqlite` under `data-dir`. Keep `data-dir`
+on persistent storage: losing it loses locks, PR status, job history, job logs,
+execution claims, pending plans, and the metadata that locates artifacts in any
+backend. Run Atlantis on local or block-backed storage; network filesystems such
+as NFS/EFS are unsupported.
+
+With `postgres`, the database holds those records instead, and `data-dir` holds
+working directories and, with filesystem artifacts, the artifact directory. The
+connection string is never written in the config file. Set exactly one of:
+
+- `connection_string_env`: the name of an environment variable that holds the
+  connection string.
+- `connection_string_file`: the path of a file whose contents are the
+  connection string, for example a mounted Kubernetes secret. Surrounding
+  whitespace is ignored.
+
+```yaml
+storage:
+  database:
+    type: postgres
+    connection_string_env: ATLANTIS_STORAGE_DATABASE_URL
+```
+
+```bash
+ATLANTIS_STORAGE_DATABASE_URL="postgres://atlantis:<password>@db.example:5432/atlantis?sslmode=verify-full"
+```
+
+The connection string uses the libpq URL or keyword/value format. Its
+`search_path` selects the schema, which must already exist; the default is
+`public`. Atlantis runs its migrations in that schema at startup, so the role
+needs permission to create tables there. Migrations run under a PostgreSQL
+advisory lock for the schema, so when several servers start together one
+migrates and the others wait. Maintenance passes also take advisory locks, so
+the role needs permission to call `pg_try_advisory_lock`, which PostgreSQL grants
+to every role by default. A second server that uses the same `data-dir` fails
+to start with an `already in use by another server` error.
+
+`storage.artifacts.type` accepts `database` (the default), `filesystem`, or `s3`.
+Filesystem storage takes `directory`, defaulting to `data-dir/artifacts`; the
+database backend rejects `directory` and `s3`. Use a directory dedicated to this database;
+installations and fresh-data-directory cutovers must not share it. When several
+servers share a PostgreSQL schema, every server must use one directory on a
+shared disk that renames files atomically, or the `s3` backend; the default
+directory under `data-dir` belongs to one server, and Atlantis logs a warning
+when PostgreSQL uses it. Live logs are journaled in the database for every
+backend; the filesystem and S3 backends archive sealed logs as one file or object
+each. Existing artifacts and logs are not migrated when changing backends, and
+logs already archived to a filesystem or bucket become unreadable after
+switching backends.
+
+The `s3` backend keeps plan snapshots and log archives in an S3-compatible bucket:
+
+```yaml
+storage:
+  database:
+    type: sqlite
+  artifacts:
+    type: s3
+    s3:
+      bucket: atlantis-artifacts
+      region: us-east-1
+      prefix: atlantis/production
+      # For S3-compatible services such as MinIO:
+      # endpoint: https://minio.example.com
+      # force_path_style: true
+      # profile: atlantis
+```
+
+`bucket` and `region` are required. `prefix` is an optional relative key prefix;
+a trailing `/` is ignored. `endpoint` overrides the service URL, `force_path_style`
+uses path-style addressing, and `profile` selects a shared AWS config profile.
+Credentials come from the AWS SDK default chain: environment variables, shared
+config, web identity, or instance and task roles. Atlantis checks the bucket at
+startup and refuses to start if it is unreachable. It needs `s3:ListBucket` on the
+bucket and `s3:GetObject`, `s3:PutObject`, and `s3:DeleteObject` on the prefix.
+The service must accept the `x-amz-checksum-sha256` upload header and ranged
+`GET` requests. Dedicate the bucket or prefix to this database, as with a
+filesystem directory, and keep it separate from any legacy `external_stores`
+plan store. Servers that share a PostgreSQL schema use the same bucket and
+prefix. Each server stages its uploads in its own `data-dir/s3-uploads`.
+
+Protect artifact storage and the database with appropriate access controls,
+encryption at rest, and backups. Plans, logs, declared workflow files, and backend
+initialization metadata can contain secrets; historical job records and backups
+also require protection. Cached backend configuration includes merged init
+settings and is retained for partial-backend restoration; provide fresh
+authentication through the server or apply workflow when credentials expire.
+
+`storage.retention.logs` is a positive Go duration, defaulting to `168h` after PR
+closure or non-PR job completion.
+`storage.retention.plan_artifacts` is a nonnegative Go duration, defaulting to
+`0s`. It retains plans, showfiles, and declared workflow files after their plan
+is applied or invalidated; pending plans and running jobs remain protected.
+`storage.workflow_files` can list additional project-relative files or directories
+to preserve between workflow stages in the plan snapshot bundle. Capture is
+explicit; the checkout, provider caches, and state files are not bundled wholesale.
+
+Unknown storage keys and conflicting backend settings reject startup. Do not
+combine `storage` with `locking-db-type`, `share-plan-dir`, or
+`enable-external-stores`. See [Durable storage](experiments.md#durable-storage)
+for cutover instructions and current limitations.
 
 ## Precedence
 
@@ -685,6 +810,16 @@ ATLANTIS_ENABLE_EXTERNAL_STORES=true
 
 Enable external storage backends configured in the server-side repo config (`external_stores` block). When set, Atlantis reads the `external_stores` section from the repo config YAML to initialize backends such as S3 for plan file persistence.
 
+::: warning Deprecated
+`--enable-external-stores` is deprecated. Installs should move to the
+[durable storage](experiments.md#durable-storage) experiment with
+`storage.artifacts.type: s3`, on PostgreSQL when they run several replicas. See the
+[external stores deprecation notice](experiments.md#external-stores-deprecation)
+for the timeline and migration steps.
+:::
+
+The durable-storage experiment uses the structured `storage.artifacts` setting instead. Do not combine `storage` with `--enable-external-stores` or `external_stores.plan_store`; Atlantis refuses to start.
+
 ### `--enable-policy-checks`
 
 ```bash
@@ -1212,10 +1347,21 @@ ATLANTIS_LOCKING_DB_TYPE="<boltdb|redis>"
 
 The locking database type to use for storing plan and apply locks. Defaults to `boltdb`.
 
+::: warning Deprecated
+`boltdb` and `redis` are deprecated. Single-instance installs should move to the
+[durable storage](experiments.md#durable-storage) experiment with SQLite, and
+installs with several servers to durable storage with PostgreSQL. See the
+[BoltDB deprecation notice](experiments.md#boltdb-deprecation) and the
+[Redis deprecation notice](experiments.md#redis-deprecation) for the timeline and
+migration steps.
+:::
+
 Notes:
 
 - If set to `boltdb`, only one process may have access to the boltdb instance.
 - If set to `redis`, use `--redis-host` and `--redis-port` for single-node mode, or `--redis-cluster-addresses` for Redis Cluster mode. Use `--redis-password` and (optionally) `--redis-username` only if your Redis deployment requires authentication.
+
+The durable-storage experiment uses the structured `storage.database` setting instead. Do not combine `storage` with an explicit `locking-db-type`. See [Durable storage](experiments.md#durable-storage).
 
 ### `--log-level`
 

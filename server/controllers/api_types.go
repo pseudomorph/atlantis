@@ -20,6 +20,7 @@ import (
 // ProjectResultAPI is the API representation of a project command result.
 // It exposes only the fields appropriate for API consumers.
 type ProjectResultAPI struct {
+	JobID string `json:"job_id,omitempty"`
 	// ProjectName is the name of the project (from atlantis.yaml).
 	ProjectName string `json:"project_name"`
 	// Directory is the relative path to the project root.
@@ -60,7 +61,7 @@ type PlanDetailsAPI struct {
 
 // NewProjectResultAPI converts an internal ProjectResult to its API representation.
 func NewProjectResultAPI(pr command.ProjectResult) ProjectResultAPI {
-	result := ProjectResultAPI{
+	result := ProjectResultAPI{JobID: pr.JobID,
 		ProjectName: pr.ProjectName,
 		Directory:   pr.RepoRelDir,
 		Workspace:   pr.Workspace,

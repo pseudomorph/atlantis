@@ -11,6 +11,7 @@ import (
 
 	"strings"
 
+	"github.com/runatlantis/atlantis/server/core/db"
 	"github.com/runatlantis/atlantis/server/core/db/mocks"
 	"github.com/runatlantis/atlantis/server/core/locking"
 	"github.com/runatlantis/atlantis/server/events/command"
@@ -83,7 +84,7 @@ func TestUnlockIfOwnedByPull_Err(t *testing.T) {
 	database.EXPECT().UnlockIfOwnedByPull(project, workspace, 1).Return(nil, errExpected)
 	l := locking.NewClient(database)
 
-	_, err := l.UnlockIfOwnedByPull(project, workspace, 1)
+	_, err := l.UnlockIfOwnedByPull(models.Repo{FullName: "owner/repo"}, project, workspace, 1)
 	Equals(t, errExpected, err)
 }
 
@@ -93,7 +94,7 @@ func TestUnlockIfOwnedByPull(t *testing.T) {
 	database.EXPECT().UnlockIfOwnedByPull(project, workspace, 1).Return(&pl, nil)
 	l := locking.NewClient(database)
 
-	lock, err := l.UnlockIfOwnedByPull(project, workspace, 1)
+	lock, err := l.UnlockIfOwnedByPull(models.Repo{FullName: "owner/repo"}, project, workspace, 1)
 	Ok(t, err)
 	Equals(t, &pl, lock)
 }
@@ -106,7 +107,7 @@ func TestUnlockIfOwnedByPull_SlashfulRepo(t *testing.T) {
 	database.EXPECT().UnlockIfOwnedByPull(slashfulProject, "default", 1).Return(&slashfulLock, nil)
 	l := locking.NewClient(database)
 
-	lock, err := l.UnlockIfOwnedByPull(slashfulProject, "default", 1)
+	lock, err := l.UnlockIfOwnedByPull(models.Repo{FullName: slashfulProject.RepoFullName}, slashfulProject, "default", 1)
 	Ok(t, err)
 	Equals(t, &slashfulLock, lock)
 }
@@ -137,7 +138,7 @@ func TestUnlockByPull(t *testing.T) {
 	database := mocks.NewMockDatabase(ctrl)
 	database.EXPECT().UnlockByPull("owner/repo", 1).Return(nil, errExpected)
 	l := locking.NewClient(database)
-	_, err := l.UnlockByPull("owner/repo", 1)
+	_, err := l.UnlockByPull(models.Repo{FullName: "owner/repo"}, 1)
 	Equals(t, errExpected, err)
 }
 
@@ -193,13 +194,13 @@ func TestList_NoOpLocker(t *testing.T) {
 
 func TestUnlockByPull_NoOpLocker(t *testing.T) {
 	l := locking.NewNoOpLocker()
-	_, err := l.UnlockByPull("owner/repo", 1)
+	_, err := l.UnlockByPull(models.Repo{FullName: "owner/repo"}, 1)
 	Ok(t, err)
 }
 
 func TestUnlockIfOwnedByPull_NoOpLocker(t *testing.T) {
 	l := locking.NewNoOpLocker()
-	lock, err := l.UnlockIfOwnedByPull(project, workspace, 1)
+	lock, err := l.UnlockIfOwnedByPull(models.Repo{FullName: "owner/repo"}, project, workspace, 1)
 	Ok(t, err)
 	var expected *models.ProjectLock
 	Equals(t, expected, lock)
@@ -371,4 +372,46 @@ func TestIsCurrentLocking_EmptyKey(t *testing.T) {
 	_, err := locking.IsCurrentLocking(key)
 	Assert(t, err != nil, "expected error for empty key")
 	Assert(t, strings.Contains(err.Error(), "invalid key format"), "expected invalid key format error")
+}
+
+// scopedDatabase leaves the legacy db.Database methods nil so any fallback panics.
+type scopedDatabase struct {
+	db.Database
+	repos []models.Repo
+}
+
+func (s *scopedDatabase) GetLockInRepo(repo models.Repo, _ models.Project, _ string) (*models.ProjectLock, error) {
+	s.repos = append(s.repos, repo)
+	return &pl, nil
+}
+
+func (s *scopedDatabase) UnlockInRepo(repo models.Repo, _ models.Project, _ string) (*models.ProjectLock, error) {
+	s.repos = append(s.repos, repo)
+	return &pl, nil
+}
+
+func (s *scopedDatabase) UnlockInRepoIfOwnedByPull(repo models.Repo, _ models.Project, _ string, _ int) (*models.ProjectLock, error) {
+	s.repos = append(s.repos, repo)
+	return &pl, nil
+}
+
+func (s *scopedDatabase) UnlockByPullInRepo(repo models.Repo, _ int) ([]models.ProjectLock, error) {
+	s.repos = append(s.repos, repo)
+	return nil, nil
+}
+
+func TestClientPrefersRepoScopedLocks(t *testing.T) {
+	database := &scopedDatabase{}
+	l := locking.NewClient(database)
+	repo := models.Repo{FullName: "owner/repo", VCSHost: models.VCSHost{Hostname: "git.example", Type: models.Gitlab}}
+	_, err := l.UnlockIfOwnedByPull(repo, project, workspace, 1)
+	Ok(t, err)
+	_, err = l.UnlockByPull(repo, 1)
+	Ok(t, err)
+	_, err = l.Unlock("owner/repo/path/workspace/projectName")
+	Ok(t, err)
+	_, err = l.GetLock("owner/repo/path/workspace/projectName")
+	Ok(t, err)
+	keyRepo := models.Repo{FullName: "owner/repo"}
+	Equals(t, []models.Repo{repo, repo, keyRepo, keyRepo}, database.repos)
 }

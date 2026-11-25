@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/runatlantis/atlantis/server/events/models"
+	. "github.com/runatlantis/atlantis/testing"
 )
 
 func TestIsUnsafeNonPRRef(t *testing.T) {
@@ -34,4 +35,18 @@ func TestIsUnsafeNonPRRef(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDurableWorkingDirectoriesAreInstanceScoped(t *testing.T) {
+	w := &FileWorkspace{DataDir: t.TempDir(), InstanceScoped: true}
+	repo := models.Repo{FullName: "org/repo", CloneURL: "https://git.example:8443/gitlab/org/repo.git", VCSHost: models.VCSHost{Type: models.Gitlab}}
+	a, err := w.repoPullDir(repo, models.PullRequest{Num: 1})
+	Ok(t, err)
+	repo.CloneURL = "https://git.example/other/org/repo.git"
+	b, err := w.repoPullDir(repo, models.PullRequest{Num: 1})
+	Ok(t, err)
+	Assert(t, a != b, "instances share a working directory")
+	planDir, err := w.planPullDir(repo, models.PullRequest{Num: 1})
+	Ok(t, err)
+	Equals(t, b, planDir)
 }

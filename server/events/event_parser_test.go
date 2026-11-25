@@ -239,7 +239,7 @@ func TestParseGithubPullEvent_EventType(t *testing.T) {
 		},
 		{
 			action:   "reopened",
-			exp:      models.OtherPullEvent,
+			exp:      models.ReopenedPullEvent,
 			draftExp: models.OtherPullEvent,
 		},
 		{
